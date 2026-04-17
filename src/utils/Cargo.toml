@@ -1,0 +1,21 @@
+[package]
+name = "utils"
+version = "0.1.0"
+authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+bench = false
+
+[features]
+tracing = ["log-instrument"]
+
+[dependencies]
+displaydoc = "0.2.5"
+libc = "0.2.184"
+log-instrument = { path = "../log-instrument", optional = true }
+thiserror = "2.0.18"
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+[workspace]
+members = ["src/*"]
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
