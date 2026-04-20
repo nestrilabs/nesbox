@@ -1,10 +1,10 @@
 [workspace]
 members = ["src/*"]
 
-default-members = [
-    "src/nesbox",
-    "src/acpi-tables",
-]
+# default-members = [
+#     "src/nesbox",
+#     "src/acpi-tables",
+# ]
 
 resolver = "2"
 

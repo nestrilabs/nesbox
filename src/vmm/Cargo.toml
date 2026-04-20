@@ -25,6 +25,7 @@ bitflags = "2.11.0"
 bitvec = { version = "1.0.1", features = ["atomic", "serde"] }
 byteorder = "1.5.0"
 crc64 = "2.0.0"
+crossbeam-channel = "0.5.15"
 derive_more = { version = "2.1.1", default-features = false, features = [
   "from",
   "display",
@@ -41,6 +42,7 @@ log = { version = "0.4.29", features = ["std", "serde"] }
 log-instrument = { path = "../log-instrument", optional = true }
 memfd = "0.6.5"
 micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
+rutabaga_gfx = { path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"] }
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"

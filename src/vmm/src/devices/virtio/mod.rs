@@ -16,6 +16,7 @@ pub mod balloon;
 pub mod block;
 pub mod device;
 pub mod generated;
+pub mod gpu;
 mod iov_deque;
 pub mod iovec;
 pub mod mem;
@@ -67,6 +68,8 @@ pub enum ActivateError {
     QueueMemoryError(QueueError),
     /// The driver didn't acknowledge a required feature: {0}
     RequiredFeatureNotAcked(&'static str),
+    /// The driver got activated, but then had something invalid (e.g. kicked a queue that wasn't ready)
+    BadActivate,
 }
 
 /// Trait that helps in upcasting an object to Any

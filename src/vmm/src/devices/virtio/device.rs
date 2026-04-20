@@ -68,6 +68,7 @@ pub enum VirtioDeviceType {
     Vsock = virtio_ids::VIRTIO_ID_VSOCK as u8,
     Mem = virtio_ids::VIRTIO_ID_MEM as u8,
     Pmem = virtio_ids::VIRTIO_ID_PMEM as u8,
+    Gpu = virtio_ids::VIRTIO_ID_GPU as u8,
 }
 
 /// Trait for virtio devices to be driven by a virtio transport.
