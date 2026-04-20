@@ -64,6 +64,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 // have VIRTQ_DESC_F_WRITE set, i.e. host-readable / driver-written data).
 // The virtio spec requires these to precede any writable descriptors.
 
+#[derive(Debug)]
 pub struct Reader {
     /// Eagerly-copied contents of all readable descriptors.
     buf: std::io::Cursor<Vec<u8>>,
@@ -136,6 +137,7 @@ impl io::Read for Reader {
 // Writes into the *writable* portion of a descriptor chain (descriptors with
 // VIRTQ_DESC_F_WRITE set).  Writes go directly to guest memory.
 
+#[derive(Debug)]
 pub struct Writer<'a> {
     mem: &'a GuestMemoryMmap,
     /// (guest_addr, byte_length) for every writable descriptor segment,

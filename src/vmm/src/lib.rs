@@ -415,6 +415,9 @@ impl Vmm {
                         memory_hotplug = Some(MemoryHotplugConfig::from(m));
                     }
                 }
+                VirtioDeviceType::Gpu => {
+                    // GPU is not currently reflected in the user-facing config API
+                }
             });
 
         let mmds_config = mmds_ref.map(|mmds| {

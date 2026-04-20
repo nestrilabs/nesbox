@@ -24,6 +24,8 @@ use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonSt
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::gpu::Gpu;
+use crate::devices::virtio::gpu::persist::GpuState;
 use crate::devices::virtio::mem::VirtioMem;
 use crate::devices::virtio::mem::persist::{VirtioMemConstructorArgs, VirtioMemState};
 use crate::devices::virtio::net::Net;
@@ -144,6 +146,8 @@ pub struct DeviceStates {
     pub pmem_devices: Vec<VirtioDeviceState<PmemState>>,
     /// Memory device state.
     pub memory_device: Option<VirtioDeviceState<VirtioMemState>>,
+    /// GPU device state.
+    pub gpu_device: Option<VirtioDeviceState<GpuState>>,
 }
 
 pub struct MMIODevManagerConstructorArgs<'a> {
@@ -342,6 +346,17 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                     let device_state = mem.save();
 
                     states.memory_device = Some(VirtioDeviceState {
+                        device_id,
+                        device_state,
+                        transport_state,
+                        device_info,
+                    });
+                }
+                VirtioDeviceType::Gpu => {
+                    let gpu_dev = locked_device.as_mut_any().downcast_mut::<Gpu>().unwrap();
+                    let device_state = gpu_dev.save();
+
+                    states.gpu_device = Some(VirtioDeviceState {
                         device_id,
                         device_state,
                         transport_state,

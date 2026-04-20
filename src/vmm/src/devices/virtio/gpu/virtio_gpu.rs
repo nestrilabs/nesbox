@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::io::IoSliceMut;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -63,12 +64,13 @@ fn sglist_to_rutabaga_iovecs(
 // Fence tracking
 // ---------------------------------------------------------------------------
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum VirtioGpuRing {
     Global,
     ContextSpecific { ctx_id: u32, ring_idx: u8 },
 }
 
+#[derive(Debug)]
 struct FenceDescriptor {
     ring: VirtioGpuRing,
     fence_id: u64,
@@ -76,7 +78,7 @@ struct FenceDescriptor {
     len: u32,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct FenceState {
     descs: Vec<FenceDescriptor>,
     completed_fences: BTreeMap<VirtioGpuRing, u64>,
@@ -104,7 +106,7 @@ impl AssociatedScanouts {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct VirtioGpuResource {
     id: u32,
     width: u32,
@@ -131,6 +133,7 @@ impl VirtioGpuResource {
     }
 }
 
+#[derive(Debug)]
 struct VirtioGpuScanout {
     resource_id: u32,
 }
@@ -145,6 +148,17 @@ pub struct VirtioGpu {
     fence_state: Arc<Mutex<FenceState>>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
+}
+
+impl fmt::Debug for VirtioGpu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("")
+            .field(&self.resources)
+            .field(&self.fence_state)
+            .field(&self.scanouts)
+            .field(&self.displays)
+            .finish()
+    }
 }
 
 impl VirtioGpu {

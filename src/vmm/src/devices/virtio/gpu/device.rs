@@ -45,6 +45,9 @@ use vm_memory::ByteValued;
 // Gpu struct
 // ---------------------------------------------------------------------------
 
+// Gpu must implement Debug because attach_pci_virtio_device requires
+// `T: 'static + VirtioDevice + MutEventSubscriber + Debug`.
+#[derive(Debug)]
 pub struct Gpu {
     // ── VirtioDevice required fields ────────────────────────────────────────
     pub(crate) id: String,
@@ -66,13 +69,15 @@ pub struct Gpu {
     pub(crate) sender: Option<Sender<u64>>,
 
     /// VirGL renderer creation flags.
-    virgl_flags: u32,
+    /// `pub(crate)` so persist.rs can read it for snapshotting.
+    pub(crate) virgl_flags: u32,
 
     /// Host-visible SHM window used for blob resource mapping.
-    shm_region: Option<VirtioShmRegion>,
+    pub(crate) shm_region: Option<VirtioShmRegion>,
 
     /// Per-scanout display configuration (width/height/EDID).
-    displays: Box<[DisplayInfo]>,
+    /// `pub(crate)` so persist.rs can iterate it for snapshotting.
+    pub(crate) displays: Box<[DisplayInfo]>,
 }
 
 // ---------------------------------------------------------------------------

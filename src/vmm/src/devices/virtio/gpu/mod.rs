@@ -10,6 +10,7 @@ mod device;
 pub mod display;
 mod edid;
 mod event_handler;
+pub mod persist;
 mod protocol;
 mod virtio_gpu;
 mod worker;
