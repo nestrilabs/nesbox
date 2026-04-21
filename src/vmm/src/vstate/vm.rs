@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use crate::devices::virtio::gpu::VirtioShmRegion;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -274,6 +275,102 @@ impl Vm {
         }
 
         Ok(())
+    }
+
+    /// Allocate a GPU host-visible shared-memory window and register it as a
+    /// KVM user-memory region.
+    ///
+    /// The window is used by the virtio-gpu device for blob-resource mapping
+    /// (`VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB`).  It is an anonymous host mapping
+    /// that the guest can access as a contiguous GPA range, and into which
+    /// individual blob resources are mapped with `mmap(MAP_FIXED | MAP_SHARED)`.
+    ///
+    /// # What this does
+    ///
+    /// 1. Allocates a guest-physical address range from the 64-bit MMIO space
+    ///    (above 4 GiB, well away from DRAM and virtio-mem).
+    /// 2. Creates an anonymous `MAP_SHARED | PROT_NONE` host mapping of the same
+    ///    size.  `PROT_NONE` means no host accesses go to this region directly;
+    ///    only `resource_map_blob` will overlay individual sub-ranges with the
+    ///    actual buffer fd.
+    /// 3. Registers the (host_addr → guest_addr) mapping with KVM via a fresh
+    ///    memory slot.
+    ///
+    /// # Returns
+    ///
+    /// A [`VirtioShmRegion`] carrying the host virtual address, guest physical
+    /// address, and size.  Pass this to `Gpu::set_shm_region` before activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VmError`] if GPA allocation, `mmap`, or KVM slot registration
+    /// fails.
+    pub fn register_gpu_shm_region(&self, size_bytes: usize) -> Result<VirtioShmRegion, VmError> {
+        use crate::devices::virtio::gpu::VirtioShmRegion;
+        use kvm_bindings::kvm_userspace_memory_region;
+        use vm_allocator::AllocPolicy;
+
+        // ── Step 1: Allocate a GPA range ────────────────────────────────────────
+        // We use the 64-bit MMIO allocator (above 4 GiB) so we don't interfere
+        // with DRAM or the 32-bit MMIO window.  Align to 2 MiB so that the guest
+        // can use huge pages inside the window if desired.
+        const ALIGN_2MIB: u64 = 2 << 20;
+        let guest_phys_addr = self
+            .resource_allocator()
+            .past_mmio64_memory
+            .allocate(size_bytes as u64, ALIGN_2MIB, AllocPolicy::FirstMatch)
+            .map_err(VmError::ResourceAllocator)?
+            .start();
+
+        // ── Step 2: Anonymous host mapping ──────────────────────────────────────
+        // MAP_SHARED is required so that subsequent MAP_FIXED | MAP_SHARED
+        // mmap calls (from resource_map_blob) can replace sub-ranges with
+        // real buffer FDs.  PROT_NONE keeps the initial window inaccessible
+        // until a blob is actually mapped into it.
+        //
+        // SAFETY: Standard POSIX mmap call with validated arguments.
+        let host_addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size_bytes,
+                libc::PROT_NONE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1,
+                0,
+            )
+        };
+
+        if host_addr == libc::MAP_FAILED {
+            return Err(VmError::MemoryError(
+                crate::vstate::memory::MemoryError::MmapRegionError(
+                    vm_memory::mmap::MmapRegionError::Mmap(std::io::Error::last_os_error()),
+                ),
+            ));
+        }
+
+        // ── Step 3: Allocate a KVM slot and register the region ─────────────────
+        let slot = self
+            .next_kvm_slot(1)
+            .ok_or(VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
+
+        self.set_user_memory_region(kvm_userspace_memory_region {
+            slot,
+            flags: 0, // no dirty-page logging; GPU blobs are not migrated
+            guest_phys_addr,
+            memory_size: size_bytes as u64,
+            userspace_addr: host_addr as u64,
+        })?;
+
+        log::debug!(
+            "virtio-gpu: SHM window slot={slot} GPA={guest_phys_addr:#x} \
+             host={host_addr:p} size={size_bytes:#x}"
+        );
+
+        Ok(VirtioShmRegion {
+            host_addr: host_addr as u64,
+            guest_addr: guest_phys_addr,
+            size: size_bytes,
+        })
     }
 
     /// Gets a reference to the kvm file descriptor owned by this VM.

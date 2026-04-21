@@ -16,8 +16,10 @@ pub mod boot_source;
 pub mod drive;
 /// Wrapper for configuring the entropy device attached to the microVM.
 pub mod entropy;
+pub mod gpu;
 /// Wrapper over the microVM general information attached to the microVM.
 pub mod instance_info;
+pub mod krunfw;
 /// Wrapper for configuring the memory and CPU of the microVM.
 pub mod machine_config;
 /// Wrapper for configuring memory hotplug.

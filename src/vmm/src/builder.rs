@@ -3,6 +3,7 @@
 
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
+use crate::vmm_config::gpu::GpuConfig;
 use std::fmt::Debug;
 use std::io;
 #[cfg(feature = "gdb")]
@@ -18,7 +19,7 @@ use vm_memory::GuestAddress;
 
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
-use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
+use crate::arch::{ConfigurationError, configure_system_for_boot};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
 use crate::cpu_config::templates::{GetCpuTemplate, GetCpuTemplateError, GuestConfigError};
@@ -39,7 +40,7 @@ use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 #[cfg(feature = "gdb")]
 use crate::gdb;
-use crate::initrd::{InitrdConfig, InitrdError};
+use crate::initrd::InitrdError;
 use crate::logger::debug;
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
@@ -124,6 +125,8 @@ pub enum StartMicrovmError {
     VcpuFdCloneError(#[from] crate::vstate::vcpu::CopyKvmFdError),
     /// Error with the Vm object: {0}
     Vm(#[from] VmError),
+    /// Cannot load kernel from libkrunfw: {0}
+    KrunfwLoad(#[from] crate::vmm_config::krunfw::KrunfwError),
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -199,8 +202,7 @@ pub fn build_microvm_for_boot(
 
     let vm = Arc::new(vm);
 
-    let entry_point = load_kernel(&boot_config.kernel_file, vm.guest_memory())?;
-    let initrd = InitrdConfig::from_config(boot_config, vm.guest_memory())?;
+    let (entry_point, initrd) = load_kernel_or_bundle(boot_config, vm.guest_memory())?;
 
     if vm_resources.pci_enabled {
         device_manager.enable_pci(&vm)?;
@@ -295,6 +297,16 @@ pub fn build_microvm_for_boot(
         setup_pvtime(&mut vm.resource_allocator(), &mut vcpus)?;
     } else {
         log::warn!("Vcpus do not support pvtime, steal time will not be reported to guest");
+    }
+
+    if let Some(gpu_config) = &vm_resources.gpu {
+        attach_gpu_device(
+            &mut device_manager,
+            &vm,
+            &mut boot_cmdline,
+            gpu_config,
+            event_manager,
+        )?;
     }
 
     configure_system_for_boot(
@@ -665,6 +677,45 @@ fn attach_virtio_mem_device(
     Ok(())
 }
 
+fn attach_gpu_device(
+    device_manager: &mut crate::device_manager::DeviceManager,
+    vm: &Arc<crate::vstate::vm::Vm>,
+    cmdline: &mut linux_loader::cmdline::Cmdline,
+    gpu_config: &GpuConfig,
+    event_manager: &mut EventManager,
+) -> Result<(), StartMicrovmError> {
+    use crate::devices::virtio::gpu::Gpu;
+
+    // Build the display slice from config.
+    let displays = gpu_config.display_infos();
+
+    let mut gpu = Gpu::new("gpu0".to_string(), gpu_config.virgl_flags, displays)
+        .map_err(|e| StartMicrovmError::Internal(VmmError::Gpu(e)))?;
+
+    // Register the SHM window with KVM if blob resources are enabled.
+    if gpu_config.shm_size_mib > 0 {
+        let shm_size_bytes = gpu_config.shm_size_mib * 1024 * 1024;
+        let shm_region = vm
+            .register_gpu_shm_region(shm_size_bytes)
+            .map_err(|e| StartMicrovmError::Internal(VmmError::Vm(e)))?;
+        gpu.set_shm_region(shm_region);
+    }
+
+    let gpu_arc = Arc::new(Mutex::new(gpu));
+    let id = gpu_arc.lock().expect("Poisoned lock").id().to_string();
+
+    device_manager.attach_virtio_device(
+        vm,
+        id,
+        gpu_arc,
+        cmdline,
+        event_manager,
+        false, // not vhost-user
+    )?;
+
+    Ok(())
+}
+
 fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
     device_manager: &mut DeviceManager,
     vm: &Arc<Vm>,
@@ -778,6 +829,46 @@ fn attach_balloon_device(
     let id = String::from(balloon.lock().expect("Poisoned lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
     device_manager.attach_virtio_device(vm, id, balloon.clone(), cmdline, event_manager, false)
+}
+
+fn load_kernel_or_bundle(
+    boot_config: &crate::vmm_config::boot_source::BootConfig,
+    guest_memory: &crate::vstate::memory::GuestMemoryMmap,
+) -> Result<(crate::arch::EntryPoint, Option<crate::initrd::InitrdConfig>), StartMicrovmError> {
+    use crate::arch::EntryPoint;
+    use crate::vmm_config::krunfw::KrunfwLoader;
+
+    if let Some(ref kernel_file) = boot_config.kernel_file {
+        // ── Standard file-based path (unchanged) ─────────────────────────────
+        let entry_point = crate::arch::load_kernel(kernel_file, guest_memory)?;
+        let initrd = crate::initrd::InitrdConfig::from_config(boot_config, guest_memory)?;
+        Ok((entry_point, initrd))
+    } else {
+        // ── krunfw.so path ───────────────────────────────────────────────────
+        // Load kernel from libkrunfw.so.  No initrd is needed because the
+        // kernel is fully self-contained.  Root filesystem comes from a
+        // virtio-blk block device.
+        let loader = KrunfwLoader::default();
+        let bundle = loader
+            .load(guest_memory)
+            .map_err(StartMicrovmError::KrunfwLoad)?;
+
+        // Build arch-specific EntryPoint.
+        // On x86_64: libkrunfw kernels are bzImage, so LinuxBoot protocol.
+        #[cfg(target_arch = "x86_64")]
+        let entry_point = EntryPoint {
+            entry_addr: bundle.entry_addr,
+            // bzImage protocol - the kernel handles its own decompression.
+            protocol: crate::arch::BootProtocol::LinuxBoot,
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        let entry_point = EntryPoint {
+            entry_addr: bundle.entry_addr,
+        };
+
+        Ok((entry_point, None))
+    }
 }
 
 #[cfg(test)]

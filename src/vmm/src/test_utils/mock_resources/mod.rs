@@ -42,7 +42,7 @@ pub struct MockBootSourceConfig(BootSourceConfig);
 impl MockBootSourceConfig {
     pub fn new() -> MockBootSourceConfig {
         MockBootSourceConfig(BootSourceConfig {
-            kernel_image_path: kernel_image_path(None),
+            kernel_image_path: Some(kernel_image_path(None)),
             initrd_path: None,
             boot_args: None,
         })
@@ -55,7 +55,7 @@ impl MockBootSourceConfig {
 
     #[cfg(target_arch = "x86_64")]
     pub fn with_kernel(mut self, kernel_image: &str) -> Self {
-        self.0.kernel_image_path = kernel_image_path(Some(kernel_image));
+        self.0.kernel_image_path = Some(kernel_image_path(Some(kernel_image)));
         self
     }
 }

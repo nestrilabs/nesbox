@@ -233,41 +233,42 @@ impl VirtioGpu {
     // Rutabaga builder helpers
     // -----------------------------------------------------------------------
 
-    fn build_rutabaga_channels() -> Vec<RutabagaChannel> {
-        let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
-        let wl = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
-        let mut channels = vec![RutabagaChannel {
-            base_channel: PathBuf::from(format!("{xdg}/{wl}")),
-            channel_type: RUTABAGA_CHANNEL_TYPE_WAYLAND,
-        }];
+    // SAFETY: This are unneeded as everything runs in the guest
+    // fn build_rutabaga_channels() -> Vec<RutabagaChannel> {
+    //     let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
+    //     let wl = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+    //     let mut channels = vec![RutabagaChannel {
+    //         base_channel: PathBuf::from(format!("{xdg}/{wl}")),
+    //         channel_type: RUTABAGA_CHANNEL_TYPE_WAYLAND,
+    //     }];
 
-        #[cfg(target_os = "linux")]
-        {
-            use rutabaga_gfx::{RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11};
+    //     #[cfg(target_os = "linux")]
+    //     {
+    //         use rutabaga_gfx::{RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11};
 
-            if let Ok(x_disp) = env::var("DISPLAY") {
-                if let Some(num) = x_disp.strip_prefix(':') {
-                    channels.push(RutabagaChannel {
-                        base_channel: PathBuf::from(format!("/tmp/.X11-unix/X{num}")),
-                        channel_type: RUTABAGA_CHANNEL_TYPE_X11,
-                    });
-                }
-            }
-            if let Ok(pw_dir) =
-                env::var("PIPEWIRE_RUNTIME_DIR").or_else(|_| env::var("XDG_RUNTIME_DIR"))
-            {
-                let name = env::var("PIPEWIRE_REMOTE").unwrap_or_else(|_| "pipewire-0".into());
-                let mut pw = PathBuf::from(pw_dir);
-                pw.push(name);
-                channels.push(RutabagaChannel {
-                    base_channel: pw,
-                    channel_type: RUTABAGA_CHANNEL_TYPE_PW,
-                });
-            }
-        }
+    //         if let Ok(x_disp) = env::var("DISPLAY") {
+    //             if let Some(num) = x_disp.strip_prefix(':') {
+    //                 channels.push(RutabagaChannel {
+    //                     base_channel: PathBuf::from(format!("/tmp/.X11-unix/X{num}")),
+    //                     channel_type: RUTABAGA_CHANNEL_TYPE_X11,
+    //                 });
+    //             }
+    //         }
+    //         if let Ok(pw_dir) =
+    //             env::var("PIPEWIRE_RUNTIME_DIR").or_else(|_| env::var("XDG_RUNTIME_DIR"))
+    //         {
+    //             let name = env::var("PIPEWIRE_REMOTE").unwrap_or_else(|_| "pipewire-0".into());
+    //             let mut pw = PathBuf::from(pw_dir);
+    //             pw.push(name);
+    //             channels.push(RutabagaChannel {
+    //                 base_channel: pw,
+    //                 channel_type: RUTABAGA_CHANNEL_TYPE_PW,
+    //             });
+    //         }
+    //     }
 
-        channels
-    }
+    //     channels
+    // }
 
     /// Try to create a full rutabaga instance.
     pub fn create_rutabaga(
@@ -276,13 +277,13 @@ impl VirtioGpu {
         fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
     ) -> Option<Rutabaga> {
-        let channels = Self::build_rutabaga_channels();
+        // let channels = Self::build_rutabaga_channels();
         let builder = RutabagaBuilder::new(
             rutabaga_gfx::RutabagaComponentType::VirglRenderer,
             virgl_flags,
             0,
-        )
-        .set_rutabaga_channels(Some(channels));
+        );
+        // .set_rutabaga_channels(Some(channels));
 
         let fence = Self::create_fence_handler(queue_ctl, fence_state, interrupt);
         builder.build(fence, None).ok()

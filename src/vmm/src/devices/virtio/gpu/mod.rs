@@ -17,8 +17,6 @@ mod worker;
 
 pub use self::descriptor_utils::{Reader, Writer};
 pub use self::device::Gpu;
-// FenceState and VirtioGpu are pub in virtio_gpu.rs; re-exported here for
-// any future snapshot/restore or test code that needs direct access.
 pub use self::virtio_gpu::{FenceState, VirtioGpu};
 
 use self::descriptor_utils::Error as DescriptorError;

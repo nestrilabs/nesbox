@@ -142,6 +142,7 @@ use crate::devices::virtio::balloon::{
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDeviceType;
+use crate::devices::virtio::gpu::Gpu;
 use crate::devices::virtio::mem::device::VirtioMem;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemStatus};
 use crate::devices::virtio::net::Net;
@@ -156,6 +157,7 @@ use crate::resources::VmmConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::entropy::EntropyDeviceConfig;
+use crate::vmm_config::gpu::GpuConfig;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -269,6 +271,8 @@ pub enum VmmError {
     Balloon(#[from] BalloonError),
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
+    /// GPU device error: {0:?}
+    Gpu(crate::devices::virtio::gpu::GpuError),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -370,6 +374,7 @@ impl Vmm {
         let mut memory_hotplug = None;
         let mut mmds_ipv4_address = None;
         let mut mmds_ref = None;
+        let mut gpu = None;
 
         self.device_manager
             .for_each_virtio_device(|device_type, device| match device_type {
@@ -416,7 +421,9 @@ impl Vmm {
                     }
                 }
                 VirtioDeviceType::Gpu => {
-                    // GPU is not currently reflected in the user-facing config API
+                    if let Some(g) = device.as_any().downcast_ref::<Gpu>() {
+                        gpu = Some(GpuConfig::from(g));
+                    }
                 }
             });
 
@@ -449,6 +456,7 @@ impl Vmm {
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
             memory_hotplug,
+            gpu,
         }
     }
 

@@ -24,7 +24,7 @@ pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=1 nomodule 8250.nr_uart
 #[serde(deny_unknown_fields)]
 pub struct BootSourceConfig {
     /// Path of the kernel image.
-    pub kernel_image_path: String,
+    pub kernel_image_path: Option<String>,
     /// Path of the initrd, if there is one.
     pub initrd_path: Option<String>,
     /// The boot arguments to pass to the kernel. If this field is uninitialized,
@@ -59,7 +59,7 @@ pub struct BootConfig {
     /// The commandline validated against correctness.
     pub cmdline: linux_loader::cmdline::Cmdline,
     /// The descriptor to the kernel file.
-    pub kernel_file: File,
+    pub kernel_file: Option<File>,
     /// The descriptor to the initrd file, if there is one.
     pub initrd_file: Option<File>,
 }
@@ -72,7 +72,12 @@ impl BootConfig {
         };
 
         // Validate boot source config.
-        let kernel_file = File::open(&cfg.kernel_image_path).map_err(InvalidKernelPath)?;
+        // let kernel_file = File::open(&cfg.kernel_image_path).map_err(InvalidKernelPath)?;
+        let kernel_file: Option<File> = match &cfg.kernel_image_path {
+            Some(path) => Some(File::open(path).map_err(InvalidKernelPath)?),
+            None => None,
+        };
+
         let initrd_file: Option<File> = match &cfg.initrd_path {
             Some(path) => Some(File::open(path).map_err(InvalidInitrdPath)?),
             None => None,
@@ -109,7 +114,7 @@ pub(crate) mod tests {
         let boot_src_cfg = BootSourceConfig {
             boot_args: None,
             initrd_path: None,
-            kernel_image_path: kernel_path,
+            kernel_image_path: Some(kernel_path),
         };
 
         let boot_cfg = BootConfig::new(&boot_src_cfg).unwrap();
@@ -125,7 +130,7 @@ pub(crate) mod tests {
         let boot_src_cfg = BootSourceConfig {
             boot_args: Some(DEFAULT_KERNEL_CMDLINE.to_string()),
             initrd_path: Some("/tmp/initrd".to_string()),
-            kernel_image_path: "./vmlinux.bin".to_string(),
+            kernel_image_path: Some("./vmlinux.bin".to_string()),
         };
 
         // Use bitcode serialization directly for the test data

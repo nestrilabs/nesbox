@@ -401,7 +401,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
     let tmp_file = tmp_file.as_path().to_str().unwrap().to_string();
     // Verify LoadSnapshot not allowed after configuring various boot-specific resources.
     let req = VmmAction::ConfigureBootSource(BootSourceConfig {
-        kernel_image_path: tmp_file.clone(),
+        kernel_image_path: Some(tmp_file.clone()),
         ..Default::default()
     });
     verify_load_snap_disallowed_after_boot_resources(req, "ConfigureBootSource");
