@@ -43,6 +43,7 @@ use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
 use crate::snapshot::Persist;
+use crate::vmm_config::gpu::default_shm_size_bytes;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::{EventManager, Vm};
@@ -638,39 +639,33 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             )
             .expect("Could not restore Gpu");
 
-            // Re-register the SHM window with KVM if the GPU config specifies one.
-            // vm_resources.gpu is the GpuConfig set during the original boot; it
-            // carries shm_size_mib so we know how large the window should be.
-            if let Some(ref gpu_config) = constructor_args.vm_resources.gpu {
-                if gpu_config.shm_size_mib > 0 {
-                    let shm_size_bytes = gpu_config.shm_size_mib * 1024 * 1024;
-                    match constructor_args.vm.register_gpu_shm_region(shm_size_bytes) {
-                        Ok(shm_region) => {
-                            gpu.set_shm_region(shm_region);
-                        }
-                        Err(e) => {
-                            // Non-fatal: GPU will start without blob mapping.
-                            // The guest driver will see ErrUnspec on
-                            // VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB and fall back.
-                            warn!(
-                                "GPU restore: failed to re-register SHM window: {e:?}; \
+            // Re-register the SHM window.
+            let shm_size_bytes = default_shm_size_bytes();
+            match constructor_args.vm.register_gpu_shm_region(shm_size_bytes) {
+                Ok(shm_region) => {
+                    gpu.set_shm_region(shm_region);
+                }
+                Err(e) => {
+                    // Non-fatal: GPU will start without blob mapping.
+                    // The guest driver will see ErrUnspec on
+                    // VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB and fall back.
+                    warn!(
+                        "GPU restore: failed to re-register SHM window: {e:?}; \
                                  blob resources will be unavailable until next boot"
-                            );
-                        }
-                    }
+                    );
                 }
             }
 
             let arcd_gpu = Arc::new(Mutex::new(gpu));
 
             restore_helper(
-                arcd_gpu,                                      // device
-                gpu_state.device_state.virtio_state.activated, // activated
-                false,                                         // is_vhost_user
-                &gpu_state.device_id,                          // id
-                &gpu_state.transport_state,                    // MmioTransportState
-                &gpu_state.device_info,                        // MMIODeviceInfo
-                constructor_args.event_manager,                // event manager
+                arcd_gpu,
+                gpu_state.device_state.virtio_state.activated,
+                false,
+                &gpu_state.device_id,
+                &gpu_state.transport_state,
+                &gpu_state.device_info,
+                constructor_args.event_manager,
             )?;
         }
 

@@ -1522,6 +1522,7 @@ dependencies = [
  "log-instrument",
  "memfd",
  "micro_http",
+ "nix 0.30.1",
  "proptest",
  "rutabaga_gfx",
  "semver",

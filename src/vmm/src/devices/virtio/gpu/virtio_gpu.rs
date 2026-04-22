@@ -233,7 +233,7 @@ impl VirtioGpu {
     // Rutabaga builder helpers
     // -----------------------------------------------------------------------
 
-    // SAFETY: This are unneeded as everything runs in the guest
+    // NOTE: This are unneeded as everything runs in the guest
     // fn build_rutabaga_channels() -> Vec<RutabagaChannel> {
     //     let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
     //     let wl = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());

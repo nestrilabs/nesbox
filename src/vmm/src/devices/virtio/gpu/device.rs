@@ -14,8 +14,6 @@
 //  - The outer `queues` Vec<Queue> satisfies the VirtioDevice trait; its CTL
 //    slot is initialised and then cloned into the Arc<Mutex> on activation.
 //    After activation only the Arc<Mutex> copy tracks live state.
-//    NOTE: If snapshot/restore is added later, `prepare_save` must sync the
-//    Arc back into `queues[CTL_INDEX]` before serialisation.
 
 use crate::{MutEventSubscriber, impl_device_type};
 use std::io::Write;
@@ -134,27 +132,6 @@ impl Gpu {
 
 impl VirtioDevice for Gpu {
     impl_device_type!(VirtioDeviceType::Gpu);
-    // fn device_type(&self) -> VirtioDeviceType {
-    //     // GPU type ID per the virtio specification.
-    //     // Cast through u32 until VirtioDeviceType gains a Gpu variant.
-    //     // SAFETY: VirtioDeviceType is #[repr(u32)] in Firecracker; we rely on
-    //     // the caller using the returned value only for virtio transport
-    //     // identification, not for pattern matching against Rust enum variants.
-    //     //
-    //     // Practical approach: keep returning Net as a placeholder until the
-    //     // enum variant is merged, OR define a GPU-specific shim type.  For
-    //     // the purposes of this port we return the raw constant directly via
-    //     // a transmute-free cast – the transport layer just forwards the u32.
-    //     //
-    //     // If VirtioDeviceType does not implement From<u32>, change this to
-    //     // whichever escape hatch the codebase uses (e.g. unsafe transmute or
-    //     // a dedicated method).
-    //     //
-    //     // For now: use Net as a placeholder — REPLACE when enum is extended.
-    //     #[allow(clippy::cast_possible_truncation)]
-    //     let _ = VIRTIO_ID_GPU; // 16
-    //     VirtioDeviceType::Gpu // ← REPLACE with VirtioDeviceType::Gpu
-    // }
 
     fn id(&self) -> &str {
         &self.id
@@ -182,6 +159,15 @@ impl VirtioDevice for Gpu {
 
     fn queue_events(&self) -> &[EventFd] {
         &self.queue_evts
+    }
+
+    fn prepare_save(&mut self) {
+        if self.is_activated() {
+            // The live CTL queue state is in queue_ctl (updated by the worker
+            // and fence handler). Sync it back into self.queues so that
+            // VirtioDeviceState::from_device reads current indices.
+            self.queues[CTL_INDEX] = self.queue_ctl.lock().unwrap().clone();
+        }
     }
 
     fn interrupt_trigger(&self) -> &dyn VirtioInterrupt {

@@ -65,6 +65,21 @@ pub mod uapi {
     unsafe impl ByteValued for virtio_gpu_config {}
 }
 
+pub mod virgl_flags {
+    /// Flags for virglrenderer.  Copied from virglrenderer bindings.
+    pub const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
+    pub const VIRGLRENDERER_THREAD_SYNC: u32 = 1 << 1;
+    pub const VIRGLRENDERER_USE_GLX: u32 = 1 << 2;
+    pub const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
+    pub const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
+    pub const VIRGLRENDERER_USE_EXTERNAL_BLOB: u32 = 1 << 5;
+    pub const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+    pub const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+    pub const VIRGLRENDERER_USE_ASYNC_FENCE_CB: u32 = 1 << 8;
+    pub const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
+    pub const VIRGLRENDERER_DRM: u32 = 1 << 10;
+}
+
 /// Supported feature bits advertised to the driver.
 pub const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
     | (1u64 << uapi::VIRTIO_GPU_F_VIRGL)

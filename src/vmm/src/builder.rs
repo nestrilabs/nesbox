@@ -299,15 +299,7 @@ pub fn build_microvm_for_boot(
         log::warn!("Vcpus do not support pvtime, steal time will not be reported to guest");
     }
 
-    if let Some(gpu_config) = &vm_resources.gpu {
-        attach_gpu_device(
-            &mut device_manager,
-            &vm,
-            &mut boot_cmdline,
-            gpu_config,
-            event_manager,
-        )?;
-    }
+    attach_gpu_device(&mut device_manager, &vm, &mut boot_cmdline, event_manager)?;
 
     configure_system_for_boot(
         &kvm,
@@ -676,15 +668,15 @@ fn attach_virtio_mem_device(
     )?;
     Ok(())
 }
-
 fn attach_gpu_device(
     device_manager: &mut crate::device_manager::DeviceManager,
     vm: &Arc<crate::vstate::vm::Vm>,
     cmdline: &mut linux_loader::cmdline::Cmdline,
-    gpu_config: &GpuConfig,
     event_manager: &mut EventManager,
 ) -> Result<(), StartMicrovmError> {
     use crate::devices::virtio::gpu::Gpu;
+
+    let gpu_config = GpuConfig::default();
 
     // Build the display slice from config.
     let displays = gpu_config.display_infos();

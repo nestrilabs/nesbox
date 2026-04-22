@@ -5,7 +5,13 @@ use crate::Gpu;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use crate::devices::virtio::gpu::display::{DisplayInfo, DisplayInfoEdid, EdidParams};
+use crate::devices::virtio::gpu::{
+    display::{DisplayInfo, DisplayInfoEdid, EdidParams},
+    virgl_flags::{
+        VIRGLRENDERER_DRM, VIRGLRENDERER_NO_VIRGL, VIRGLRENDERER_THREAD_SYNC,
+        VIRGLRENDERER_USE_ASYNC_FENCE_CB, VIRGLRENDERER_USE_EGL,
+    },
+};
 
 // ---------------------------------------------------------------------------
 // Public configuration structs (JSON-configurable)
@@ -39,6 +45,30 @@ fn default_refresh_rate() -> u32 {
 }
 fn default_dpi() -> u32 {
     96
+}
+
+// TODO(wanjohiryan): Check on this later, does it work with multiple VMMs? Should we use host or guest ram from machine_config?
+// FIX: How do we set the HK_SYSMEM in guest? Or let us set it as half of *guest* memory for now, fingers crossed it works
+/// By default, HK sets the heap size to be half the size of the *guest* memory.
+/// Since commit 167744dc it's also possible to override the heap size by setting
+/// the HK_SYSMEM environment variable.
+///
+/// Let's set the SHM window for virtio-gpu to be as large as the host's RAM, not
+/// because we expect VRAM to be as large as RAM, but to account for the more than
+/// likely region fragmentation.
+///
+/// Then, let's set HK_SYSMEM to be either half the size of the *host* memory, or
+/// the value passed by the user with the "vram" argument.
+pub fn default_shm_size_mib() -> usize {
+    use nix::sys::sysinfo::sysinfo;
+    let sysinfo = sysinfo().expect("Failed to get system information");
+    (sysinfo.ram_total() / (1024 * 1024)) as usize
+}
+
+/// default shm size in bytes
+pub fn default_shm_size_bytes() -> usize {
+    let ram_total_mib = default_shm_size_mib();
+    ram_total_mib * 1024 * 1024
 }
 
 impl From<&GpuDisplayConfig> for DisplayInfo {
@@ -79,10 +109,6 @@ impl From<&GpuDisplayConfig> for DisplayInfo {
 #[serde(deny_unknown_fields, default)]
 pub struct GpuConfig {
     /// VirGL renderer creation flags (passed verbatim to rutabaga).
-    ///
-    /// Common values:
-    ///  - `0`  – default VirGL (requires a host EGL/Wayland context)
-    ///  - `1 << 7` (`VIRGLRENDERER_NO_VIRGL`) – 2-D only, no host GL required
     pub virgl_flags: u32,
 
     /// Size of the host-visible shared memory window used for blob resource
@@ -98,8 +124,12 @@ pub struct GpuConfig {
 impl Default for GpuConfig {
     fn default() -> Self {
         GpuConfig {
-            virgl_flags: 0,
-            shm_size_mib: 256,
+            virgl_flags: VIRGLRENDERER_USE_EGL
+                | VIRGLRENDERER_NO_VIRGL
+                | VIRGLRENDERER_DRM
+                | VIRGLRENDERER_THREAD_SYNC
+                | VIRGLRENDERER_USE_ASYNC_FENCE_CB,
+            shm_size_mib: default_shm_size_mib(),
             displays: vec![GpuDisplayConfig {
                 width: 1280,
                 height: 720,

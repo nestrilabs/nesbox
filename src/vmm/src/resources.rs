@@ -78,6 +78,8 @@ pub enum CustomCpuTemplateOrPath {
     Template(CustomCpuTemplate),
 }
 
+// TODO(wnajohiryan): Cleanup `gpu` in the VMMConfig and VMResources where applicable, as we do not want it to end up in user configurations
+
 /// Used for configuring a vmm from one single json passed to the Firecracker process.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -100,6 +102,7 @@ pub struct VmmConfig {
     #[serde(skip)]
     pub serial_config: Option<SerialConfig>,
     pub memory_hotplug: Option<MemoryHotplugConfig>,
+    #[serde(skip)]
     pub gpu: Option<GpuConfig>,
 }
 
@@ -543,7 +546,7 @@ impl From<&VmResources> for VmmConfig {
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
-            gpu: resources.gpu.clone(),
+            gpu: None,
         }
     }
 }
