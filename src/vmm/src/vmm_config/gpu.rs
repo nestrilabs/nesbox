@@ -95,6 +95,27 @@ impl From<&GpuDisplayConfig> for DisplayInfo {
     }
 }
 
+impl From<&DisplayInfo> for GpuDisplayConfig {
+    fn from(info: &DisplayInfo) -> Self {
+        use base64::Engine; // Ensure Engine trait is in scope
+
+        let edid_blob = match &info.edid {
+            DisplayInfoEdid::Provided(bytes) => {
+                Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+            DisplayInfoEdid::Generated(_) => None,
+        };
+
+        GpuDisplayConfig {
+            width: info.width,
+            height: info.height,
+            refresh_rate: default_refresh_rate(),
+            dpi: default_dpi(),
+            edid_blob,
+        }
+    }
+}
+
 /// Top-level GPU device configuration.
 ///
 /// Example JSON:
@@ -153,10 +174,15 @@ impl GpuConfig {
 }
 
 impl From<&Gpu> for GpuConfig {
-    fn from(mem: &Gpu) -> Self {
+    fn from(g: &Gpu) -> Self {
         GpuConfig {
-            virgl_flags: mem.virgl_flags,
-            ..Default::default()
+            virgl_flags: g.virgl_flags,
+            shm_size_mib: g
+                .shm_region
+                .as_ref()
+                .map(|r| r.size / (1024 * 1024))
+                .unwrap_or(0),
+            displays: g.displays.iter().map(&GpuDisplayConfig::from).collect(),
         }
     }
 }
