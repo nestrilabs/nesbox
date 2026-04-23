@@ -97,8 +97,6 @@ impl From<&GpuDisplayConfig> for DisplayInfo {
 
 impl From<&DisplayInfo> for GpuDisplayConfig {
     fn from(info: &DisplayInfo) -> Self {
-        use base64::Engine; // Ensure Engine trait is in scope
-
         let edid_blob = match &info.edid {
             DisplayInfoEdid::Provided(bytes) => {
                 Some(base64::engine::general_purpose::STANDARD.encode(bytes))
@@ -181,7 +179,7 @@ impl From<&Gpu> for GpuConfig {
                 .shm_region
                 .as_ref()
                 .map(|r| r.size / (1024 * 1024))
-                .unwrap_or(0),
+                .unwrap_or(default_shm_size_mib()),
             displays: g.displays.iter().map(&GpuDisplayConfig::from).collect(),
         }
     }
