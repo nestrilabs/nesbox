@@ -9,6 +9,7 @@
 
 use std::cmp::min;
 use std::convert::TryFrom;
+use std::fs::OpenOptions;
 use std::io::Error as SysError;
 use std::io::IoSliceMut;
 use std::mem::size_of;
@@ -37,6 +38,7 @@ use crate::rutabaga_os::FromRawDescriptor;
 use crate::rutabaga_os::IntoRawDescriptor;
 use crate::rutabaga_os::SafeDescriptor;
 use crate::rutabaga_utils::*;
+use crate::AsRawDescriptor;
 
 type Query = virgl_renderer_export_query;
 
@@ -247,6 +249,35 @@ unsafe extern "C" fn get_server_fd(cookie: *mut c_void, version: u32) -> c_int {
     .unwrap_or_else(|_| abort())
 }
 
+unsafe extern "C" fn get_drm_fd(cookie: *mut std::os::raw::c_void) -> std::os::raw::c_int {
+    let cookie = &*(cookie as *const RutabagaCookie);
+    let fd = match &cookie.render_node_fd {
+        Some(fd) => {
+            let raw = fd.as_raw_descriptor();
+            let new_fd = libc::dup(raw);
+            if new_fd < 0 {
+                log::error!(
+                    "NESBOX_GPU: dup({}) failed: {}",
+                    raw,
+                    std::io::Error::last_os_error()
+                );
+                return -1;
+            }
+            log::info!(
+                "NESBOX_GPU: get_drm_fd callback called, dup'd fd={} -> {}",
+                raw,
+                new_fd
+            );
+            new_fd
+        }
+        None => {
+            log::error!("NESBOX_GPU: get_drm_fd called but no render node fd");
+            -1
+        }
+    };
+    fd
+}
+
 const VIRGL_RENDERER_CALLBACKS: &virgl_renderer_callbacks = &virgl_renderer_callbacks {
     #[cfg(not(feature = "virgl_renderer_next"))]
     version: 1,
@@ -256,7 +287,7 @@ const VIRGL_RENDERER_CALLBACKS: &virgl_renderer_callbacks = &virgl_renderer_call
     create_gl_context: None,
     destroy_gl_context: None,
     make_current: None,
-    get_drm_fd: None,
+    get_drm_fd: Some(get_drm_fd),
     #[cfg(not(feature = "virgl_renderer_next"))]
     write_context_fence: None,
     #[cfg(feature = "virgl_renderer_next")]
@@ -314,15 +345,44 @@ impl VirglRenderer {
 
         unsafe { virgl_set_debug_callback(Some(debug_callback)) };
 
+        // Open host render node for DRM backend
+        // Prefers amdgpu for obvious reasons
+        let render_node_fd = (128..=143).find_map(|n| {
+            let path = format!("/dev/dri/renderD{}", n);
+            let file = OpenOptions::new().read(true).write(true).open(&path).ok()?;
+
+            // Check if it's amdgpu by reading the driver name
+            let sysfs = format!("/sys/class/drm/renderD{}/device/uevent", n);
+            let uevent = std::fs::read_to_string(&sysfs).ok()?;
+            if uevent.contains("DRIVER=amdgpu") {
+                log::info!("NESBOX_GPU: found amdgpu at renderD{}", n);
+                Some(unsafe { SafeDescriptor::from_raw_descriptor(file.into_raw_descriptor()) })
+            } else {
+                log::info!("NESBOX_GPU: skipping renderD{} (not amdgpu)", n);
+                None
+            }
+        });
+
         // Cookie is intentionally never freed because virglrenderer never gets uninitialized.
         // Otherwise, Resource and Context would become invalid because their lifetime is not tied
         // to the Renderer instance. Doing so greatly simplifies the ownership for users of this
         // library.
         let cookie = Box::into_raw(Box::new(RutabagaCookie {
             render_server_fd,
+            render_node_fd,
             fence_handler: Some(fence_handler),
             debug_handler: None,
         }));
+
+        let flags: i32 = virglrenderer_flags.into();
+        log::info!("NESBOX_GPU: virgl_renderer_init flags=0x{:x}", flags);
+        log::info!(
+            "NESBOX_GPU:   DRM(0x400)={} VENUS(0x40)={} EGL(0x1)={} SURFACELESS(0x8)={}",
+            flags & 0x400 != 0,
+            flags & 0x40 != 0,
+            flags & 0x1 != 0,
+            flags & 0x8 != 0
+        );
 
         // Safe because a valid cookie and set of callbacks is used and the result is checked for
         // error.
@@ -334,6 +394,8 @@ impl VirglRenderer {
                     as *mut virgl_renderer_callbacks,
             )
         };
+
+        log::info!("NESBOX_GPU: virgl_renderer_init returned {}", ret);
 
         // If the initialization failed, allow the users to try again.
         if ret != 0 {

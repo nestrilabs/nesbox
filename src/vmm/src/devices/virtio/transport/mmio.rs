@@ -20,6 +20,7 @@ use crate::utils::byte_order;
 use crate::vstate::bus::BusDevice;
 use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+use std::collections::BTreeMap;
 
 // TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;
@@ -62,6 +63,9 @@ pub struct MmioTransport {
     mem: GuestMemoryMmap,
     pub(crate) interrupt: Arc<IrqTrigger>,
     pub is_vhost_user: bool,
+
+    pub(crate) shm_sel: u32,
+    pub(crate) shm_regions: BTreeMap<u32, (u64, u64)>, // id → (base_gpa, length)
 }
 
 impl MmioTransport {
@@ -72,6 +76,15 @@ impl MmioTransport {
         device: Arc<Mutex<dyn VirtioDevice>>,
         is_vhost_user: bool,
     ) -> MmioTransport {
+        // Query the device for any shared memory regions it wants to expose.
+        let shm_regions: BTreeMap<u32, (u64, u64)> = device
+            .lock()
+            .expect("Poisoned lock")
+            .shm_regions()
+            .into_iter()
+            .map(|(id, base, size)| (id, (base, size)))
+            .collect();
+
         MmioTransport {
             device,
             features_select: 0,
@@ -82,7 +95,14 @@ impl MmioTransport {
             mem,
             interrupt,
             is_vhost_user,
+            shm_sel: 0,
+            shm_regions,
         }
+    }
+
+    /// Manually register a shared memory region (e.g. for late binding).
+    pub fn set_shm_region(&mut self, id: u32, base: u64, len: u64) {
+        self.shm_regions.insert(id, (base, len));
     }
 
     /// Gets the encapsulated locked VirtioDevice.
@@ -145,6 +165,7 @@ impl MmioTransport {
         if self.locked_device().is_activated() {
             warn!("reset device while it's still in active state");
         }
+        self.shm_sel = 0;
         self.features_select = 0;
         self.acked_features_select = 0;
         self.queue_select = 0;
@@ -281,6 +302,41 @@ impl BusDevice for MmioTransport {
                     }
                     0x70 => self.device_status,
                     0xfc => self.config_generation,
+                    0xb0 => {
+                        // VIRTIO_MMIO_SHM_LEN_LOW
+                        let val = match self.shm_regions.get(&self.shm_sel) {
+                            Some(&(_base, len)) => len as u32,
+                            None => !0u32,
+                        };
+                        log::info!(
+                            "NESBOX_GPU: SHM_LEN_LOW read sel={} val={:#x} regions={:?}",
+                            self.shm_sel,
+                            val,
+                            self.shm_regions
+                        );
+                        val
+                    }
+                    0xb4 => {
+                        // VIRTIO_MMIO_SHM_LEN_HIGH
+                        match self.shm_regions.get(&self.shm_sel) {
+                            Some(&(_base, len)) => (len >> 32) as u32,
+                            None => !0u32,
+                        }
+                    }
+                    0xb8 => {
+                        // VIRTIO_MMIO_SHM_BASE_LOW
+                        match self.shm_regions.get(&self.shm_sel) {
+                            Some(&(base, _len)) => base as u32,
+                            None => 0,
+                        }
+                    }
+                    0xbc => {
+                        // VIRTIO_MMIO_SHM_BASE_HIGH
+                        match self.shm_regions.get(&self.shm_sel) {
+                            Some(&(base, _len)) => (base >> 32) as u32,
+                            None => 0,
+                        }
+                    }
                     _ => {
                         warn!("unknown virtio mmio register read: {:#x}", offset);
                         return;
@@ -344,6 +400,10 @@ impl BusDevice for MmioTransport {
                     0x94 => self.update_queue_field(|q| hi(&mut q.avail_ring_address, v)),
                     0xa0 => self.update_queue_field(|q| lo(&mut q.used_ring_address, v)),
                     0xa4 => self.update_queue_field(|q| hi(&mut q.used_ring_address, v)),
+                    0xac => {
+                        // VIRTIO_MMIO_SHM_SEL
+                        self.shm_sel = v;
+                    }
                     _ => {
                         warn!("unknown virtio mmio register write: {:#x}", offset);
                     }

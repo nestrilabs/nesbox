@@ -233,6 +233,10 @@ impl DeviceManager {
         // The device mutex mustn't be locked here otherwise it will deadlock.
         let device =
             MmioTransport::new(vm.guest_memory().clone(), interrupt, device, is_vhost_user);
+        log::info!(
+            "NESBOX_GPU: MmioTransport shm_regions={:?}",
+            device.shm_regions
+        );
         self.mmio_devices
             .register_mmio_virtio_for_boot(vm, id, device, event_manager, cmdline)?;
 

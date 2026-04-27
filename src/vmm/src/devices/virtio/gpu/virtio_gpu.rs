@@ -148,6 +148,7 @@ pub struct VirtioGpu {
     fence_state: Arc<Mutex<FenceState>>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
+    pub num_capsets: u32,
 }
 
 impl fmt::Debug for VirtioGpu {
@@ -277,16 +278,24 @@ impl VirtioGpu {
         fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
     ) -> Option<Rutabaga> {
+        let capset_mask: u64 =
+            (1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM) | (1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2);
         // let channels = Self::build_rutabaga_channels();
         let builder = RutabagaBuilder::new(
             rutabaga_gfx::RutabagaComponentType::VirglRenderer,
             virgl_flags,
-            0,
+            capset_mask,
         );
         // .set_rutabaga_channels(Some(channels));
 
         let fence = Self::create_fence_handler(queue_ctl, fence_state, interrupt);
-        builder.build(fence, None).ok()
+        match builder.build(fence, None) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                log::error!("virtio-gpu: rutabaga build failed: {e:?}");
+                None
+            }
+        }
     }
 
     /// Fallback rutabaga that disables virgl entirely.
@@ -334,12 +343,25 @@ impl VirtioGpu {
             }
         };
 
+        let mut num_capsets = 0u32;
+        for i in 0.. {
+            match rutabaga.get_capset_info(i) {
+                Ok((id, ver, size)) => {
+                    log::info!("virtio-gpu: capset[{i}] id={id} ver={ver} size={size}");
+                    num_capsets += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        log::info!("virtio-gpu: {num_capsets} capsets available");
+
         Self {
             rutabaga,
             resources: Default::default(),
             fence_state,
             scanouts: Default::default(),
             displays,
+            num_capsets,
         }
     }
 
@@ -562,6 +584,20 @@ impl VirtioGpu {
 
     pub fn get_capset(&self, capset_id: u32, version: u32) -> VirtioGpuResult {
         let capset = self.rutabaga.get_capset(capset_id, version)?;
+        if capset_id == 6 {
+            log::info!(
+                "NESBOX_GPU: DRM capset {} bytes, first 24: {:02x?}",
+                capset.len(),
+                &capset[..capset.len().min(24)]
+            );
+            if capset.len() >= 20 {
+                let ct = u32::from_le_bytes([capset[16], capset[17], capset[18], capset[19]]);
+                log::info!(
+                    "NESBOX_GPU: DRM capset context_type={} (1=msm, 2=amdgpu, 3=i915)",
+                    ct
+                );
+            }
+        }
         Ok(OkCapset(capset))
     }
 
@@ -575,9 +611,26 @@ impl VirtioGpu {
         context_init: u32,
         context_name: Option<&str>,
     ) -> VirtioGpuResult {
-        self.rutabaga
-            .create_context(ctx_id, context_init, context_name)?;
-        Ok(OkNoData)
+        log::info!(
+            "NESBOX_GPU: create_context ctx_id={} context_init={:#x} ({:#b}) name={:?}",
+            ctx_id,
+            context_init,
+            context_init,
+            context_name
+        );
+        match self
+            .rutabaga
+            .create_context(ctx_id, context_init, context_name)
+        {
+            Ok(_) => {
+                log::info!("NESBOX_GPU: create_context succeeded");
+                Ok(GpuResponse::OkNoData)
+            }
+            Err(e) => {
+                log::error!("NESBOX_GPU: create_context FAILED: {:?}", e);
+                Err(GpuResponse::ErrUnspec)
+            }
+        }
     }
 
     pub fn destroy_context(&mut self, ctx_id: u32) -> VirtioGpuResult {
@@ -687,21 +740,40 @@ impl VirtioGpu {
         shm_region: &VirtioShmRegion,
         offset: u64,
     ) -> VirtioGpuResult {
-        use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
-        use std::os::fd::AsRawFd;
+        log::info!(
+            "NESBOX_GPU: resource_map_blob res={} offset={} shm_addr=0x{:x} shm_size=0x{:x}",
+            resource_id,
+            offset,
+            shm_region.host_addr,
+            shm_region.size
+        );
 
-        let resource = self
+        let res_size = self
             .resources
-            .get_mut(&resource_id)
-            .ok_or(ErrInvalidResourceId)?;
+            .get(&resource_id)
+            .ok_or_else(|| {
+                log::error!("NESBOX_GPU: map_blob: resource {} not found", resource_id);
+                ErrInvalidResourceId
+            })?
+            .size;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        let map_info = self.rutabaga.map_info(resource_id).map_err(|e| {
+            log::error!("NESBOX_GPU: map_blob: map_info failed: {:?}", e);
+            ErrUnspec
+        })?;
+        log::info!(
+            "NESBOX_GPU: map_blob: size={} map_info=0x{:x}",
+            res_size,
+            map_info
+        );
 
-        let export = self
-            .rutabaga
-            .export_blob(resource_id)
-            .map_err(|_| ErrUnspec)?;
-        if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD {
+        if offset + res_size > shm_region.size as u64 {
+            log::error!(
+                "NESBOX_GPU: map_blob: overflow offset={} + size={} > shm={}",
+                offset,
+                res_size,
+                shm_region.size
+            );
             return Err(ErrUnspec);
         }
 
@@ -710,22 +782,71 @@ impl VirtioGpu {
             RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
             RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
             _ => {
-                log::error!("virtio-gpu: unexpected map access mode");
+                log::error!(
+                    "NESBOX_GPU: map_blob: unexpected access mode 0x{:x}",
+                    map_info
+                );
                 return Err(ErrUnspec);
             }
         };
 
-        if offset + resource.size > shm_region.size as u64 {
-            log::error!("virtio-gpu: blob map does not fit in SHM region");
+        let addr = shm_region.host_addr + offset;
+
+        match self.rutabaga.resource_map(
+            resource_id,
+            addr,
+            res_size,
+            prot,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+        ) {
+            Ok(()) => {
+                log::info!("NESBOX_GPU: map_blob: resource_map SUCCESS at 0x{:x}", addr);
+            }
+            Err(e) => {
+                log::warn!(
+                    "NESBOX_GPU: map_blob: resource_map failed ({:?}), trying export_blob fallback",
+                    e
+                );
+                self.map_blob_via_export(resource_id, addr, res_size, prot)?;
+            }
+        }
+
+        // Re-borrow after all &mut self calls are done
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        resource.shmem_offset = Some(offset);
+        Ok(OkMapInfo {
+            map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn map_blob_via_export(
+        &mut self,
+        resource_id: u32,
+        addr: u64,
+        size: u64,
+        prot: i32,
+    ) -> VirtioGpuResult {
+        use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
+        use std::os::fd::AsRawFd;
+
+        let export = self.rutabaga.export_blob(resource_id).map_err(|e| {
+            log::error!("NESBOX_GPU: map_blob: export_blob also failed: {:?}", e);
+            ErrUnspec
+        })?;
+
+        if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD {
+            log::error!("NESBOX_GPU: map_blob: opaque fd not mappable");
             return Err(ErrUnspec);
         }
 
-        let addr = shm_region.host_addr + offset;
-        // SAFETY: mmap with MAP_FIXED into a pre-allocated SHM window.
         let ret = unsafe {
             libc::mmap(
                 addr as *mut libc::c_void,
-                resource.size as usize,
+                size as usize,
                 prot,
                 libc::MAP_SHARED | libc::MAP_FIXED,
                 export.os_handle.as_raw_fd(),
@@ -733,13 +854,16 @@ impl VirtioGpu {
             )
         };
         if ret == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error();
+            log::error!("NESBOX_GPU: map_blob: fallback mmap failed: {}", errno);
             return Err(ErrUnspec);
         }
 
-        resource.shmem_offset = Some(offset);
-        Ok(OkMapInfo {
-            map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
-        })
+        log::info!(
+            "NESBOX_GPU: map_blob: export fallback SUCCESS at 0x{:x}",
+            addr
+        );
+        Ok(OkNoData)
     }
 
     #[cfg(target_os = "linux")]

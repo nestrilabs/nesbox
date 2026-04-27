@@ -78,6 +78,13 @@ pub enum VirtioDeviceType {
 /// expose them to the transport via get_queues/get_queue_events/get_interrupt/get_interrupt_status
 /// fns.
 pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
+    /// Shared memory regions exposed to the guest via MMIO SHM registers.
+    /// Returns a list of (region_id, guest_physical_addr, size_in_bytes).
+    /// Default: no SHM regions.
+    fn shm_regions(&self) -> Vec<(u32, u64, u64)> {
+        vec![]
+    }
+
     /// Get the available features offered by device.
     fn avail_features(&self) -> u64;
 

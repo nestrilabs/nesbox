@@ -311,13 +311,13 @@ impl Vm {
         use vm_allocator::AllocPolicy;
 
         // ── Step 1: Allocate a GPA range ────────────────────────────────────────
-        // We use the 64-bit MMIO allocator (above 4 GiB) so we don't interfere
-        // with DRAM or the 32-bit MMIO window.  Align to 2 MiB so that the guest
+        // Use the 64-bit MMIO allocator (starts at 256 GiB) so we stay within
+        // the CPU's physical address width.  Align to 2 MiB so that the guest
         // can use huge pages inside the window if desired.
         const ALIGN_2MIB: u64 = 2 << 20;
         let guest_phys_addr = self
             .resource_allocator()
-            .past_mmio64_memory
+            .mmio64_memory // ← was: past_mmio64_memory
             .allocate(size_bytes as u64, ALIGN_2MIB, AllocPolicy::FirstMatch)
             .map_err(VmError::ResourceAllocator)?
             .start();

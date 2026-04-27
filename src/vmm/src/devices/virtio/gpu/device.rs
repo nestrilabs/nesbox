@@ -18,6 +18,7 @@
 use crate::{MutEventSubscriber, impl_device_type};
 use std::io::Write;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Sender, unbounded};
@@ -76,6 +77,8 @@ pub struct Gpu {
     /// Per-scanout display configuration (width/height/EDID).
     /// `pub(crate)` so persist.rs can iterate it for snapshotting.
     pub(crate) displays: Box<[DisplayInfo]>,
+
+    pub(crate) num_capsets: Arc<AtomicU32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +119,7 @@ impl Gpu {
             virgl_flags,
             shm_region: None,
             displays,
+            num_capsets: Arc::new(AtomicU32::new(2)),
         })
     }
 
@@ -135,6 +139,13 @@ impl VirtioDevice for Gpu {
 
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn shm_regions(&self) -> Vec<(u32, u64, u64)> {
+        match &self.shm_region {
+            Some(r) => vec![(1, r.guest_addr, r.size as u64)],
+            None => vec![],
+        }
     }
 
     fn avail_features(&self) -> u64 {
@@ -183,7 +194,7 @@ impl VirtioDevice for Gpu {
             events_read: 0,
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
-            num_capsets: 5,
+            num_capsets: self.num_capsets.load(Ordering::Acquire),
         };
 
         let config_slice = config.as_slice();
@@ -263,6 +274,7 @@ impl VirtioDevice for Gpu {
             shm_region,
             self.virgl_flags,
             self.displays.clone(),
+            self.num_capsets.clone(),
         );
         worker.run();
         self.sender = Some(sender);

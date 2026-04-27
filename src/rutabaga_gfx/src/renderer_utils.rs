@@ -31,6 +31,7 @@ pub fn ret_to_res(ret: i32) -> RutabagaResult<()> {
 #[allow(dead_code)]
 pub struct RutabagaCookie {
     pub render_server_fd: Option<SafeDescriptor>,
+    pub render_node_fd: Option<SafeDescriptor>,
     pub fence_handler: Option<RutabagaFenceHandler>,
     pub debug_handler: Option<RutabagaDebugHandler>,
 }

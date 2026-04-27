@@ -687,10 +687,22 @@ fn attach_gpu_device(
     // Register the SHM window with KVM if blob resources are enabled.
     if gpu_config.shm_size_mib > 0 {
         let shm_size_bytes = gpu_config.shm_size_mib * 1024 * 1024;
+        log::info!(
+            "NESBOX_GPU: registering SHM region, size={} MiB",
+            gpu_config.shm_size_mib
+        );
         let shm_region = vm
             .register_gpu_shm_region(shm_size_bytes)
             .map_err(|e| StartMicrovmError::Internal(VmmError::Vm(e)))?;
+        log::info!(
+            "NESBOX_GPU: SHM region registered: host={:#x} guest={:#x} size={:#x}",
+            shm_region.host_addr,
+            shm_region.guest_addr,
+            shm_region.size
+        );
         gpu.set_shm_region(shm_region);
+    } else {
+        log::warn!("NESBOX_GPU: shm_size_mib=0, no SHM region!");
     }
 
     let gpu_arc = Arc::new(Mutex::new(gpu));

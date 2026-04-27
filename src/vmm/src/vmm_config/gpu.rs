@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::devices::virtio::gpu::{
     display::{DisplayInfo, DisplayInfoEdid, EdidParams},
     virgl_flags::{
-        VIRGLRENDERER_DRM, VIRGLRENDERER_NO_VIRGL, VIRGLRENDERER_THREAD_SYNC,
-        VIRGLRENDERER_USE_ASYNC_FENCE_CB, VIRGLRENDERER_USE_EGL,
+        VIRGLRENDERER_DRM, VIRGLRENDERER_THREAD_SYNC, VIRGLRENDERER_USE_ASYNC_FENCE_CB,
+        VIRGLRENDERER_USE_EGL, VIRGLRENDERER_USE_EXTERNAL_BLOB, VIRGLRENDERER_USE_SURFACELESS,
     },
 };
 
@@ -47,28 +47,15 @@ fn default_dpi() -> u32 {
     96
 }
 
-// TODO(wanjohiryan): Check on this later, does it work with multiple VMMs? Should we use host or guest ram from machine_config?
-// FIX: How do we set the HK_SYSMEM in guest? Or let us set it as half of *guest* memory for now, fingers crossed it works
-/// By default, HK sets the heap size to be half the size of the *guest* memory.
-/// Since commit 167744dc it's also possible to override the heap size by setting
-/// the HK_SYSMEM environment variable.
-///
-/// Let's set the SHM window for virtio-gpu to be as large as the host's RAM, not
-/// because we expect VRAM to be as large as RAM, but to account for the more than
-/// likely region fragmentation.
-///
-/// Then, let's set HK_SYSMEM to be either half the size of the *host* memory, or
-/// the value passed by the user with the "vram" argument.
+/// Fallback SHM size when no explicit config is given.
+/// 256 MiB is a safe conservative default that works for most workloads.
 pub fn default_shm_size_mib() -> usize {
-    use nix::sys::sysinfo::sysinfo;
-    let sysinfo = sysinfo().expect("Failed to get system information");
-    (sysinfo.ram_total() / (1024 * 1024)) as usize
+    256
 }
 
 /// default shm size in bytes
 pub fn default_shm_size_bytes() -> usize {
-    let ram_total_mib = default_shm_size_mib();
-    ram_total_mib * 1024 * 1024
+    default_shm_size_mib() * 1024 * 1024
 }
 
 impl From<&GpuDisplayConfig> for DisplayInfo {
@@ -144,10 +131,11 @@ impl Default for GpuConfig {
     fn default() -> Self {
         GpuConfig {
             virgl_flags: VIRGLRENDERER_USE_EGL
-                | VIRGLRENDERER_NO_VIRGL
-                | VIRGLRENDERER_DRM
                 | VIRGLRENDERER_THREAD_SYNC
-                | VIRGLRENDERER_USE_ASYNC_FENCE_CB,
+                | VIRGLRENDERER_USE_ASYNC_FENCE_CB
+                | VIRGLRENDERER_USE_EXTERNAL_BLOB
+                | VIRGLRENDERER_USE_SURFACELESS
+                | VIRGLRENDERER_DRM,
             shm_size_mib: default_shm_size_mib(),
             displays: vec![GpuDisplayConfig {
                 width: 1280,

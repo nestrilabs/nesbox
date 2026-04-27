@@ -10,6 +10,7 @@
 // unimplemented in this headless port.
 
 use std::io::Read;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -50,6 +51,7 @@ pub struct Worker {
     shm_region: VirtioShmRegion,
     virgl_flags: u32,
     displays: Box<[DisplayInfo]>,
+    pub num_capsets: Arc<AtomicU32>,
 }
 
 impl Worker {
@@ -62,6 +64,7 @@ impl Worker {
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
         displays: Box<[DisplayInfo]>,
+        num_capsets: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
         Worker {
             receiver,
@@ -71,6 +74,7 @@ impl Worker {
             shm_region,
             virgl_flags,
             displays,
+            num_capsets,
         }
     }
 
@@ -87,12 +91,30 @@ impl Worker {
     // -----------------------------------------------------------------------
 
     fn work(mut self) {
+        let start = std::time::Instant::now();
         let mut virtio_gpu = VirtioGpu::new(
             self.queue_ctl.clone(),
             self.interrupt.clone(),
             self.virgl_flags,
             self.displays.clone(),
         );
+        log::info!(
+            "virtio-gpu worker: rutabaga init took {:?}",
+            start.elapsed()
+        );
+
+        let actual = virtio_gpu.num_capsets;
+        log::info!("virtio-gpu worker: rutabaga reports {actual} capsets");
+        if actual != self.num_capsets.load(Ordering::Acquire) {
+            log::error!(
+                "virtio-gpu: capset count mismatch! config={}, actual={}. \
+                 Guest may malfunction.",
+                self.num_capsets.load(Ordering::Acquire),
+                actual
+            );
+            // Update anyway so at least future reads are correct
+            self.num_capsets.store(actual, Ordering::Release);
+        }
 
         loop {
             // Block until the event handler signals a queue event.
