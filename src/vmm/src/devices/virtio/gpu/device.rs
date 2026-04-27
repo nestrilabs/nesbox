@@ -119,7 +119,7 @@ impl Gpu {
             virgl_flags,
             shm_region: None,
             displays,
-            num_capsets: Arc::new(AtomicU32::new(2)),
+            num_capsets: Arc::new(AtomicU32::new(1)),
         })
     }
 

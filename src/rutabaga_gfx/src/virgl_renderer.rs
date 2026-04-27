@@ -766,10 +766,10 @@ impl RutabagaComponent for VirglRenderer {
         _prot: i32,
         _flags: i32,
     ) -> RutabagaResult<()> {
-        #[cfg(feature = "virgl_resource_map2")]
+        #[cfg(feature = "virgl_renderer_resource_map_fixed")]
         {
             let ret = unsafe {
-                virgl_renderer_resource_map2(
+                virgl_renderer_resource_map_fixed(
                     _resource_id,
                     _addr as *mut libc::c_void,
                     _size,
@@ -783,7 +783,7 @@ impl RutabagaComponent for VirglRenderer {
 
             Ok(())
         }
-        #[cfg(not(feature = "virgl_resource_map2"))]
+        #[cfg(not(feature = "virgl_renderer_resource_map_fixed"))]
         Err(RutabagaError::Unsupported)
     }
 

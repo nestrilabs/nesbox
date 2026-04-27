@@ -278,8 +278,7 @@ impl VirtioGpu {
         fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
     ) -> Option<Rutabaga> {
-        let capset_mask: u64 =
-            (1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM) | (1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2);
+        let capset_mask: u64 = (1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM);
         // let channels = Self::build_rutabaga_channels();
         let builder = RutabagaBuilder::new(
             rutabaga_gfx::RutabagaComponentType::VirglRenderer,
@@ -654,7 +653,13 @@ impl VirtioGpu {
         commands: &mut [u8],
         fence_ids: &[u64],
     ) -> VirtioGpuResult {
-        self.rutabaga.submit_command(ctx_id, commands, fence_ids)?;
+        self.rutabaga.submit_command(ctx_id, commands, fence_ids).map_err(|e| {
+            let preview: Vec<String> = commands.iter().take(32)
+                .map(|b| format!("{:02x}", b)).collect();
+            log::error!("NESBOX_GPU: submit_command FAILED ctx={} cmd_len={} fences={}: {:?} first_bytes=[{}]",
+                ctx_id, commands.len(), fence_ids.len(), e, preview.join(" "));
+            ErrUnspec
+        })?;
         Ok(OkNoData)
     }
 
@@ -724,7 +729,7 @@ impl VirtioGpu {
     }
 
     // -----------------------------------------------------------------------
-    // Blob resource host mapping (Linux, non-virgl_resource_map2 path)
+    // Blob resource host mapping (Linux, non-virgl_renderer_resource_map_fixed path)
     // -----------------------------------------------------------------------
     //
     // This maps a blob resource into the host-visible SHM window so the guest

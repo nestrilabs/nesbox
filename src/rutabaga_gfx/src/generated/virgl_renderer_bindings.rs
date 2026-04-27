@@ -378,9 +378,9 @@ extern "C" {
         out_size: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
-#[cfg(feature = "virgl_resource_map2")]
+#[cfg(feature = "virgl_renderer_resource_map_fixed")]
 extern "C" {
-    pub fn virgl_renderer_resource_map2(
+    pub fn virgl_renderer_resource_map_fixed(
         res_handle: u32,
         map: *const ::std::os::raw::c_void,
         size: u64,
