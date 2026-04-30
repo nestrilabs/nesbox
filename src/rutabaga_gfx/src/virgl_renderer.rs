@@ -7,16 +7,19 @@
 
 #![cfg(feature = "virgl_renderer")]
 
-use std::cmp::min;
-use std::convert::TryFrom;
+use std::ffi::CStr;
+use std::fs::canonicalize;
 use std::fs::OpenOptions;
 use std::io::Error as SysError;
+use std::io::IoSlice;
 use std::io::IoSliceMut;
 use std::mem::size_of;
+use std::mem::ManuallyDrop;
+use std::os::fd::IntoRawFd;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::panic::catch_unwind;
 use std::process::abort;
 use std::ptr::null_mut;
@@ -24,23 +27,84 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use log::debug;
 use log::error;
+use log::info;
+use log::log;
 use log::warn;
+use log::Level;
+use mesa3d_util::FromRawDescriptor;
+use mesa3d_util::IntoRawDescriptor;
+use mesa3d_util::MesaError;
+use mesa3d_util::MesaHandle;
+use mesa3d_util::MesaMapping;
+use mesa3d_util::OwnedDescriptor;
+use mesa3d_util::RawDescriptor;
+use mesa3d_util::MESA_HANDLE_TYPE_MEM_DMABUF;
+use mesa3d_util::MESA_HANDLE_TYPE_MEM_OPAQUE_FD;
+use mesa3d_util::MESA_HANDLE_TYPE_MEM_SHM;
+#[cfg(virgl_renderer_unstable)]
+use mesa3d_util::MESA_HANDLE_TYPE_SIGNAL_SYNC_FD;
 
-use crate::generated::virgl_debug_callback_bindings::*;
 use crate::generated::virgl_renderer_bindings::*;
-use crate::renderer_utils::*;
+use crate::handle::RutabagaHandle;
+use crate::renderer_utils::ret_to_res;
+use crate::renderer_utils::RutabagaCookie;
+use crate::renderer_utils::VirglBox;
 use crate::rutabaga_core::RutabagaComponent;
 use crate::rutabaga_core::RutabagaContext;
 use crate::rutabaga_core::RutabagaResource;
-use crate::rutabaga_os::FromRawDescriptor;
-use crate::rutabaga_os::IntoRawDescriptor;
-use crate::rutabaga_os::SafeDescriptor;
-use crate::rutabaga_utils::*;
-use crate::AsRawDescriptor;
+use crate::rutabaga_utils::Resource3DInfo;
+use crate::rutabaga_utils::ResourceCreate3D;
+use crate::rutabaga_utils::ResourceCreateBlob;
+use crate::rutabaga_utils::RutabagaComponentType;
+use crate::rutabaga_utils::RutabagaError;
+use crate::rutabaga_utils::RutabagaFence;
+use crate::rutabaga_utils::RutabagaFenceHandler;
+use crate::rutabaga_utils::RutabagaIovec;
+use crate::rutabaga_utils::RutabagaResult;
+use crate::rutabaga_utils::Transfer3D;
+use crate::rutabaga_utils::VirglRendererFlags;
+use crate::rutabaga_utils::RUTABAGA_FLAG_FENCE;
+use crate::rutabaga_utils::RUTABAGA_FLAG_INFO_RING_IDX;
+use crate::rutabaga_utils::RUTABAGA_MAP_ACCESS_RW;
+use crate::RutabagaPath;
+use crate::RutabagaPaths;
+use crate::RUTABAGA_PATH_TYPE_GPU;
 
 type Query = virgl_renderer_export_query;
+
+/// Default drm fd, returning this indicates that virglrenderer should
+/// find an available GPU itself.
+const DEFAULT_DRM_FD: i32 = -1;
+
+/// Check if the given rutabaga path is a valid GPU path.
+fn is_valid_gpu_path(rpath: &RutabagaPath) -> bool {
+    if rpath.path_type != RUTABAGA_PATH_TYPE_GPU {
+        return false;
+    }
+
+    canonicalize(&rpath.path)
+        .map(|path| {
+            path.to_string_lossy()
+                .to_string()
+                .starts_with("/dev/dri/renderD")
+                && path.exists()
+        })
+        .unwrap_or_default()
+}
+
+fn dup(rd: RawDescriptor) -> RutabagaResult<OwnedDescriptor> {
+    // SAFETY:
+    // Safe because the underlying raw descriptor is guaranteed valid by rd's existence.
+    //
+    // Note that we are cloning the underlying raw descriptor since we have no guarantee of
+    // its existence after this function returns.
+    let rd_as_safe_desc = ManuallyDrop::new(unsafe { OwnedDescriptor::from_raw_descriptor(rd) });
+
+    // We have to clone rd because we have no guarantee ownership was transferred (rd is
+    // borrowed).
+    Ok(rd_as_safe_desc.try_clone().map_err(MesaError::IoError)?)
+}
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
 pub struct VirglRenderer {}
@@ -54,10 +118,16 @@ fn import_resource(resource: &mut RutabagaResource) -> RutabagaResult<()> {
         return Ok(());
     }
 
-    if let Some(_handle) = &resource.handle {
+    if let Some(mesa_handle) = resource.handle.as_ref().and_then(|h| h.as_mesa_handle()) {
         #[cfg(target_os = "linux")]
-        if _handle.handle_type == RUTABAGA_MEM_HANDLE_TYPE_DMABUF {
-            let dmabuf_fd = _handle.os_handle.try_clone()?.into_raw_descriptor();
+        if mesa_handle.handle_type == MESA_HANDLE_TYPE_MEM_DMABUF {
+            let dmabuf_fd = mesa_handle
+                .os_handle
+                .try_clone()
+                .map_err(MesaError::IoError)?
+                .into_raw_descriptor();
+
+            // SAFETY:
             // Safe because we are being passed a valid fd
             unsafe {
                 let dmabuf_size = libc::lseek64(dmabuf_fd, 0, libc::SEEK_END);
@@ -80,6 +150,7 @@ fn import_resource(resource: &mut RutabagaResource) -> RutabagaResult<()> {
                     libc::close(dmabuf_fd);
                     return Ok(());
                 }
+
                 resource.component_mask |= 1 << (RutabagaComponentType::VirglRenderer as u8);
             }
         }
@@ -89,14 +160,22 @@ fn import_resource(resource: &mut RutabagaResource) -> RutabagaResult<()> {
 }
 
 impl RutabagaContext for VirglRendererContext {
-    fn submit_cmd(&mut self, commands: &mut [u8], fence_ids: &[u64]) -> RutabagaResult<()> {
+    fn submit_cmd(
+        &mut self,
+        commands: &mut [u8],
+        fence_ids: &[u64],
+        _shareable_fences: Vec<MesaHandle>,
+    ) -> RutabagaResult<()> {
+        #[cfg(not(virgl_renderer_unstable))]
         if !fence_ids.is_empty() {
-            return Err(RutabagaError::Unsupported);
+            return Err(MesaError::Unsupported.into());
         }
-        if !commands.len().is_multiple_of(size_of::<u32>()) {
+        if commands.len() % size_of::<u32>() != 0 {
             return Err(RutabagaError::InvalidCommandSize(commands.len()));
         }
         let dword_count = (commands.len() / size_of::<u32>()) as i32;
+        #[cfg(not(virgl_renderer_unstable))]
+        // SAFETY:
         // Safe because the context and buffer are valid and virglrenderer will have been
         // initialized if there are Context instances.
         let ret = unsafe {
@@ -106,15 +185,29 @@ impl RutabagaContext for VirglRendererContext {
                 dword_count,
             )
         };
+        #[cfg(virgl_renderer_unstable)]
+        // SAFETY:
+        // Safe because the context and buffers are valid and virglrenderer will have been
+        // initialized if there are Context instances.
+        let ret = unsafe {
+            virgl_renderer_submit_cmd2(
+                commands.as_mut_ptr() as *mut c_void,
+                self.ctx_id as i32,
+                dword_count,
+                fence_ids.as_ptr() as *mut u64,
+                fence_ids.len() as u32,
+            )
+        };
         ret_to_res(ret)
     }
 
     fn attach(&mut self, resource: &mut RutabagaResource) {
         match import_resource(resource) {
             Ok(()) => (),
-            Err(e) => error!("importing resource failing with {e}"),
+            Err(e) => error!("importing resource failing with {}", e),
         }
 
+        // SAFETY:
         // The context id and resource id must be valid because the respective instances ensure
         // their lifetime.
         unsafe {
@@ -123,6 +216,7 @@ impl RutabagaContext for VirglRendererContext {
     }
 
     fn detach(&mut self, resource: &RutabagaResource) {
+        // SAFETY:
         // The context id and resource id must be valid because the respective instances ensure
         // their lifetime.
         unsafe {
@@ -134,26 +228,30 @@ impl RutabagaContext for VirglRendererContext {
         RutabagaComponentType::VirglRenderer
     }
 
-    fn context_create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+    fn context_create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<Option<MesaHandle>> {
         // RutabagaFence::flags are not compatible with virglrenderer's fencing API and currently
         // virglrenderer context's assume all fences on a single timeline are MERGEABLE, and enforce
         // this assumption.
         let flags: u32 = VIRGL_RENDERER_FENCE_FLAG_MERGEABLE;
 
+        // TODO(b/315870313): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
         let ret = unsafe {
             virgl_renderer_context_create_fence(
                 fence.ctx_id,
                 flags,
-                fence.ring_idx as u64,
+                fence.ring_idx as u32,
                 fence.fence_id,
             )
         };
-        ret_to_res(ret)
+        ret_to_res(ret)?;
+        Ok(None)
     }
 }
 
 impl Drop for VirglRendererContext {
     fn drop(&mut self) {
+        // SAFETY:
         // The context is safe to destroy because nothing else can be referencing it.
         unsafe {
             virgl_renderer_context_destroy(self.ctx_id);
@@ -161,41 +259,72 @@ impl Drop for VirglRendererContext {
     }
 }
 
-extern "C" fn debug_callback(fmt: *const ::std::os::raw::c_char, ap: stdio::va_list) {
-    const BUF_LEN: usize = 256;
-    let mut v = [b' '; BUF_LEN];
-
-    let printed_len = unsafe {
-        let ptr = v.as_mut_ptr() as *mut ::std::os::raw::c_char;
-        #[cfg(any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64"
-        ))]
-        let size = BUF_LEN as ::std::os::raw::c_ulong;
-        #[cfg(target_arch = "arm")]
-        let size = BUF_LEN as ::std::os::raw::c_uint;
-
-        stdio::vsnprintf(ptr, size, fmt, ap)
+extern "C" fn log_callback(
+    log_level: virgl_log_level_flags,
+    message: *const ::std::os::raw::c_char,
+    _user_data: *mut ::std::os::raw::c_void,
+) {
+    let level = match log_level {
+        VIRGL_LOG_LEVEL_DEBUG => Level::Debug,
+        VIRGL_LOG_LEVEL_WARNING => Level::Warn,
+        VIRGL_LOG_LEVEL_ERROR => Level::Error,
+        VIRGL_LOG_LEVEL_INFO => Level::Info,
+        _ => Level::Trace,
     };
 
-    if printed_len < 0 {
-        debug!("rutabaga_gfx::virgl_renderer::debug_callback: vsnprintf returned {printed_len}");
-    } else {
-        // vsnprintf returns the number of chars that *would* have been printed
-        let len = min(printed_len as usize, BUF_LEN - 1);
-        debug!("{}", String::from_utf8_lossy(&v[..len]));
-    }
+    // SAFETY:
+    // The caller ensures that `message` is always a valid pointer to a NULL-terminated string
+    // (even if zero-length).
+    let message_str = unsafe { CStr::from_ptr(message) };
+    log!(level, "{}", message_str.to_string_lossy());
 }
 
-/// TODO(ryanneph): re-evaluate if "ring_idx: u8" can be used instead so we can drop this in favor
-/// of the common write_context_fence() from renderer_utils before promoting to
-/// cfg(feature = "virgl_renderer").
-#[cfg(feature = "virgl_renderer_next")]
-extern "C" fn write_context_fence(cookie: *mut c_void, ctx_id: u32, ring_idx: u64, fence_id: u64) {
+extern "C" fn get_drm_fd(cookie: *mut c_void) -> c_int {
     catch_unwind(|| {
         assert!(!cookie.is_null());
+        // SAFETY:
+        // The assert above ensures it's not null, and virglrenderer ensures the pointer
+        // is valid for the duration of this callback.
+        let cookie = unsafe { &mut *(cookie as *mut RutabagaCookie) };
+
+        // Find the first valid GPU path from rutabaga paths
+        let gpu_path = cookie.rutabaga_paths.as_ref().and_then(|rpaths| {
+            rpaths
+                .iter()
+                .find(|rpath| is_valid_gpu_path(rpath))
+                .map(|rpath| rpath.path.clone())
+        });
+
+        match gpu_path {
+            Some(path) => {
+                info!("using provided GPU path {path:?}");
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY)
+                    .open(path)
+                    .inspect_err(|err| error!("failed to open GPU path: {err}"))
+                    .ok()
+                    // Convert file to raw fd, the ownership of the fd is
+                    // transferred to virglrenderer.
+                    .map(|file| file.into_raw_fd())
+                    .unwrap_or(DEFAULT_DRM_FD)
+            }
+            None => {
+                info!("no valid GPU path provided");
+                DEFAULT_DRM_FD
+            }
+        }
+    })
+    .unwrap_or_else(|_| abort())
+}
+
+extern "C" fn write_context_fence(cookie: *mut c_void, ctx_id: u32, ring_idx: u32, fence_id: u64) {
+    catch_unwind(|| {
+        assert!(!cookie.is_null());
+        // SAFETY:
+        // The assert above ensures it's not null, and virglrenderer ensures the pointer
+        // is valid for the duration of this callback.
         let cookie = unsafe { &*(cookie as *mut RutabagaCookie) };
 
         // Call fence completion callback
@@ -211,10 +340,13 @@ extern "C" fn write_context_fence(cookie: *mut c_void, ctx_id: u32, ring_idx: u6
     .unwrap_or_else(|_| abort())
 }
 
-unsafe extern "C" fn write_fence(cookie: *mut c_void, fence: u32) {
+extern "C" fn write_fence(cookie: *mut c_void, fence: u32) {
     catch_unwind(|| {
         assert!(!cookie.is_null());
-        let cookie = &*(cookie as *mut RutabagaCookie);
+        // SAFETY:
+        // The assert above ensures it's not null, and virglrenderer ensures the pointer
+        // is valid for the duration of this callback.
+        let cookie = unsafe { &*(cookie as *mut RutabagaCookie) };
 
         // Call fence completion callback
         if let Some(handler) = &cookie.fence_handler {
@@ -229,11 +361,13 @@ unsafe extern "C" fn write_fence(cookie: *mut c_void, fence: u32) {
     .unwrap_or_else(|_| abort())
 }
 
-#[cfg(feature = "virgl_renderer_next")]
-unsafe extern "C" fn get_server_fd(cookie: *mut c_void, version: u32) -> c_int {
+extern "C" fn get_server_fd(cookie: *mut c_void, version: u32) -> c_int {
     catch_unwind(|| {
         assert!(!cookie.is_null());
-        let cookie = &mut *(cookie as *mut RutabagaCookie);
+        // SAFETY:
+        // The assert above ensures it's not null, and virglrenderer ensures the pointer
+        // is valid for the duration of this callback.
+        let cookie = unsafe { &mut *(cookie as *mut RutabagaCookie) };
 
         if version != 0 {
             return -1;
@@ -243,59 +377,22 @@ unsafe extern "C" fn get_server_fd(cookie: *mut c_void, version: u32) -> c_int {
         cookie
             .render_server_fd
             .take()
-            .map(SafeDescriptor::into_raw_descriptor)
+            .map(OwnedDescriptor::into_raw_descriptor)
             .unwrap_or(-1)
     })
     .unwrap_or_else(|_| abort())
 }
 
-unsafe extern "C" fn get_drm_fd(cookie: *mut std::os::raw::c_void) -> std::os::raw::c_int {
-    let cookie = &*(cookie as *const RutabagaCookie);
-    let fd = match &cookie.render_node_fd {
-        Some(fd) => {
-            let raw = fd.as_raw_descriptor();
-            let new_fd = libc::dup(raw);
-            if new_fd < 0 {
-                log::error!(
-                    "NESBOX_GPU: dup({}) failed: {}",
-                    raw,
-                    std::io::Error::last_os_error()
-                );
-                return -1;
-            }
-            log::info!(
-                "NESBOX_GPU: get_drm_fd callback called, dup'd fd={} -> {}",
-                raw,
-                new_fd
-            );
-            new_fd
-        }
-        None => {
-            log::error!("NESBOX_GPU: get_drm_fd called but no render node fd");
-            -1
-        }
-    };
-    fd
-}
-
 const VIRGL_RENDERER_CALLBACKS: &virgl_renderer_callbacks = &virgl_renderer_callbacks {
-    #[cfg(not(feature = "virgl_renderer_next"))]
-    version: 1,
-    #[cfg(feature = "virgl_renderer_next")]
     version: 3,
     write_fence: Some(write_fence),
     create_gl_context: None,
     destroy_gl_context: None,
     make_current: None,
     get_drm_fd: Some(get_drm_fd),
-    #[cfg(not(feature = "virgl_renderer_next"))]
-    write_context_fence: None,
-    #[cfg(feature = "virgl_renderer_next")]
     write_context_fence: Some(write_context_fence),
-    #[cfg(not(feature = "virgl_renderer_next"))]
-    get_server_fd: None,
-    #[cfg(feature = "virgl_renderer_next")]
     get_server_fd: Some(get_server_fd),
+    get_egl_display: None,
 };
 
 /// Retrieves metadata suitable for export about this resource. If "export_fd" is true,
@@ -308,8 +405,9 @@ fn export_query(resource_id: u32) -> RutabagaResult<Query> {
     query.in_resource_id = resource_id;
     query.in_export_fds = 0;
 
-    // Safe because the image parameters are stack variables of the correct type.
     let ret =
+        // SAFETY:
+        // Safe because the image parameters are stack variables of the correct type.
         unsafe { virgl_renderer_execute(&mut query as *mut _ as *mut c_void, query.hdr.size) };
 
     ret_to_res(ret)?;
@@ -320,9 +418,12 @@ impl VirglRenderer {
     pub fn init(
         virglrenderer_flags: VirglRendererFlags,
         fence_handler: RutabagaFenceHandler,
-        render_server_fd: Option<SafeDescriptor>,
+        render_server_fd: Option<OwnedDescriptor>,
+        rutabaga_paths: Option<RutabagaPaths>,
     ) -> RutabagaResult<Box<dyn RutabagaComponent>> {
         if cfg!(debug_assertions) {
+            // TODO(b/315870313): Add safety comment
+            #[allow(clippy::undocumented_unsafe_blocks)]
             let ret = unsafe { libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO) };
             if ret == -1 {
                 warn!(
@@ -343,25 +444,11 @@ impl VirglRenderer {
             return Err(RutabagaError::AlreadyInUse);
         }
 
-        unsafe { virgl_set_debug_callback(Some(debug_callback)) };
-
-        // Open host render node for DRM backend
-        // Prefers amdgpu for obvious reasons
-        let render_node_fd = (128..=143).find_map(|n| {
-            let path = format!("/dev/dri/renderD{}", n);
-            let file = OpenOptions::new().read(true).write(true).open(&path).ok()?;
-
-            // Check if it's amdgpu by reading the driver name
-            let sysfs = format!("/sys/class/drm/renderD{}/device/uevent", n);
-            let uevent = std::fs::read_to_string(&sysfs).ok()?;
-            if uevent.contains("DRIVER=amdgpu") {
-                log::info!("NESBOX_GPU: found amdgpu at renderD{}", n);
-                Some(unsafe { SafeDescriptor::from_raw_descriptor(file.into_raw_descriptor()) })
-            } else {
-                log::info!("NESBOX_GPU: skipping renderD{} (not amdgpu)", n);
-                None
-            }
-        });
+        // TODO(b/315870313): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        unsafe {
+            virgl_set_log_callback(Some(log_callback), null_mut(), None);
+        };
 
         // Cookie is intentionally never freed because virglrenderer never gets uninitialized.
         // Otherwise, Resource and Context would become invalid because their lifetime is not tied
@@ -369,21 +456,12 @@ impl VirglRenderer {
         // library.
         let cookie = Box::into_raw(Box::new(RutabagaCookie {
             render_server_fd,
-            render_node_fd,
             fence_handler: Some(fence_handler),
             debug_handler: None,
+            rutabaga_paths,
         }));
 
-        let flags: i32 = virglrenderer_flags.into();
-        log::info!("NESBOX_GPU: virgl_renderer_init flags=0x{:x}", flags);
-        log::info!(
-            "NESBOX_GPU:   DRM(0x400)={} VENUS(0x40)={} EGL(0x1)={} SURFACELESS(0x8)={}",
-            flags & 0x400 != 0,
-            flags & 0x40 != 0,
-            flags & 0x1 != 0,
-            flags & 0x8 != 0
-        );
-
+        // SAFETY:
         // Safe because a valid cookie and set of callbacks is used and the result is checked for
         // error.
         let ret = unsafe {
@@ -395,44 +473,24 @@ impl VirglRenderer {
             )
         };
 
-        log::info!("NESBOX_GPU: virgl_renderer_init returned {}", ret);
-
-        // If the initialization failed, allow the users to try again.
-        if ret != 0 {
-            INIT_ONCE.store(false, Ordering::Release);
-        }
-
         ret_to_res(ret)?;
         Ok(Box::new(VirglRenderer {}))
     }
 
-    #[allow(unused_variables)]
     fn map_info(&self, resource_id: u32) -> RutabagaResult<u32> {
-        #[cfg(feature = "virgl_renderer_next")]
-        {
-            let mut map_info = 0;
-            let ret = unsafe { virgl_renderer_resource_get_map_info(resource_id, &mut map_info) };
-            ret_to_res(ret)?;
-
-            Ok(map_info | RUTABAGA_MAP_ACCESS_RW)
-        }
-        #[cfg(not(feature = "virgl_renderer_next"))]
-        Err(RutabagaError::Unsupported)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn map_ptr(&self, resource_id: u32) -> RutabagaResult<u64> {
-        let mut map_ptr = 0;
-        let ret = unsafe { virgl_renderer_resource_get_map_ptr(resource_id, &mut map_ptr) };
+        let mut map_info = 0;
+        // TODO(b/315870313): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        let ret = unsafe { virgl_renderer_resource_get_map_info(resource_id, &mut map_info) };
         ret_to_res(ret)?;
 
-        Ok(map_ptr)
+        Ok(map_info | RUTABAGA_MAP_ACCESS_RW)
     }
 
     fn query(&self, resource_id: u32) -> RutabagaResult<Resource3DInfo> {
         let query = export_query(resource_id)?;
         if query.out_num_fds == 0 {
-            return Err(RutabagaError::Unsupported);
+            return Err(MesaError::Unsupported.into());
         }
 
         // virglrenderer unfortunately doesn't return the width or height, so map to zero.
@@ -446,42 +504,42 @@ impl VirglRenderer {
         })
     }
 
-    #[allow(unused_variables)]
     fn export_blob(&self, resource_id: u32) -> RutabagaResult<Arc<RutabagaHandle>> {
-        #[cfg(feature = "virgl_renderer_next")]
-        {
-            let mut fd_type = 0;
-            let mut fd = -1;
-            let ret =
-                unsafe { virgl_renderer_resource_export_blob(resource_id, &mut fd_type, &mut fd) };
-            ret_to_res(ret)?;
+        let mut fd_type = 0;
+        let mut fd = -1;
+        // TODO(b/315870313): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        let ret =
+            unsafe { virgl_renderer_resource_export_blob(resource_id, &mut fd_type, &mut fd) };
+        ret_to_res(ret)?;
 
-            // Safe because the FD was just returned by a successful virglrenderer
-            // call so it must be valid and owned by us.
-            let handle = unsafe { SafeDescriptor::from_raw_descriptor(fd) };
+        // SAFETY:
+        // Safe because the FD was just returned by a successful virglrenderer
+        // call so it must be valid and owned by us.
+        let handle = unsafe { OwnedDescriptor::from_raw_descriptor(fd) };
 
-            let handle_type = match fd_type {
-                VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF => RUTABAGA_MEM_HANDLE_TYPE_DMABUF,
-                VIRGL_RENDERER_BLOB_FD_TYPE_SHM => RUTABAGA_MEM_HANDLE_TYPE_SHM,
-                VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE => RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD,
-                VIRGL_RENDERER_BLOB_FD_TYPE_APPLE => RUTABAGA_MEM_HANDLE_TYPE_APPLE,
-                _ => {
-                    return Err(RutabagaError::Unsupported);
-                }
-            };
+        let handle_type = match fd_type {
+            VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF => MESA_HANDLE_TYPE_MEM_DMABUF,
+            VIRGL_RENDERER_BLOB_FD_TYPE_SHM => MESA_HANDLE_TYPE_MEM_SHM,
+            VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE => MESA_HANDLE_TYPE_MEM_OPAQUE_FD,
+            _ => {
+                return Err(MesaError::Unsupported.into());
+            }
+        };
 
-            Ok(Arc::new(RutabagaHandle {
+        Ok(Arc::new(
+            MesaHandle {
                 os_handle: handle,
                 handle_type,
-            }))
-        }
-        #[cfg(not(feature = "virgl_renderer_next"))]
-        Err(RutabagaError::Unsupported)
+            }
+            .into(),
+        ))
     }
 }
 
 impl Drop for VirglRenderer {
     fn drop(&mut self) {
+        // SAFETY:
         // Safe because virglrenderer is initialized.
         //
         // This invalidates all context ids and resource ids.  It is fine because struct Rutabaga
@@ -497,6 +555,7 @@ impl RutabagaComponent for VirglRenderer {
     fn get_capset_info(&self, capset_id: u32) -> (u32, u32) {
         let mut version = 0;
         let mut size = 0;
+        // SAFETY:
         // Safe because virglrenderer is initialized by now and properly size stack variables are
         // used for the pointers.
         unsafe {
@@ -508,6 +567,7 @@ impl RutabagaComponent for VirglRenderer {
     fn get_capset(&self, capset_id: u32, version: u32) -> Vec<u8> {
         let (_, max_size) = self.get_capset_info(capset_id);
         let mut buf = vec![0u8; max_size as usize];
+        // SAFETY:
         // Safe because virglrenderer is initialized by now and the given buffer is sized properly
         // for the given cap id/version.
         unsafe {
@@ -517,23 +577,35 @@ impl RutabagaComponent for VirglRenderer {
     }
 
     fn force_ctx_0(&self) {
-        unsafe { virgl_renderer_force_ctx_0() };
+        // TODO(b/315870313): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        unsafe {
+            virgl_renderer_force_ctx_0()
+        };
     }
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+        // TODO(b/315870313): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
         let ret = unsafe { virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) };
         ret_to_res(ret)
     }
 
     fn event_poll(&self) {
-        unsafe { virgl_renderer_poll() };
+        // TODO(b/315870313): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        unsafe {
+            virgl_renderer_poll()
+        };
     }
 
-    fn poll_descriptor(&self) -> Option<SafeDescriptor> {
+    fn poll_descriptor(&self) -> Option<OwnedDescriptor> {
+        // SAFETY:
         // Safe because it can be called anytime and returns -1 in the event of an error.
         let fd = unsafe { virgl_renderer_get_poll_fd() };
         if fd >= 0 {
-            if let Ok(dup_fd) = SafeDescriptor::try_from(&fd as &dyn AsRawFd) {
+            let descriptor: RawDescriptor = fd as RawDescriptor;
+            if let Ok(dup_fd) = dup(descriptor) {
                 return Some(dup_fd);
             }
         }
@@ -559,22 +631,68 @@ impl RutabagaComponent for VirglRenderer {
             flags: resource_create_3d.flags,
         };
 
+        // SAFETY:
         // Safe because virglrenderer is initialized by now, and the return value is checked before
         // returning a new resource. The backing buffers are not supplied with this call.
         let ret = unsafe { virgl_renderer_resource_create(&mut args, null_mut(), 0) };
         ret_to_res(ret)?;
 
+        let mut resource_handle: Option<Arc<RutabagaHandle>> = self.export_blob(resource_id).ok();
+        let mut resource_info_3d: Option<Resource3DInfo> = self.query(resource_id).ok();
+
+        // Fallback if export_blob and query both fail to return a DMABUF handle or 3D info.
+        if resource_handle.is_none() && resource_info_3d.is_none() {
+            let mut info_ext = Default::default();
+
+            // SAFETY: virglrenderer is initialized; info_ext is a valid pointer.
+            // Function writes into info_ext but does not retain the pointer after returning.
+            let ret_info =
+                unsafe { virgl_renderer_resource_get_info_ext(resource_id as i32, &mut info_ext) };
+
+            if ret_info == 0 {
+                // Successfully got info_ext, now try to get the FD.
+                let mut fd = -1;
+
+                // SAFETY: virglrenderer is initialized; tex_id is from valid resource.
+                // fd is written by the call and remains owned by the caller.
+                let ret_fd =
+                    unsafe { virgl_renderer_get_fd_for_texture(info_ext.base.tex_id, &mut fd) };
+
+                if ret_fd == 0 && fd >= 0 {
+                    // Successfully got DMABUF FD.
+                    let fourcc: u32 = info_ext.base.drm_fourcc as u32;
+
+                    // SAFETY: `fd` is validated to be >= 0 and uniquely owned.
+                    let owned_fd = unsafe { OwnedDescriptor::from_raw_descriptor(fd) };
+
+                    resource_handle = Some(Arc::new(
+                        MesaHandle {
+                            os_handle: owned_fd,
+                            handle_type: MESA_HANDLE_TYPE_MEM_DMABUF,
+                        }
+                        .into(),
+                    ));
+                    resource_info_3d = Some(Resource3DInfo {
+                        width: info_ext.base.width,
+                        height: info_ext.base.height,
+                        drm_fourcc: fourcc,
+                        strides: [info_ext.base.stride, 0, 0, 0], // Assuming single plane
+                        offsets: [0, 0, 0, 0],                    // Assuming single plane
+                        modifier: info_ext.modifiers,
+                    });
+                }
+            }
+        }
+
         Ok(RutabagaResource {
             resource_id,
-            handle: self.export_blob(resource_id).ok(),
+            handle: resource_handle,
             blob: false,
             blob_mem: 0,
             blob_flags: 0,
             map_info: None,
-            #[cfg(target_os = "macos")]
-            map_ptr: None,
             info_2d: None,
-            info_3d: self.query(resource_id).ok(),
+            info_3d: resource_info_3d,
             vulkan_info: None,
             backing_iovecs: None,
             component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
@@ -588,6 +706,7 @@ impl RutabagaComponent for VirglRenderer {
         resource_id: u32,
         vecs: &mut Vec<RutabagaIovec>,
     ) -> RutabagaResult<()> {
+        // SAFETY:
         // Safe because the backing is into guest memory that we store a reference count for.
         let ret = unsafe {
             virgl_renderer_resource_attach_iov(
@@ -600,6 +719,7 @@ impl RutabagaComponent for VirglRenderer {
     }
 
     fn detach_backing(&self, resource_id: u32) {
+        // SAFETY:
         // Safe as we don't need the old backing iovecs returned and the reference to the guest
         // memory can be dropped as it will no longer be needed for this resource.
         unsafe {
@@ -608,6 +728,7 @@ impl RutabagaComponent for VirglRenderer {
     }
 
     fn unref_resource(&self, resource_id: u32) {
+        // SAFETY:
         // The resource is safe to unreference destroy because no user of these bindings can still
         // be holding a reference.
         unsafe {
@@ -620,9 +741,14 @@ impl RutabagaComponent for VirglRenderer {
         ctx_id: u32,
         resource: &mut RutabagaResource,
         transfer: Transfer3D,
+        buf: Option<IoSlice>,
     ) -> RutabagaResult<()> {
         if transfer.is_empty() {
             return Ok(());
+        }
+
+        if buf.is_some() {
+            return Err(MesaError::Unsupported.into());
         }
 
         let mut transfer_box = VirglBox {
@@ -634,6 +760,7 @@ impl RutabagaComponent for VirglRenderer {
             d: transfer.d,
         };
 
+        // SAFETY:
         // Safe because only stack variables of the appropriate type are used.
         let ret = unsafe {
             virgl_renderer_transfer_write_iov(
@@ -685,6 +812,7 @@ impl RutabagaComponent for VirglRenderer {
             None => (null_mut(), 0),
         };
 
+        // SAFETY:
         // Safe because only stack variables of the appropriate type are used.
         let ret = unsafe {
             virgl_renderer_transfer_read_iov(
@@ -711,132 +839,110 @@ impl RutabagaComponent for VirglRenderer {
         mut iovec_opt: Option<Vec<RutabagaIovec>>,
         _handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
-        #[cfg(feature = "virgl_renderer_next")]
-        {
-            let mut iovec_ptr = null_mut();
-            let mut num_iovecs = 0;
-            if let Some(ref mut iovecs) = iovec_opt {
-                iovec_ptr = iovecs.as_mut_ptr();
-                num_iovecs = iovecs.len();
-            }
-
-            let resource_create_args = virgl_renderer_resource_create_blob_args {
-                res_handle: resource_id,
-                ctx_id,
-                blob_mem: resource_create_blob.blob_mem,
-                blob_flags: resource_create_blob.blob_flags,
-                blob_id: resource_create_blob.blob_id,
-                size: resource_create_blob.size,
-                iovecs: iovec_ptr as *const iovec,
-                num_iovs: num_iovecs as u32,
-            };
-
-            let ret = unsafe { virgl_renderer_resource_create_blob(&resource_create_args) };
-            ret_to_res(ret)?;
-
-            // TODO(b/244591751): assign vulkan_info to support opaque_fd mapping via Vulkano when
-            // sandboxing (hence external_blob) is enabled.
-            Ok(RutabagaResource {
-                resource_id,
-                handle: self.export_blob(resource_id).ok(),
-                blob: true,
-                blob_mem: resource_create_blob.blob_mem,
-                blob_flags: resource_create_blob.blob_flags,
-                map_info: self.map_info(resource_id).ok(),
-                #[cfg(target_os = "macos")]
-                map_ptr: self.map_ptr(resource_id).ok(),
-                info_2d: None,
-                info_3d: self.query(resource_id).ok(),
-                vulkan_info: None,
-                backing_iovecs: iovec_opt,
-                component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
-                size: resource_create_blob.size,
-                mapping: None,
-            })
+        let mut iovec_ptr = null_mut();
+        let mut num_iovecs = 0;
+        if let Some(ref mut iovecs) = iovec_opt {
+            iovec_ptr = iovecs.as_mut_ptr();
+            num_iovecs = iovecs.len();
         }
-        #[cfg(not(feature = "virgl_renderer_next"))]
-        Err(RutabagaError::Unsupported)
+
+        let resource_create_args = virgl_renderer_resource_create_blob_args {
+            res_handle: resource_id,
+            ctx_id,
+            blob_mem: resource_create_blob.blob_mem,
+            blob_flags: resource_create_blob.blob_flags,
+            blob_id: resource_create_blob.blob_id,
+            size: resource_create_blob.size,
+            iovecs: iovec_ptr as *const iovec,
+            num_iovs: num_iovecs as u32,
+        };
+
+        // TODO(b/315870313): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        let ret = unsafe { virgl_renderer_resource_create_blob(&resource_create_args) };
+        ret_to_res(ret)?;
+
+        // TODO(b/244591751): assign vulkan_info to support opaque_fd mapping via Vulkano when
+        // sandboxing (hence external_blob) is enabled.
+        Ok(RutabagaResource {
+            resource_id,
+            handle: self.export_blob(resource_id).ok(),
+            blob: true,
+            blob_mem: resource_create_blob.blob_mem,
+            blob_flags: resource_create_blob.blob_flags,
+            map_info: self.map_info(resource_id).ok(),
+            info_2d: None,
+            info_3d: self.query(resource_id).ok(),
+            vulkan_info: None,
+            backing_iovecs: iovec_opt,
+            component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
+            size: resource_create_blob.size,
+            mapping: None,
+        })
     }
 
-    fn resource_map(
-        &self,
-        _resource_id: u32,
-        _addr: u64,
-        _size: u64,
-        _prot: i32,
-        _flags: i32,
-    ) -> RutabagaResult<()> {
-        #[cfg(feature = "virgl_renderer_resource_map_fixed")]
+    fn map_placed(&self, _resource_id: u32, addr: u64) -> RutabagaResult<()> {
+        #[cfg(virgl_renderer_unstable)]
         {
+            // SAFETY:
+            // Safe because virglrenderer is initialized and addr is a valid pointer provided
+            // by the caller.
             let ret = unsafe {
-                virgl_renderer_resource_map_fixed(
-                    _resource_id,
-                    _addr as *mut libc::c_void,
-                    _size,
-                    _prot,
-                    _flags,
-                )
+                virgl_renderer_resource_map_fixed(_resource_id, addr as *mut libc::c_void)
             };
             if ret != 0 {
                 return Err(RutabagaError::MappingFailed(ret));
             }
-
             Ok(())
         }
-        #[cfg(not(feature = "virgl_renderer_resource_map_fixed"))]
-        Err(RutabagaError::Unsupported)
+        #[cfg(not(virgl_renderer_unstable))]
+        Err(MesaError::Unsupported.into())
     }
 
-    fn map(&self, resource_id: u32) -> RutabagaResult<RutabagaMapping> {
-        #[cfg(feature = "virgl_renderer_next")]
-        {
-            let mut map: *mut c_void = null_mut();
-            let mut size: u64 = 0;
-            // Safe because virglrenderer wraps and validates use of GL/VK.
-            let ret = unsafe { virgl_renderer_resource_map(resource_id, &mut map, &mut size) };
-            if ret != 0 {
-                return Err(RutabagaError::MappingFailed(ret));
-            }
-
-            Ok(RutabagaMapping {
-                ptr: map as u64,
-                size,
-            })
+    fn map(&self, resource_id: u32) -> RutabagaResult<MesaMapping> {
+        let mut map: *mut c_void = null_mut();
+        let mut size: u64 = 0;
+        // SAFETY:
+        // Safe because virglrenderer wraps and validates use of GL/VK.
+        let ret = unsafe { virgl_renderer_resource_map(resource_id, &mut map, &mut size) };
+        if ret != 0 {
+            return Err(RutabagaError::MappingFailed(ret));
         }
-        #[cfg(not(feature = "virgl_renderer_next"))]
-        Err(RutabagaError::Unsupported)
+
+        Ok(MesaMapping {
+            ptr: map as u64,
+            size,
+        })
     }
 
     fn unmap(&self, resource_id: u32) -> RutabagaResult<()> {
-        #[cfg(feature = "virgl_renderer_next")]
-        {
-            // Safe because virglrenderer is initialized by now.
-            let ret = unsafe { virgl_renderer_resource_unmap(resource_id) };
-            ret_to_res(ret)
-        }
-        #[cfg(not(feature = "virgl_renderer_next"))]
-        Err(RutabagaError::Unsupported)
+        // SAFETY:
+        // Safe because virglrenderer is initialized by now.
+        let ret = unsafe { virgl_renderer_resource_unmap(resource_id) };
+        ret_to_res(ret)
     }
 
     #[allow(unused_variables)]
-    fn export_fence(&self, fence_id: u32) -> RutabagaResult<RutabagaHandle> {
-        #[cfg(feature = "virgl_renderer_next")]
+    fn export_fence(&self, fence_id: u64) -> RutabagaResult<MesaHandle> {
+        #[cfg(virgl_renderer_unstable)]
         {
-            // Safe because the parameters are stack variables of the correct type.
             let mut fd: i32 = 0;
+            // SAFETY:
+            // Safe because the parameters are stack variables of the correct type.
             let ret = unsafe { virgl_renderer_export_fence(fence_id, &mut fd) };
             ret_to_res(ret)?;
 
+            // SAFETY:
             // Safe because the FD was just returned by a successful virglrenderer call so it must
             // be valid and owned by us.
-            let fence = unsafe { SafeDescriptor::from_raw_descriptor(fd) };
-            Ok(RutabagaHandle {
+            let fence = unsafe { OwnedDescriptor::from_raw_descriptor(fd) };
+            Ok(MesaHandle {
                 os_handle: fence,
-                handle_type: RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD,
+                handle_type: MESA_HANDLE_TYPE_SIGNAL_SYNC_FD,
             })
         }
-        #[cfg(not(feature = "virgl_renderer_next"))]
-        Err(RutabagaError::Unsupported)
+        #[cfg(not(virgl_renderer_unstable))]
+        Err(MesaError::Unsupported.into())
     }
 
     #[allow(unused_variables)]
@@ -852,10 +958,10 @@ impl RutabagaComponent for VirglRenderer {
             name = name_string;
         }
 
+        // SAFETY:
         // Safe because virglrenderer is initialized by now and the context name is statically
         // allocated. The return value is checked before returning a new context.
         let ret = unsafe {
-            #[cfg(feature = "virgl_renderer_next")]
             match context_init {
                 0 => virgl_renderer_context_create(
                     ctx_id,
@@ -869,8 +975,6 @@ impl RutabagaComponent for VirglRenderer {
                     name.as_ptr() as *const c_char,
                 ),
             }
-            #[cfg(not(feature = "virgl_renderer_next"))]
-            virgl_renderer_context_create(ctx_id, name.len() as u32, name.as_ptr() as *const c_char)
         };
         ret_to_res(ret)?;
         Ok(Box::new(VirglRendererContext { ctx_id }))

@@ -4,7 +4,7 @@
 
 //! This module implements cross-platform allocation of window system buffers.
 //! In addition, it may perform mappings of GPU buffers.  This is based on
-//! "gralloc", a well-known Android hardware abstaction layer (HAL).
+//! "gralloc", a well-known Android hardware abstraction layer (HAL).
 //!
 //! <https://source.android.com/devices/graphics/arch-bq-gralloc>
 
@@ -12,7 +12,6 @@ mod formats;
 mod gralloc;
 mod minigbm;
 mod minigbm_bindings;
-mod rendernode;
 mod system_gralloc;
 mod vulkano_gralloc;
 
@@ -20,4 +19,5 @@ pub use formats::DrmFormat;
 pub use gralloc::ImageAllocationInfo;
 pub use gralloc::ImageMemoryRequirements;
 pub use gralloc::RutabagaGralloc;
+pub use gralloc::RutabagaGrallocBackendFlags;
 pub use gralloc::RutabagaGrallocFlags;

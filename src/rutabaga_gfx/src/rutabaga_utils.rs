@@ -4,24 +4,22 @@
 
 //! rutabaga_utils: Utility enums, structs, and implementations needed by the rest of the crate.
 
-use std::ffi::NulError;
 use std::fmt;
-use std::io::Error as IoError;
-use std::num::TryFromIntError;
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 use std::path::PathBuf;
-use std::str::Utf8Error;
 use std::sync::Arc;
 
-#[cfg(unix)]
-use nix::Error as NixError;
+use mesa3d_util::MesaError;
 use remain::sorted;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Error as SerdeJsonError;
 use thiserror::Error;
 #[cfg(feature = "vulkano")]
 use vulkano::device::DeviceCreationError;
 #[cfg(feature = "vulkano")]
-use vulkano::image::ImageCreationError;
+use vulkano::image::ImageError;
 #[cfg(feature = "vulkano")]
 use vulkano::instance::InstanceCreationError;
 #[cfg(feature = "vulkano")]
@@ -32,8 +30,9 @@ use vulkano::memory::MemoryMapError;
 use vulkano::LoadingError;
 #[cfg(feature = "vulkano")]
 use vulkano::VulkanError;
-
-use crate::rutabaga_os::SafeDescriptor;
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
 
 /// Represents a buffer.  `base` contains the address of a buffer, while `len` contains the length
 /// of the buffer.
@@ -44,7 +43,10 @@ pub struct RutabagaIovec {
     pub len: usize,
 }
 
+// SAFETY: trivially safe
 unsafe impl Send for RutabagaIovec {}
+
+// SAFETY: trivially safe
 unsafe impl Sync for RutabagaIovec {}
 
 /// 3D resource creation parameters.  Also used to create 2D resource.  Constants based on Mesa's
@@ -53,7 +55,7 @@ unsafe impl Sync for RutabagaIovec {}
 pub const RUTABAGA_PIPE_TEXTURE_2D: u32 = 2;
 pub const RUTABAGA_PIPE_BIND_RENDER_TARGET: u32 = 2;
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
 pub struct ResourceCreate3D {
     pub target: u32,
     pub format: u32,
@@ -84,15 +86,9 @@ pub struct ResourceCreateBlob {
     pub size: u64,
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct RutabagaMapping {
-    pub ptr: u64,
-    pub size: u64,
-}
-
 /// Metadata associated with a swapchain, video or camera image.
-#[derive(Default, Copy, Clone, Debug)]
+#[repr(C)]
+#[derive(Default, Copy, Clone, Debug, Deserialize, Serialize)]
 pub struct Resource3DInfo {
     pub width: u32,
     pub height: u32,
@@ -103,14 +99,44 @@ pub struct Resource3DInfo {
 }
 
 /// A unique identifier for a device.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FromBytes,
+    IntoBytes,
+    Immutable,
+)]
+#[repr(C)]
+#[derive(Deserialize, Serialize)]
 pub struct DeviceId {
     pub device_uuid: [u8; 16],
     pub driver_uuid: [u8; 16],
 }
 
 /// Memory index and physical device id of the associated VkDeviceMemory.
-#[derive(Copy, Clone, Default)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FromBytes,
+    IntoBytes,
+    Immutable,
+)]
+#[repr(C)]
+#[derive(Deserialize, Serialize)]
 pub struct VulkanInfo {
     pub memory_idx: u32,
     pub device_id: DeviceId,
@@ -122,7 +148,7 @@ pub const RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK: u32 = 0x00ff;
 /// Rutabaga flags for creating fences.
 pub const RUTABAGA_FLAG_FENCE: u32 = 1 << 0;
 pub const RUTABAGA_FLAG_INFO_RING_IDX: u32 = 1 << 1;
-pub const RUTABAGA_FLAG_FENCE_SHAREABLE: u32 = 1 << 2;
+pub const RUTABAGA_FLAG_FENCE_HOST_SHAREABLE: u32 = 1 << 2;
 
 /// Convenience struct for Rutabaga fences
 #[repr(C)]
@@ -147,10 +173,29 @@ pub struct RutabagaDebug {
     pub message: *const c_char,
 }
 
+/// Rutabaga import flags
+pub const RUTABAGA_IMPORT_FLAG_3D_INFO: u32 = 1 << 0;
+pub const RUTABAGA_IMPORT_FLAG_VULKAN_INFO: u32 = 1 << 1;
+pub const RUTABAGA_IMPORT_FLAG_RESOURCE_EXISTS: u32 = 1 << 30;
+pub const RUTABAGA_IMPORT_FLAG_PRESERVE_CONTENT: u32 = 1 << 31;
+
+/// Import Data for resource_import
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RutabagaImportData {
+    pub flags: u32,
+    pub info_3d: Resource3DInfo,
+}
+
+// SAFETY:
 // This is sketchy, since `message` is a C-string and there's no locking + atomics.  However,
 // the current use case is to mirror the C-API.  If the `RutabagaDebugHandler` is used with
 // by Rust code, a different struct should be used.
 unsafe impl Send for RutabagaDebug {}
+// SAFETY:
+// This is sketchy, since `message` is a C-string and there's no locking + atomics.  However,
+// the current use case is to mirror the C-API.  If the `RutabagaDebugHandler` is used with
+// by Rust code, a different struct should be used.
 unsafe impl Sync for RutabagaDebug {}
 
 /// Mapped memory caching flags (see virtio_gpu spec)
@@ -171,12 +216,18 @@ pub const RUTABAGA_CAPSET_GFXSTREAM_VULKAN: u32 = 3;
 pub const RUTABAGA_CAPSET_VENUS: u32 = 4;
 pub const RUTABAGA_CAPSET_CROSS_DOMAIN: u32 = 5;
 pub const RUTABAGA_CAPSET_DRM: u32 = 6;
-pub const RUTABAGA_CAPSET_GFXSTREAM_MAGMA: u32 = 7;
+pub const RUTABAGA_CAPSET_MAGMA: u32 = 7;
 pub const RUTABAGA_CAPSET_GFXSTREAM_GLES: u32 = 8;
 pub const RUTABAGA_CAPSET_GFXSTREAM_COMPOSER: u32 = 9;
 
-/// An error generated while using this crate.
+/// A list specifying general categories of rutabaga_gfx error.
+///
+/// This list is intended to grow over time and it is not recommended to exhaustively match against
+/// it.
+///
+/// It is used with the [`RutabagaError`] type.
 #[sorted]
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum RutabagaError {
     /// Indicates `Rutabaga` was already initialized since only one Rutabaga instance per process
@@ -251,38 +302,23 @@ pub enum RutabagaError {
     #[error("invalid resource id")]
     InvalidResourceId,
     /// Indicates an error in the RutabagaBuilder.
-    #[error("invalid rutabaga build parameters: {0}")]
-    InvalidRutabagaBuild(&'static str),
-    /// An error with the RutabagaHandle
-    #[error("invalid rutabaga handle")]
-    InvalidRutabagaHandle,
-    /// Invalid Vulkan info
+    #[error("invalid rutabaga build parameters")]
+    InvalidRutabagaBuild,
+    /// An error with VulkanInfo
     #[error("invalid vulkan info")]
     InvalidVulkanInfo,
-    /// An input/output error occured.
-    #[error("an input/output error occur: {0}")]
-    IoError(IoError),
     /// The mapping failed.
     #[error("The mapping failed with library error: {0}")]
     MappingFailed(i32),
-    /// Nix crate error.
-    #[cfg(unix)]
-    #[error("The errno is {0}")]
-    NixError(NixError),
-    #[error("Nul Error occured {0}")]
-    NulError(NulError),
-    /// Violation of the Rutabaga spec occured.
-    #[error("violation of the rutabaga spec: {0}")]
-    SpecViolation(&'static str),
-    /// An attempted integer conversion failed.
-    #[error("int conversion failed: {0}")]
-    TryFromIntError(TryFromIntError),
-    /// The command is unsupported.
-    #[error("the requested function is not implemented")]
-    Unsupported,
-    /// Utf8 error.
-    #[error("an utf8 error occured: {0}")]
-    Utf8Error(Utf8Error),
+    /// A Mesa Error
+    #[error("An mesa error was returned {0}")]
+    MesaError(MesaError),
+    /// A snapshot JSON error was returned
+    #[error("An serde json snapshot error was returned {0}")]
+    SerdeJsonError(SerdeJsonError),
+    /// A snapshot Error
+    #[error("An snapshot error was returned")]
+    SnapshotError,
     /// Device creation error
     #[cfg(feature = "vulkano")]
     #[error("vulkano device creation failure {0}")]
@@ -298,7 +334,7 @@ pub enum RutabagaError {
     /// Image creation error
     #[cfg(feature = "vulkano")]
     #[error("vulkano image creation failure {0}")]
-    VkImageCreationError(ImageCreationError),
+    VkImageCreationError(ImageError),
     /// Instance creation error
     #[cfg(feature = "vulkano")]
     #[error("vulkano instance creation failure {0}")]
@@ -313,34 +349,15 @@ pub enum RutabagaError {
     VkMemoryMapError(MemoryMapError),
 }
 
-#[cfg(unix)]
-impl From<NixError> for RutabagaError {
-    fn from(e: NixError) -> RutabagaError {
-        RutabagaError::NixError(e)
+impl From<MesaError> for RutabagaError {
+    fn from(e: MesaError) -> RutabagaError {
+        RutabagaError::MesaError(e)
     }
 }
 
-impl From<NulError> for RutabagaError {
-    fn from(e: NulError) -> RutabagaError {
-        RutabagaError::NulError(e)
-    }
-}
-
-impl From<IoError> for RutabagaError {
-    fn from(e: IoError) -> RutabagaError {
-        RutabagaError::IoError(e)
-    }
-}
-
-impl From<TryFromIntError> for RutabagaError {
-    fn from(e: TryFromIntError) -> RutabagaError {
-        RutabagaError::TryFromIntError(e)
-    }
-}
-
-impl From<Utf8Error> for RutabagaError {
-    fn from(e: Utf8Error) -> RutabagaError {
-        RutabagaError::Utf8Error(e)
+impl From<SerdeJsonError> for RutabagaError {
+    fn from(e: SerdeJsonError) -> RutabagaError {
+        RutabagaError::SerdeJsonError(e)
     }
 }
 
@@ -350,6 +367,7 @@ pub type RutabagaResult<T> = std::result::Result<T, RutabagaError>;
 /// Flags for virglrenderer.  Copied from virglrenderer bindings.
 const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
 const VIRGLRENDERER_THREAD_SYNC: u32 = 1 << 1;
+#[allow(dead_code)]
 const VIRGLRENDERER_USE_GLX: u32 = 1 << 2;
 const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
 const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
@@ -376,9 +394,9 @@ impl Default for VirglRendererFlags {
     }
 }
 
-impl From<u32> for VirglRendererFlags {
-    fn from(val: u32) -> Self {
-        VirglRendererFlags(val)
+impl From<VirglRendererFlags> for u32 {
+    fn from(flags: VirglRendererFlags) -> u32 {
+        flags.0
     }
 }
 
@@ -427,11 +445,6 @@ impl VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_THREAD_SYNC, v)
     }
 
-    /// Use GLX for context creation.
-    pub fn use_glx(self, v: bool) -> VirglRendererFlags {
-        self.set_flag(VIRGLRENDERER_USE_GLX, v)
-    }
-
     /// No surfaces required when creating context.
     pub fn use_surfaceless(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_SURFACELESS, v)
@@ -461,6 +474,7 @@ impl VirglRendererFlags {
 const STREAM_RENDERER_FLAGS_USE_EGL: u32 = 1 << 0;
 #[allow(dead_code)]
 const STREAM_RENDERER_FLAGS_THREAD_SYNC: u32 = 1 << 1;
+#[allow(dead_code)]
 const STREAM_RENDERER_FLAGS_USE_GLX: u32 = 1 << 2;
 const STREAM_RENDERER_FLAGS_USE_SURFACELESS: u32 = 1 << 3;
 const STREAM_RENDERER_FLAGS_USE_GLES: u32 = 1 << 4;
@@ -496,11 +510,6 @@ impl GfxstreamFlags {
     /// Use EGL for context creation.
     pub fn use_egl(self, v: bool) -> GfxstreamFlags {
         self.set_flag(STREAM_RENDERER_FLAGS_USE_EGL, v)
-    }
-
-    /// Use GLX for context creation.
-    pub fn use_glx(self, v: bool) -> GfxstreamFlags {
-        self.set_flag(STREAM_RENDERER_FLAGS_USE_GLX, v)
     }
 
     /// No surfaces required when creating context.
@@ -575,7 +584,7 @@ pub struct Transfer3D {
 impl Transfer3D {
     /// Constructs a 2 dimensional XY box in 3 dimensional space with unit depth and zero
     /// displacement on the Z axis.
-    pub fn new_2d(x: u32, y: u32, w: u32, h: u32) -> Transfer3D {
+    pub fn new_2d(x: u32, y: u32, w: u32, h: u32, offset: u64) -> Transfer3D {
         Transfer3D {
             x,
             y,
@@ -586,7 +595,7 @@ impl Transfer3D {
             level: 0,
             stride: 0,
             layer_stride: 0,
-            offset: 0,
+            offset,
         }
     }
 
@@ -596,62 +605,49 @@ impl Transfer3D {
     }
 }
 
-/// Rutabaga channel types
-pub const RUTABAGA_CHANNEL_TYPE_WAYLAND: u32 = 0x0001;
-pub const RUTABAGA_CHANNEL_TYPE_CAMERA: u32 = 0x0002;
-pub const RUTABAGA_CHANNEL_TYPE_PW: u32 = 0x0010;
-pub const RUTABAGA_CHANNEL_TYPE_X11: u32 = 0x0011;
+/// Rutabaga path types
+pub const RUTABAGA_PATH_TYPE_WAYLAND: u32 = 0x0001;
+pub const RUTABAGA_PATH_TYPE_GPU: u32 = 0x0002;
+
+pub type RutabagaPaths = Vec<RutabagaPath>;
 
 /// Information needed to open an OS-specific RutabagaConnection (TBD).  Only Linux hosts are
 /// considered at the moment.
 #[derive(Clone)]
-pub struct RutabagaChannel {
-    pub base_channel: PathBuf,
-    pub channel_type: u32,
+pub struct RutabagaPath {
+    pub path: PathBuf,
+    pub path_type: u32,
 }
 
 /// Enumeration of possible rutabaga components.
 #[repr(u8)]
 #[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord)]
 pub enum RutabagaComponentType {
+    NoneSelected,
     Rutabaga2D,
     VirglRenderer,
     Gfxstream,
     CrossDomain,
+    Magma,
 }
 
-/// Rutabaga handle types (memory and sync in same namespace)
-pub const RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0001;
-pub const RUTABAGA_MEM_HANDLE_TYPE_DMABUF: u32 = 0x0002;
-pub const RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0003;
-pub const RUTABAGA_MEM_HANDLE_TYPE_SHM: u32 = 0x0004;
-pub const RUTABAGA_MEM_HANDLE_TYPE_ZIRCON: u32 = 0x0005;
-pub const RUTABAGA_MEM_HANDLE_TYPE_APPLE: u32 = 0x0006;
-
-pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0006;
-pub const RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD: u32 = 0x0007;
-pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0008;
-pub const RUTABAGA_FENCE_HANDLE_TYPE_ZIRCON: u32 = 0x0009;
-
-/// Handle to OS-specific memory or synchronization objects.
-pub struct RutabagaHandle {
-    pub os_handle: SafeDescriptor,
-    pub handle_type: u32,
-}
-
-impl RutabagaHandle {
-    /// Clones an existing rutabaga handle, by using OS specific mechanisms.
-    pub fn try_clone(&self) -> RutabagaResult<RutabagaHandle> {
-        let clone = self
-            .os_handle
-            .try_clone()
-            .map_err(|_| RutabagaError::InvalidRutabagaHandle)?;
-        Ok(RutabagaHandle {
-            os_handle: clone,
-            handle_type: self.handle_type,
-        })
+impl RutabagaComponentType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RutabagaComponentType::NoneSelected => "none_selected",
+            RutabagaComponentType::CrossDomain => "cross_domain",
+            RutabagaComponentType::Gfxstream => "gfxstream",
+            RutabagaComponentType::Magma => "magma",
+            RutabagaComponentType::Rutabaga2D => "rutabaga_2d",
+            RutabagaComponentType::VirglRenderer => "virgl_renderer",
+        }
     }
 }
+
+// Handle types to support special-case consumers.
+pub const RUTABAGA_HANDLE_TYPE_PLATFORM_SCREEN_BUFFER_QNX: u32 = 0x01000000;
+pub const RUTABAGA_HANDLE_TYPE_PLATFORM_EGL_NATIVE_PIXMAP: u32 = 0x02000000;
+pub const RUTABAGA_HANDLE_TYPE_PLATFORM_AHB: u32 = 0x03000000;
 
 #[derive(Clone)]
 pub struct RutabagaHandler<S> {
@@ -680,5 +676,4 @@ impl<S> fmt::Debug for RutabagaHandler<S> {
 }
 
 pub type RutabagaFenceHandler = RutabagaHandler<RutabagaFence>;
-
 pub type RutabagaDebugHandler = RutabagaHandler<RutabagaDebug>;

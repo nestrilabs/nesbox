@@ -168,6 +168,16 @@ impl MsixConfig {
         self.masked = ((reg >> FUNCTION_MASK_BIT) & 1u16) == 1u16;
         self.enabled = ((reg >> MSIX_ENABLE_BIT) & 1u16) == 1u16;
 
+        log::info!(
+            "MSI-X set_msg_ctl: dev={} reg={:#x} {{enabled: {}->{}, masked: {}->{}}}",
+            self.sbdf,
+            reg,
+            old_enabled,
+            self.enabled,
+            old_masked,
+            self.masked
+        );
+
         // Update interrupt routing
         if old_masked != self.masked || old_enabled != self.enabled {
             if self.enabled && !self.masked {
@@ -268,6 +278,15 @@ impl MsixConfig {
 
         let index: usize = (offset / MSIX_TABLE_ENTRIES_MODULO) as usize;
         let modulo_offset = offset % MSIX_TABLE_ENTRIES_MODULO;
+
+        log::info!(
+            "MSI-X write_table: dev={} offset:{} data_len:{} index:{} modulo_offset: {}",
+            self.sbdf,
+            offset,
+            data.len(),
+            index,
+            modulo_offset,
+        );
 
         if index >= self.table_entries.len() {
             warn!("msi-x: invalid table entry index {index}");
@@ -495,8 +514,9 @@ impl MsixCap {
     ) -> Self {
         assert!(table_size < MAX_MSIX_VECTORS_PER_DEVICE);
 
-        // Set the table size and enable MSI-X.
-        let msg_ctl: u16 = 0x8000u16 + table_size - 1;
+        // Initial state: MSI-X disabled (bit 15 = 0), function not masked (bit 14 = 0),
+        // table size in bits 10:0 encoded as N-1.
+        let msg_ctl: u16 = table_size - 1;
 
         MsixCap {
             msg_ctl,

@@ -4,11 +4,13 @@
 
 //! renderer_utils: Utility functions and structs used by virgl_renderer and gfxstream.
 
-use crate::rutabaga_os::SafeDescriptor;
+use mesa3d_util::OwnedDescriptor;
+
 use crate::rutabaga_utils::RutabagaDebugHandler;
 use crate::rutabaga_utils::RutabagaError;
 use crate::rutabaga_utils::RutabagaFenceHandler;
 use crate::rutabaga_utils::RutabagaResult;
+use crate::RutabagaPaths;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -28,10 +30,11 @@ pub fn ret_to_res(ret: i32) -> RutabagaResult<()> {
     }
 }
 
-#[allow(dead_code)]
 pub struct RutabagaCookie {
-    pub render_server_fd: Option<SafeDescriptor>,
-    pub render_node_fd: Option<SafeDescriptor>,
+    #[allow(dead_code)]
+    pub render_server_fd: Option<OwnedDescriptor>,
     pub fence_handler: Option<RutabagaFenceHandler>,
+    #[allow(dead_code)]
     pub debug_handler: Option<RutabagaDebugHandler>,
+    pub rutabaga_paths: Option<RutabagaPaths>,
 }

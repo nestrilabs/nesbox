@@ -235,15 +235,15 @@ impl VirtioPciCommonConfig {
     }
 
     /// Guard queue configuration field writes based on device status.
-    ///
-    /// Per the virtio spec, the driver SHALL follow this sequence:
-    ///   INIT -> ACKNOWLEDGE -> DRIVER -> FEATURES_OK -> DRIVER_OK
-    /// https://docs.oasis-open.org/virtio/virtio/v1.3/csd01/virtio-v1.3-csd01.html#x1-1220001
-    ///
-    /// Queue configuration must only be done between FEATURES_OK and DRIVER_OK.
     fn update_queue_field<F: FnOnce(&mut Queue)>(&mut self, queues: &mut [Queue], f: F) {
+        // Per virtio 1.x spec section 4.1.4.3.2, queue configuration must happen
+        // after FEATURES_OK and before DRIVER_OK. Allow any combination of
+        // ACKNOWLEDGE, DRIVER, FEATURES_OK as long as DRIVER_OK and FAILED are not set.
         let status = self.driver_status;
-        if status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) {
+        let needed = FEATURES_OK;
+        let forbidden = DRIVER_OK | FAILED | DEVICE_NEEDS_RESET;
+
+        if (status & needed) == needed && (status & forbidden) == 0 {
             self.with_queue_mut(queues, f);
         } else {
             warn!(

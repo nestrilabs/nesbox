@@ -1,17 +1,13 @@
 // Copyright 2024 - virtio-gpu port for Firecracker
 //! GPU device configuration and SHM window management.
 
+use std::path::PathBuf;
+
 use crate::Gpu;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use crate::devices::virtio::gpu::{
-    display::{DisplayInfo, DisplayInfoEdid, EdidParams},
-    virgl_flags::{
-        VIRGLRENDERER_DRM, VIRGLRENDERER_THREAD_SYNC, VIRGLRENDERER_USE_ASYNC_FENCE_CB,
-        VIRGLRENDERER_USE_EGL, VIRGLRENDERER_USE_EXTERNAL_BLOB, VIRGLRENDERER_USE_SURFACELESS,
-    },
-};
+use crate::devices::virtio::gpu::display::{DisplayInfo, DisplayInfoEdid, EdidParams};
 
 // ---------------------------------------------------------------------------
 // Public configuration structs (JSON-configurable)
@@ -114,8 +110,8 @@ impl From<&DisplayInfo> for GpuDisplayConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GpuConfig {
-    /// VirGL renderer creation flags (passed verbatim to rutabaga).
-    pub virgl_flags: u32,
+    /// GPU render device to use
+    pub gpu_device_path: PathBuf,
 
     /// Size of the host-visible shared memory window used for blob resource
     /// mapping, in mebibytes.  Set to 0 to disable blob resources (no SHM
@@ -130,12 +126,7 @@ pub struct GpuConfig {
 impl Default for GpuConfig {
     fn default() -> Self {
         GpuConfig {
-            virgl_flags: VIRGLRENDERER_USE_EGL
-                | VIRGLRENDERER_THREAD_SYNC
-                | VIRGLRENDERER_USE_ASYNC_FENCE_CB
-                | VIRGLRENDERER_USE_EXTERNAL_BLOB
-                | VIRGLRENDERER_USE_SURFACELESS
-                | VIRGLRENDERER_DRM,
+            gpu_device_path: "/dev/dri/renderD128".into(),
             shm_size_mib: default_shm_size_mib(),
             displays: vec![GpuDisplayConfig {
                 width: 1280,
@@ -162,7 +153,7 @@ impl GpuConfig {
 impl From<&Gpu> for GpuConfig {
     fn from(g: &Gpu) -> Self {
         GpuConfig {
-            virgl_flags: g.virgl_flags,
+            gpu_device_path: g.gpu_device_path.clone(),
             shm_size_mib: g
                 .shm_region
                 .as_ref()

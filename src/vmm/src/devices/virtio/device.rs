@@ -151,7 +151,15 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
             0 => u64::from(value),
             1 => u64::from(value) << 32,
             _ => {
-                warn!("Cannot acknowledge unknown features page: {}", page);
+                // Modern virtio_pci_modern always probes feature pages 2 and 3 even
+                // though the spec currently only defines 64 feature bits. The driver
+                // expects writes to those pages to silently succeed when the value
+                // is 0 (i.e. it's just acking that it saw nothing).
+                if value != 0 {
+                    warn!(
+                        "virtio: driver tried to ack non-zero features on unsupported page {page}: {value:#x}"
+                    );
+                }
                 0u64
             }
         };

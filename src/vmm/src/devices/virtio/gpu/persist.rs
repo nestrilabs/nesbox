@@ -193,7 +193,7 @@ impl<'a> Persist<'a> for Gpu {
     fn save(&self) -> Self::State {
         GpuState {
             virtio_state: VirtioDeviceState::from_device(self),
-            virgl_flags: self.virgl_flags,
+            virgl_flags: 0,
             displays: self.displays.iter().map(DisplayInfoState::from).collect(),
         }
     }
@@ -215,8 +215,8 @@ impl<'a> Persist<'a> for Gpu {
             // transport layer; we pass an empty string here and let the transport
             // state override it.
             String::new(),
-            state.virgl_flags,
             displays,
+            "".into(), // TODO: Placeholder, should be /dev/dri/renderD*
         )
         .map_err(GpuPersistError::CreateDevice)?;
 

@@ -38,6 +38,7 @@ use super::{
     AVAIL_FEATURES, CTL_INDEX, CUR_INDEX, NUM_QUEUES, QUEUE_SIZES, VirtioShmRegion,
     uapi::VIRTIO_ID_GPU,
 };
+use std::path::PathBuf;
 use vm_memory::ByteValued;
 
 // ---------------------------------------------------------------------------
@@ -67,10 +68,6 @@ pub struct Gpu {
     /// index fired.
     pub(crate) sender: Option<Sender<u64>>,
 
-    /// VirGL renderer creation flags.
-    /// `pub(crate)` so persist.rs can read it for snapshotting.
-    pub(crate) virgl_flags: u32,
-
     /// Host-visible SHM window used for blob resource mapping.
     pub(crate) shm_region: Option<VirtioShmRegion>,
 
@@ -79,6 +76,9 @@ pub struct Gpu {
     pub(crate) displays: Box<[DisplayInfo]>,
 
     pub(crate) num_capsets: Arc<AtomicU32>,
+
+    /// GPU device to use (/dev/dri/renderD*)
+    pub(crate) gpu_device_path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,8 +88,8 @@ pub struct Gpu {
 impl Gpu {
     pub fn new(
         id: String,
-        virgl_flags: u32,
         displays: Box<[DisplayInfo]>,
+        gpu_device_path: PathBuf,
     ) -> Result<Self, super::GpuError> {
         let queues: Vec<Queue> = QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
 
@@ -116,10 +116,10 @@ impl Gpu {
                 .map_err(super::GpuError::EventFd)?,
             queue_ctl,
             sender: None,
-            virgl_flags,
             shm_region: None,
             displays,
             num_capsets: Arc::new(AtomicU32::new(1)),
+            gpu_device_path,
         })
     }
 
@@ -272,9 +272,9 @@ impl VirtioDevice for Gpu {
             self.queue_ctl.clone(),
             interrupt.clone(),
             shm_region,
-            self.virgl_flags,
             self.displays.clone(),
             self.num_capsets.clone(),
+            self.gpu_device_path.clone(),
         );
         worker.run();
         self.sender = Some(sender);

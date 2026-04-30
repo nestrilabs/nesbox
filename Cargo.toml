@@ -1,12 +1,6 @@
 [workspace]
+resolver = "3"
 members = ["src/*"]
-
-# default-members = [
-#     "src/nesbox",
-#     "src/acpi-tables",
-# ]
-
-resolver = "2"
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

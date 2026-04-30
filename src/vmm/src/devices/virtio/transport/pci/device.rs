@@ -349,6 +349,20 @@ impl VirtioPciDevice {
         // Once the BARs are allocated, the capabilities can be added to the PCI configuration.
         self.add_pci_capabilities();
         self.bar_address = virtio_pci_bar_addr;
+
+        log::info!(
+            "=== PCI config space layout for {} (sbdf={:?}) ===",
+            self.id,
+            self.sbdf
+        );
+        for reg in 0..0x40 {
+            // Standard config space (256 bytes)
+            let val = self.configuration.read_reg(reg);
+            if val != 0 {
+                log::info!("  cfg[{:#06x}] = {:#010x}", reg * 4, val);
+            }
+        }
+        log::info!("=== end {} ===", self.id);
     }
 
     /// Constructs a new PCI transport for the given virtio device.
@@ -726,6 +740,15 @@ impl PciDevice for VirtioPciDevice {
         offset: u8,
         data: &[u8],
     ) -> Option<Arc<Barrier>> {
+        log::info!(
+            "PCI cfg WRITE: dev={} reg={:#06x} off={:#04x}+{} data={:02x?}",
+            self.id,
+            reg_idx,
+            reg_idx as usize * 4,
+            offset,
+            data
+        );
+
         // Handle the special case where the capability VIRTIO_PCI_CAP_PCI_CFG
         // is accessed. This capability has a special meaning as it allows the
         // guest to access other capabilities without mapping the PCI BAR.
@@ -744,11 +767,8 @@ impl PciDevice for VirtioPciDevice {
     }
 
     fn read_config_register(&mut self, reg_idx: u16) -> u32 {
-        // Handle the special case where the capability VIRTIO_PCI_CAP_PCI_CFG
-        // is accessed. This capability has a special meaning as it allows the
-        // guest to access other capabilities without mapping the PCI BAR.
         let base = reg_idx as usize * 4;
-        if base >= self.cap_pci_cfg_info.offset as usize
+        let result = if base >= self.cap_pci_cfg_info.offset as usize
             && base + 4
                 <= self.cap_pci_cfg_info.offset as usize + self.cap_pci_cfg_info.cap.bytes().len()
         {
@@ -763,7 +783,16 @@ impl PciDevice for VirtioPciDevice {
             }
         } else {
             self.configuration.read_reg(reg_idx)
-        }
+        };
+
+        log::info!(
+            "PCI cfg READ:  dev={} reg={:#06x} (off={:#04x}) = {:#010x}",
+            self.id,
+            reg_idx,
+            base,
+            result
+        );
+        result
     }
 
     fn detect_bar_reprogramming(
@@ -785,6 +814,8 @@ impl PciDevice for VirtioPciDevice {
     }
 
     fn read_bar(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
+        let len = data.len();
+
         match offset {
             o if o < u64::from(COMMON_CONFIG_BAR_OFFSET + COMMON_CONFIG_SIZE) => {
                 self.common_config.read(
@@ -841,6 +872,15 @@ impl PciDevice for VirtioPciDevice {
             }
             _ => (),
         }
+
+        // After the match, log it:
+        log::debug!(
+            "PCI BAR READ:  dev={} off={:#06x} len={} = {:02x?}",
+            self.id,
+            offset,
+            len,
+            data
+        );
     }
 
     fn write_bar(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {

@@ -161,6 +161,15 @@ impl PciDevices {
 
         let msix_vectors = Vm::create_msix_group(vm.clone(), msix_num)?;
 
+        log::info!(
+            "PCI virtio attach: id={} type={:?} num_queues={} msix_num={} sbdf={:?}",
+            id,
+            device_type,
+            device.lock().unwrap().queues().len(),
+            msix_num,
+            sbdf,
+        );
+
         // Create the transport
         let mut virtio_device =
             VirtioPciDevice::new(id.clone(), mem, device, Arc::new(msix_vectors), sbdf)?;

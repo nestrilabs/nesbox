@@ -5,10 +5,12 @@
 //! A crate for handling 2D and 3D virtio-gpu hypercalls, along with graphics
 //! swapchain allocation and mapping.
 
+mod context_common;
 mod cross_domain;
 mod generated;
 mod gfxstream;
-mod gfxstream_stub;
+mod handle;
+mod magma;
 #[macro_use]
 mod macros;
 #[cfg(any(feature = "gfxstream", feature = "virgl_renderer"))]
@@ -16,11 +18,22 @@ mod renderer_utils;
 mod rutabaga_2d;
 mod rutabaga_core;
 mod rutabaga_gralloc;
-mod rutabaga_os;
-mod rutabaga_snapshot;
 mod rutabaga_utils;
+mod snapshot;
 mod virgl_renderer;
 
+pub use mesa3d_util::FromRawDescriptor as RutabagaFromRawDescriptor;
+pub use mesa3d_util::IntoRawDescriptor as RutabagaIntoRawDescriptor;
+pub use mesa3d_util::MappedRegion as RutabagaMappedRegion;
+pub use mesa3d_util::MesaError::Unsupported as RutabagaUnsupported;
+pub use mesa3d_util::MesaHandle as RutabagaMesaHandle;
+pub use mesa3d_util::OwnedDescriptor as RutabagaDescriptor;
+pub use mesa3d_util::RawDescriptor as RutabagaRawDescriptor;
+pub use mesa3d_util::MESA_HANDLE_TYPE_MEM_DMABUF as RUTABAGA_HANDLE_TYPE_MEM_DMABUF;
+pub use mesa3d_util::MESA_HANDLE_TYPE_MEM_OPAQUE_FD as RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD;
+
+pub use crate::handle::AhbInfo;
+pub use crate::handle::RutabagaHandle;
 pub use crate::rutabaga_core::calculate_capset_mask;
 pub use crate::rutabaga_core::calculate_capset_names;
 pub use crate::rutabaga_core::Rutabaga;
@@ -29,10 +42,6 @@ pub use crate::rutabaga_gralloc::DrmFormat;
 pub use crate::rutabaga_gralloc::ImageAllocationInfo;
 pub use crate::rutabaga_gralloc::ImageMemoryRequirements;
 pub use crate::rutabaga_gralloc::RutabagaGralloc;
+pub use crate::rutabaga_gralloc::RutabagaGrallocBackendFlags;
 pub use crate::rutabaga_gralloc::RutabagaGrallocFlags;
-pub use crate::rutabaga_os::AsRawDescriptor;
-pub use crate::rutabaga_os::FromRawDescriptor as RutabagaFromRawDescriptor;
-pub use crate::rutabaga_os::IntoRawDescriptor as RutabagaIntoRawDescriptor;
-pub use crate::rutabaga_os::MappedRegion as RutabagaMappedRegion;
-pub use crate::rutabaga_os::SafeDescriptor as RutabagaDescriptor;
 pub use crate::rutabaga_utils::*;

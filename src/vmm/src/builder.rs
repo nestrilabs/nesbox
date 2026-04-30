@@ -681,7 +681,7 @@ fn attach_gpu_device(
     // Build the display slice from config.
     let displays = gpu_config.display_infos();
 
-    let mut gpu = Gpu::new("gpu0".to_string(), gpu_config.virgl_flags, displays)
+    let mut gpu = Gpu::new("gpu0".to_string(), displays, gpu_config.gpu_device_path)
         .map_err(|e| StartMicrovmError::Internal(VmmError::Gpu(e)))?;
 
     // Register the SHM window with KVM if blob resources are enabled.

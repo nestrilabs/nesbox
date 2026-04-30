@@ -5,12 +5,16 @@
 //! Utility file for allocating exportable system memory.  On Linux systems,
 //! this is is often done with memfd.
 
+use mesa3d_util::MesaHandle;
+use mesa3d_util::SharedMemory;
+use mesa3d_util::MESA_HANDLE_TYPE_MEM_SHM;
+
 use crate::rutabaga_gralloc::formats::canonical_image_requirements;
 use crate::rutabaga_gralloc::gralloc::Gralloc;
 use crate::rutabaga_gralloc::gralloc::ImageAllocationInfo;
 use crate::rutabaga_gralloc::gralloc::ImageMemoryRequirements;
-use crate::rutabaga_os::SharedMemory;
-use crate::rutabaga_utils::*;
+use crate::rutabaga_utils::RutabagaResult;
+use crate::rutabaga_utils::RUTABAGA_MAP_CACHE_CACHED;
 
 /// A gralloc implementation capable of allocation from system memory.
 pub struct SystemGralloc(());
@@ -44,11 +48,11 @@ impl Gralloc for SystemGralloc {
         Ok(reqs)
     }
 
-    fn allocate_memory(&mut self, reqs: ImageMemoryRequirements) -> RutabagaResult<RutabagaHandle> {
+    fn allocate_memory(&mut self, reqs: ImageMemoryRequirements) -> RutabagaResult<MesaHandle> {
         let shm = SharedMemory::new("rutabaga_gralloc", reqs.size)?;
-        Ok(RutabagaHandle {
+        Ok(MesaHandle {
             os_handle: shm.into(),
-            handle_type: RUTABAGA_MEM_HANDLE_TYPE_SHM,
+            handle_type: MESA_HANDLE_TYPE_MEM_SHM,
         })
     }
 }

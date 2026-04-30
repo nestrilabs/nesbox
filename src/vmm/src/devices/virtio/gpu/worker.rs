@@ -36,6 +36,7 @@ use super::protocol::{
 };
 use super::virtio_gpu::{VirtioGpu, VirtioGpuRing};
 use super::{GpuError, VirtioShmRegion};
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Worker struct
@@ -49,9 +50,9 @@ pub struct Worker {
     queue_ctl: Arc<Mutex<Queue>>,
     interrupt: Arc<dyn VirtioInterrupt>,
     shm_region: VirtioShmRegion,
-    virgl_flags: u32,
     displays: Box<[DisplayInfo]>,
     pub num_capsets: Arc<AtomicU32>,
+    gpu_device_path: PathBuf,
 }
 
 impl Worker {
@@ -62,9 +63,9 @@ impl Worker {
         queue_ctl: Arc<Mutex<Queue>>,
         interrupt: Arc<dyn VirtioInterrupt>,
         shm_region: VirtioShmRegion,
-        virgl_flags: u32,
         displays: Box<[DisplayInfo]>,
         num_capsets: Arc<std::sync::atomic::AtomicU32>,
+        gpu_device_path: PathBuf,
     ) -> Self {
         Worker {
             receiver,
@@ -72,9 +73,9 @@ impl Worker {
             queue_ctl,
             interrupt,
             shm_region,
-            virgl_flags,
             displays,
             num_capsets,
+            gpu_device_path,
         }
     }
 
@@ -95,8 +96,8 @@ impl Worker {
         let mut virtio_gpu = VirtioGpu::new(
             self.queue_ctl.clone(),
             self.interrupt.clone(),
-            self.virgl_flags,
             self.displays.clone(),
+            self.gpu_device_path.clone(),
         );
         log::info!(
             "virtio-gpu worker: rutabaga init took {:?}",
@@ -332,7 +333,13 @@ impl Worker {
             }
 
             GpuCommand::TransferToHost2d(info) => {
-                let transfer = Transfer3D::new_2d(info.r.x, info.r.y, info.r.width, info.r.height);
+                let transfer = Transfer3D::new_2d(
+                    info.r.x,
+                    info.r.y,
+                    info.r.width,
+                    info.r.height,
+                    info.offset,
+                );
                 virtio_gpu.transfer_write(0, info.resource_id, transfer)
             }
 

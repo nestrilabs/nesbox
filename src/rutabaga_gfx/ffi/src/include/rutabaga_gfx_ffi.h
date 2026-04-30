@@ -27,7 +27,7 @@ extern "C" {
  */
 #define RUTABAGA_VERSION_MAJOR 0
 #define RUTABAGA_VERSION_MINOR 1
-#define RUTABAGA_VERSION_PATCH 2
+#define RUTABAGA_VERSION_PATCH 6
 
 /**
  * Rutabaga capsets.
@@ -72,23 +72,26 @@ extern "C" {
 /**
  * Rutabaga handle types
  */
-#define RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD 0x1
-#define RUTABAGA_MEM_HANDLE_TYPE_DMABUF 0x2
-#define RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_WIN32 0x3
-#define RUTABAGA_MEM_HANDLE_TYPE_SHM 0x4
-#define RUTABAGA_MEM_HANDLE_TYPE_ZIRCON 0x5
+#define RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD 0x1
+#define RUTABAGA_HANDLE_TYPE_MEM_DMABUF 0x2
+#define RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_WIN32 0x3
+#define RUTABAGA_HANDLE_TYPE_MEM_SHM 0x4
+#define RUTABAGA_HANDLE_TYPE_MEM_ZIRCON 0x5
 
-#define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD 0x6
-#define RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD 0x7
-#define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x8
-#define RUTABAGA_FENCE_HANDLE_TYPE_ZIRCON 0x9
+#define RUTABAGA_HANDLE_TYPE_SIGNAL_OPAQUE_FD 0x10
+#define RUTABAGA_HANDLE_TYPE_SIGNAL_SYNC_FD 0x20
+#define RUTABAGA_HANDLE_TYPE_SIGNAL_OPAQUE_WIN32 0x30
+#define RUTABAGA_HANDLE_TYPE_SIGNAL_ZIRCON 0x40
+#define RUTABAGA_HANDLE_TYPE_SIGNAL_EVENT_FD 0x50
+
+#define RUTABAGA_HANDLE_TYPE_PLATFORM_SCREEN_BUFFER_QNX 0x01000000
+#define RUTABAGA_HANDLE_TYPE_PLATFORM_EGL_NATIVE_PIXMAP 0x02000000
+#define RUTABAGA_HANDLE_TYPE_PLATFORM_AHB 0x03000000
 
 /**
  * Rutabaga channel types
  */
 #define RUTABAGA_CHANNEL_TYPE_WAYLAND 1
-#define RUTABAGA_CHANNEL_TYPE_PW 0x10
-#define RUTABAGA_CHANNEL_TYPE_X11 0x11
 
 /**
  * Rutabaga WSI
@@ -108,6 +111,18 @@ extern "C" {
 #define RUTABAGA_DEBUG_ERROR 0x1
 #define RUTABAGA_DEBUG_WARN 0x2
 #define RUTABAGA_DEBUG_INFO 0x3
+
+#ifdef RUTABAGA_GFX_FFI_UNSTABLE
+
+/**
+ * Rutabaga resource import flags
+ */
+#define RUTABAGA_IMPORT_FLAG_3D_INFO (1 << 0)
+#define RUTABAGA_IMPORT_FLAG_VULKAN_INFO (1 << 1)
+#define RUTABAGA_IMPORT_FLAG_RESOURCE_EXISTS (1 << 30)
+#define RUTABAGA_IMPORT_FLAG_PRESERVE_CONTENT (1 << 31)
+
+#endif
 
 struct rutabaga;
 
@@ -130,6 +145,22 @@ struct rutabaga_create_3d {
     uint32_t nr_samples;
     uint32_t flags;
 };
+
+#ifdef RUTABAGA_GFX_FFI_UNSTABLE
+
+struct rutabaga_import_data {
+    uint32_t flags;
+    struct {
+        uint32_t width;
+        uint32_t height;
+        uint32_t drm_fourcc;
+        uint32_t strides[4];
+        uint32_t offsets[4];
+        uint64_t modifier;
+    } info_3d;
+};
+
+#endif
 
 struct rutabaga_transfer {
     uint32_t x;
@@ -164,11 +195,13 @@ struct rutabaga_command {
     uint32_t cmd_size;
     uint8_t *cmd;
 
-    /**
-     * Unstable, don't use until version > 0.1.2
-     */
+#ifdef RUTABAGA_GFX_FFI_UNSTABLE
     uint32_t num_in_fences;
     uint64_t *fence_ids;
+#else
+    uint32_t _reserved_1;
+    uint64_t *_reserved_2;
+#endif
 };
 
 /**
@@ -220,6 +253,9 @@ struct rutabaga_builder {
 
     // Optional and platform specific
     struct rutabaga_channels *channels;
+
+    // Optional, renderer specific, null-terminated C-string.
+    const char *renderer_features;
 };
 
 /**
@@ -340,6 +376,30 @@ int32_t rutabaga_resource_map_info(struct rutabaga *ptr, uint32_t resource_id, u
 int32_t rutabaga_submit_command(struct rutabaga *ptr, struct rutabaga_command *cmd);
 
 int32_t rutabaga_create_fence(struct rutabaga *ptr, const struct rutabaga_fence *fence);
+
+#ifdef RUTABAGA_GFX_FFI_UNSTABLE
+
+/**
+ * Write a snapshot to `dir`. The directory is expected to already exist and to be empty.
+ *
+ * # Safety
+ * - `dir` must be a null-terminated C-string.
+ */
+int32_t rutabaga_snapshot(struct rutabaga *ptr, const char *dir);
+
+/**
+ * Restore from a snapshot at `dir`.
+ *
+ * # Safety
+ * - `dir` must be a null-terminated C-string.
+ */
+int32_t rutabaga_restore(struct rutabaga *ptr, const char *dir);
+
+int32_t rutabaga_resource_import(struct rutabaga *ptr, uint32_t resource_id,
+                                 const struct rutabaga_handle *import_handle,
+                                 const struct rutabaga_import_data *import_data);
+
+#endif
 
 #ifdef __cplusplus
 }

@@ -12,10 +12,10 @@ bench = false
 tracing = ["log-instrument"]
 
 [dependencies]
-displaydoc = "0.2.5"
-libc = "0.2.184"
+displaydoc = "0.2"
+libc = "0.2"
 log-instrument = { path = "../log-instrument", optional = true }
-thiserror = "2.0.18"
+thiserror = "2"
 
 [lints]
 workspace = true

@@ -144,28 +144,52 @@ impl MsixVectorGroup {
         set_gsi: bool,
     ) -> Result<(), InterruptError> {
         if let Some(vector) = self.vectors.get(index) {
+            log::info!(
+                "MSI-X update enter: idx={} gsi={} masked={} set_gsi={} addr={:#x}_{:08x} data={:#x}",
+                index,
+                vector.gsi,
+                masked,
+                set_gsi,
+                msi_config.high_addr,
+                msi_config.low_addr,
+                msi_config.data
+            );
             METRICS.interrupts.config_updates.inc();
-            // When an interrupt is masked the GSI will not be passed to KVM through
-            // KVM_SET_GSI_ROUTING. So, call [`disable()`] to unregister the interrupt file
-            // descriptor before passing the interrupt routes to KVM
+
             if masked {
                 vector.disable(&self.vm.common.fd)?;
             }
 
             self.vm.register_msi(vector, masked, msi_config)?;
+            log::info!("MSI-X update: register_msi ok for gsi={}", vector.gsi);
+
             if set_gsi {
-                self.vm
-                    .set_gsi_routes()
-                    .map_err(|err| std::io::Error::other(format!("MSI-X update: {err}")))?
+                match self.vm.set_gsi_routes() {
+                    Ok(()) => log::info!("MSI-X update: set_gsi_routes ok"),
+                    Err(e) => {
+                        log::error!("MSI-X update: set_gsi_routes FAILED: {:?}", e);
+                        return Err(InterruptError::Io(std::io::Error::other(format!(
+                            "MSI-X update: {e}"
+                        ))));
+                    }
+                }
             }
 
-            // Assign KVM_IRQFD after KVM_SET_GSI_ROUTING to avoid
-            // panic on kernel which does not have commit a80ced6ea514
-            // (KVM: SVM: fix panic on out-of-bounds guest IRQ).
             if !masked {
-                vector.enable(&self.vm.common.fd)?;
+                match vector.enable(&self.vm.common.fd) {
+                    Ok(()) => log::info!("MSI-X update: enable irqfd ok for gsi={}", vector.gsi),
+                    Err(e) => {
+                        log::error!(
+                            "MSI-X update: enable irqfd FAILED for gsi={}: {:?}",
+                            vector.gsi,
+                            e
+                        );
+                        return Err(e);
+                    }
+                }
             }
 
+            log::info!("MSI-X update exit: idx={} gsi={} ok", index, vector.gsi);
             return Ok(());
         }
 

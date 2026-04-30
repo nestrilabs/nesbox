@@ -12,9 +12,11 @@ use vulkano::format::Format as VulkanFormat;
 #[cfg(feature = "vulkano")]
 use vulkano::image::ImageAspect as VulkanImageAspect;
 
+use crate::checked_arithmetic;
 use crate::rutabaga_gralloc::gralloc::ImageAllocationInfo;
 use crate::rutabaga_gralloc::gralloc::ImageMemoryRequirements;
-use crate::rutabaga_utils::*;
+use crate::rutabaga_utils::RutabagaError;
+use crate::rutabaga_utils::RutabagaResult;
 
 /*
  * This list is based on Sommelier / cros_gralloc guest userspace.  Formats that are never
@@ -105,7 +107,7 @@ static TRIPLANAR_YUV420: PlanarLayout = PlanarLayout {
 };
 
 impl DrmFormat {
-    /// Constructs a format identifer using a fourcc byte sequence.
+    /// Constructs a format identifier using a fourcc byte sequence.
     #[inline(always)]
     pub fn new(a: u8, b: u8, c: u8, d: u8) -> DrmFormat {
         DrmFormat((a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24))
@@ -179,13 +181,13 @@ impl DrmFormat {
             DRM_FORMAT_NV12 => match plane {
                 0 => Ok(VulkanImageAspect::Plane0),
                 1 => Ok(VulkanImageAspect::Plane1),
-                _ => Err(RutabagaError::InvalidGrallocNumberOfPlanes),
+                _ => Err(RutabagaError::InvalidGrallocNumberOfPlanes.into()),
             },
             DRM_FORMAT_YVU420 => match plane {
                 0 => Ok(VulkanImageAspect::Plane0),
                 1 => Ok(VulkanImageAspect::Plane1),
                 2 => Ok(VulkanImageAspect::Plane2),
-                _ => Err(RutabagaError::InvalidGrallocNumberOfPlanes),
+                _ => Err(RutabagaError::InvalidGrallocNumberOfPlanes.into()),
             },
             _ => Err(RutabagaError::InvalidGrallocDrmFormat),
         }
@@ -267,12 +269,12 @@ mod tests {
     fn format_debug() {
         let f = DrmFormat::new(b'X', b'R', b'2', b'4');
         let mut buf = String::new();
-        write!(&mut buf, "{f:?}").unwrap();
+        write!(&mut buf, "{:?}", f).unwrap();
         assert_eq!(buf, "fourcc(XR24)");
 
         let f = DrmFormat::new(0, 1, 2, 16);
         let mut buf = String::new();
-        write!(&mut buf, "{f:?}").unwrap();
+        write!(&mut buf, "{:?}", f).unwrap();
         assert_eq!(buf, "fourcc(0x00010210)");
     }
 

@@ -2,40 +2,70 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-///! C-bindings for the rutabaga_gfx crate
+//! C bindings for the rutabaga_gfx crate
+
 extern crate rutabaga_gfx;
 
 use std::convert::TryInto;
 use std::ffi::CStr;
 use std::ffi::CString;
+#[cfg(goldfish)]
+use std::io::IoSlice;
 use std::io::IoSliceMut;
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 use std::panic::catch_unwind;
 use std::panic::AssertUnwindSafe;
+use std::path::Path;
 use std::path::PathBuf;
 use std::ptr::copy_nonoverlapping;
-use std::ptr::null;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts;
 use std::slice::from_raw_parts_mut;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
+#[cfg(unix)]
 use libc::iovec;
 use libc::EINVAL;
 use libc::ESRCH;
-use once_cell::sync::OnceCell;
-use rutabaga_gfx::*;
+use rutabaga_gfx::ResourceCreate3D;
+use rutabaga_gfx::ResourceCreateBlob;
+use rutabaga_gfx::Rutabaga;
+use rutabaga_gfx::RutabagaBuilder;
+use rutabaga_gfx::RutabagaComponentType;
+use rutabaga_gfx::RutabagaDebug;
+use rutabaga_gfx::RutabagaDebugHandler;
+use rutabaga_gfx::RutabagaDescriptor;
+use rutabaga_gfx::RutabagaFence;
+use rutabaga_gfx::RutabagaFenceHandler;
+use rutabaga_gfx::RutabagaFromRawDescriptor;
+use rutabaga_gfx::RutabagaHandle;
+use rutabaga_gfx::RutabagaImportData;
+use rutabaga_gfx::RutabagaIntoRawDescriptor;
+use rutabaga_gfx::RutabagaIovec;
+use rutabaga_gfx::RutabagaMesaHandle;
+use rutabaga_gfx::RutabagaPath;
+use rutabaga_gfx::RutabagaRawDescriptor;
+use rutabaga_gfx::RutabagaResult;
+use rutabaga_gfx::RutabagaWsi;
+use rutabaga_gfx::Transfer3D;
+use rutabaga_gfx::RUTABAGA_DEBUG_ERROR;
+
+#[cfg(not(unix))]
+#[repr(C)]
+pub struct iovec {
+    pub iov_base: *mut c_void,
+    pub iov_len: usize,
+}
 
 const NO_ERROR: i32 = 0;
 const RUTABAGA_WSI_SURFACELESS: u64 = 1;
 
-static S_DEBUG_HANDLER: OnceCell<Mutex<RutabagaDebugHandler>> = OnceCell::new();
+static S_DEBUG_HANDLER: OnceLock<Mutex<RutabagaDebugHandler>> = OnceLock::new();
 
 fn log_error(debug_string: String) {
-    // Although this should be only called from a single-thread environment, add locking to
-    // to reduce the amount of unsafe code blocks.
-    if let Some(ref handler_mutex) = S_DEBUG_HANDLER.get() {
+    if let Some(handler_mutex) = S_DEBUG_HANDLER.get() {
         let cstring = CString::new(debug_string.as_str()).expect("CString creation failed");
 
         let debug = RutabagaDebug {
@@ -129,6 +159,9 @@ pub struct rutabaga_command {
 }
 
 #[allow(non_camel_case_types)]
+type rutabaga_import_data = RutabagaImportData;
+
+#[allow(non_camel_case_types)]
 pub type rutabaga_fence_callback = extern "C" fn(user_data: u64, fence: &rutabaga_fence);
 
 #[allow(non_camel_case_types)]
@@ -142,6 +175,7 @@ pub struct rutabaga_builder<'a> {
     pub fence_cb: rutabaga_fence_callback,
     pub debug_cb: Option<rutabaga_debug_callback>,
     pub channels: Option<&'a rutabaga_channels>,
+    pub renderer_features: *const c_char,
 }
 
 fn create_ffi_fence_handler(
@@ -166,7 +200,7 @@ pub unsafe extern "C" fn rutabaga_calculate_capset_mask(
     capset_mask: &mut u64,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        if capset_names == null() {
+        if capset_names.is_null() {
             return -EINVAL;
         }
 
@@ -186,21 +220,19 @@ pub unsafe extern "C" fn rutabaga_calculate_capset_mask(
 #[no_mangle]
 pub unsafe extern "C" fn rutabaga_init(builder: &rutabaga_builder, ptr: &mut *mut rutabaga) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        let fence_handler = create_ffi_fence_handler((*builder).user_data, (*builder).fence_cb);
+        let fence_handler = create_ffi_fence_handler(builder.user_data, builder.fence_cb);
         let mut debug_handler_opt: Option<RutabagaDebugHandler> = None;
 
-        if let Some(func) = (*builder).debug_cb {
-            let debug_handler = create_ffi_debug_handler((*builder).user_data, func);
-            S_DEBUG_HANDLER
-                .set(Mutex::new(debug_handler.clone()))
-                .expect("once_cell set failed");
+        if let Some(func) = builder.debug_cb {
+            let debug_handler = create_ffi_debug_handler(builder.user_data, func);
+            let _ = S_DEBUG_HANDLER.set(Mutex::new(debug_handler.clone()));
             debug_handler_opt = Some(debug_handler);
         }
 
-        let mut rutabaga_channels_opt = None;
-        if let Some(channels) = (*builder).channels {
-            let mut rutabaga_channels: Vec<RutabagaChannel> = Vec::new();
-            let channels_slice = from_raw_parts(channels.channels, channels.num_channels);
+        let mut rutabaga_paths_opt = None;
+        if let Some(paths) = builder.channels {
+            let mut rutabaga_paths: Vec<RutabagaPath> = Vec::new();
+            let channels_slice = from_raw_parts(paths.channels, paths.num_channels);
 
             for channel in channels_slice {
                 let c_str_slice = CStr::from_ptr(channel.channel_name);
@@ -209,32 +241,44 @@ pub unsafe extern "C" fn rutabaga_init(builder: &rutabaga_builder, ptr: &mut *mu
                 let string = str_slice.to_owned();
                 let path = PathBuf::from(&string);
 
-                rutabaga_channels.push(RutabagaChannel {
-                    base_channel: path,
-                    channel_type: channel.channel_type,
+                rutabaga_paths.push(RutabagaPath {
+                    path,
+                    path_type: channel.channel_type,
                 });
             }
 
-            rutabaga_channels_opt = Some(rutabaga_channels);
+            rutabaga_paths_opt = Some(rutabaga_paths);
         }
 
-        let mut component_type = RutabagaComponentType::CrossDomain;
-        if (*builder).capset_mask == 0 {
-            component_type = RutabagaComponentType::Rutabaga2D;
+        let mut renderer_features_opt = None;
+        let renderer_features_ptr = builder.renderer_features;
+        if !renderer_features_ptr.is_null() {
+            let c_str_slice = CStr::from_ptr(renderer_features_ptr);
+            let result = c_str_slice.to_str();
+            let str_slice = return_on_error!(result);
+            let string = str_slice.to_owned();
+            renderer_features_opt = Some(string);
         }
 
-        let rutabaga_wsi = match (*builder).wsi {
+        let rutabaga_wsi = match builder.wsi {
             RUTABAGA_WSI_SURFACELESS => RutabagaWsi::Surfaceless,
             _ => return -EINVAL,
         };
 
-        let result = RutabagaBuilder::new(component_type, (*builder).capset_mask)
+        let mut component = RutabagaComponentType::NoneSelected;
+        if builder.capset_mask == 0 {
+            component = RutabagaComponentType::Rutabaga2D;
+        }
+
+        let result = RutabagaBuilder::new(builder.capset_mask, fence_handler)
+            .set_default_component(component)
             .set_use_external_blob(false)
             .set_use_egl(true)
             .set_wsi(rutabaga_wsi)
             .set_debug_handler(debug_handler_opt)
-            .set_rutabaga_channels(rutabaga_channels_opt)
-            .build(fence_handler, None);
+            .set_rutabaga_paths(rutabaga_paths_opt)
+            .set_renderer_features(renderer_features_opt)
+            .build();
 
         let rtbg = return_on_error!(result);
         *ptr = Box::into_raw(Box::new(rtbg)) as _;
@@ -248,7 +292,7 @@ pub unsafe extern "C" fn rutabaga_init(builder: &rutabaga_builder, ptr: &mut *mu
 #[no_mangle]
 pub extern "C" fn rutabaga_finish(ptr: &mut *mut rutabaga) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        unsafe { Box::from_raw(*ptr) };
+        let _ = unsafe { Box::from_raw(*ptr) };
         *ptr = null_mut();
         NO_ERROR
     }))
@@ -379,11 +423,34 @@ pub extern "C" fn rutabaga_resource_create_3d(
 }
 
 /// # Safety
+/// - Caller must ensure `ptr, `import_handle` and `import_data` are all valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn rutabaga_resource_import(
+    ptr: &mut rutabaga,
+    resource_id: u32,
+    import_handle: &rutabaga_handle,
+    import_data: &rutabaga_import_data,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let internal_handle = RutabagaMesaHandle {
+            os_handle: RutabagaDescriptor::from_raw_descriptor(
+                import_handle.os_handle as RutabagaRawDescriptor,
+            ),
+            handle_type: import_handle.handle_type,
+        };
+
+        let result = ptr.resource_import(resource_id, internal_handle.into(), *import_data);
+        return_result(result)
+    }))
+    .unwrap_or(-ESRCH)
+}
+
+/// # Safety
 /// - If `iovecs` is not null, the caller must ensure `(*iovecs).iovecs` points to a valid array of
 ///   iovecs of size `(*iovecs).num_iovecs`.
 /// - Each iovec must point to valid memory starting at `iov_base` with length `iov_len`.
-/// - Each iovec must valid until the resource's backing is explictly detached or the resource is
-///   is unreferenced.
+/// - Each iovec must valid until the resource's backing is explictly detached or the resource is is
+///   unreferenced.
 #[no_mangle]
 pub unsafe extern "C" fn rutabaga_resource_attach_backing(
     ptr: &mut rutabaga,
@@ -391,7 +458,7 @@ pub unsafe extern "C" fn rutabaga_resource_attach_backing(
     iovecs: &rutabaga_iovecs,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        let slice = from_raw_parts((*iovecs).iovecs, (*iovecs).num_iovecs);
+        let slice = from_raw_parts(iovecs.iovecs, iovecs.num_iovecs);
         let vecs = slice
             .iter()
             .map(|iov| RutabagaIovec {
@@ -449,7 +516,31 @@ pub extern "C" fn rutabaga_resource_transfer_write(
     transfer: &rutabaga_transfer,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        let result = ptr.transfer_write(ctx_id, resource_id, *transfer);
+        let result = ptr.transfer_write(ctx_id, resource_id, *transfer, None);
+        return_result(result)
+    }))
+    .unwrap_or(-ESRCH)
+}
+
+#[cfg(goldfish)]
+#[no_mangle]
+pub unsafe extern "C" fn rutabaga_resource_transfer_write_goldfish(
+    ptr: &mut rutabaga,
+    ctx_id: u32,
+    resource_id: u32,
+    transfer: &rutabaga_transfer,
+    buf: Option<&iovec>,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let slice = match buf {
+            Some(iov) => Some(IoSlice::new(std::slice::from_raw_parts(
+                iov.iov_base as *mut u8,
+                iov.iov_len,
+            ))),
+            None => None,
+        };
+
+        let result = ptr.transfer_write(ctx_id, resource_id, *transfer, slice);
         return_result(result)
     }))
     .unwrap_or(-ESRCH)
@@ -460,8 +551,8 @@ pub extern "C" fn rutabaga_resource_transfer_write(
 ///   iovecs of size `(*iovecs).num_iovecs`.
 /// - If `handle` is not null, the caller must ensure it is a valid OS-descriptor.  Ownership is
 ///   transfered to rutabaga.
-/// - Each iovec must valid until the resource's backing is explictly detached or the resource is
-///   is unreferenced.
+/// - Each iovec must valid until the resource's backing is explictly detached or the resource is is
+///   unreferenced.
 #[no_mangle]
 pub unsafe extern "C" fn rutabaga_resource_create_blob(
     ptr: &mut rutabaga,
@@ -474,7 +565,11 @@ pub unsafe extern "C" fn rutabaga_resource_create_blob(
     catch_unwind(AssertUnwindSafe(|| {
         let mut iovecs_opt: Option<Vec<RutabagaIovec>> = None;
         if let Some(iovs) = iovecs {
-            let slice = from_raw_parts((*iovs).iovecs, (*iovs).num_iovecs);
+            let slice = if iovs.num_iovecs != 0 {
+                from_raw_parts(iovs.iovecs, iovs.num_iovecs)
+            } else {
+                &[]
+            };
             let vecs = slice
                 .iter()
                 .map(|iov| RutabagaIovec {
@@ -486,13 +581,19 @@ pub unsafe extern "C" fn rutabaga_resource_create_blob(
         }
 
         let mut handle_opt: Option<RutabagaHandle> = None;
+
+        // Only needed on Unix, since there is no way to create a handle from guest memory on
+        // Windows.
         if let Some(hnd) = handle {
-            handle_opt = Some(RutabagaHandle {
-                os_handle: RutabagaDescriptor::from_raw_descriptor(
-                    (*hnd).os_handle.try_into().unwrap(),
-                ),
-                handle_type: (*hnd).handle_type,
-            });
+            handle_opt = Some(
+                RutabagaMesaHandle {
+                    os_handle: RutabagaDescriptor::from_raw_descriptor(
+                        hnd.os_handle as RutabagaRawDescriptor,
+                    ),
+                    handle_type: hnd.handle_type,
+                }
+                .into(),
+            );
         }
 
         let result =
@@ -523,9 +624,10 @@ pub extern "C" fn rutabaga_resource_export_blob(
     catch_unwind(AssertUnwindSafe(|| {
         let result = ptr.export_blob(resource_id);
         let hnd = return_on_error!(result);
+        let hnd = return_on_error!(RutabagaMesaHandle::try_from(hnd));
 
-        (*handle).handle_type = hnd.handle_type;
-        (*handle).os_handle = hnd.os_handle.into_raw_descriptor() as i64;
+        handle.handle_type = hnd.handle_type;
+        handle.os_handle = hnd.os_handle.into_raw_descriptor() as i64;
         NO_ERROR
     }))
     .unwrap_or(-ESRCH)
@@ -540,8 +642,8 @@ pub extern "C" fn rutabaga_resource_map(
     catch_unwind(AssertUnwindSafe(|| {
         let result = ptr.map(resource_id);
         let internal_map = return_on_error!(result);
-        (*mapping).ptr = internal_map.ptr as *mut c_void;
-        (*mapping).size = internal_map.size;
+        mapping.ptr = internal_map.ptr as *mut c_void;
+        mapping.size = internal_map.size;
         NO_ERROR
     }))
     .unwrap_or(-ESRCH)
@@ -578,8 +680,17 @@ pub unsafe extern "C" fn rutabaga_submit_command(
     cmd: &rutabaga_command,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        let cmd_slice = from_raw_parts_mut(cmd.cmd, cmd.cmd_size as usize);
-        let fence_ids = from_raw_parts(cmd.fence_ids, cmd.num_in_fences as usize);
+        let cmd_slice = if cmd.cmd_size != 0 {
+            from_raw_parts_mut(cmd.cmd, cmd.cmd_size as usize)
+        } else {
+            &mut []
+        };
+        let fence_ids = if cmd.num_in_fences != 0 {
+            from_raw_parts(cmd.fence_ids, cmd.num_in_fences as usize)
+        } else {
+            &mut []
+        };
+
         let result = ptr.submit_command(cmd.ctx_id, cmd_slice, fence_ids);
         return_result(result)
     }))
@@ -590,6 +701,38 @@ pub unsafe extern "C" fn rutabaga_submit_command(
 pub extern "C" fn rutabaga_create_fence(ptr: &mut rutabaga, fence: &rutabaga_fence) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         let result = ptr.create_fence(*fence);
+        return_result(result)
+    }))
+    .unwrap_or(-ESRCH)
+}
+
+/// # Safety
+/// - `dir` must be a null-terminated C-string.
+#[no_mangle]
+pub unsafe extern "C" fn rutabaga_snapshot(ptr: &mut rutabaga, dir: *const c_char) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let c_str_slice = CStr::from_ptr(dir);
+
+        let result = c_str_slice.to_str();
+        let directory = return_on_error!(result);
+
+        let result = ptr.snapshot(Path::new(directory));
+        return_result(result)
+    }))
+    .unwrap_or(-ESRCH)
+}
+
+/// # Safety
+/// - `dir` must be a null-terminated C-string.
+#[no_mangle]
+pub unsafe extern "C" fn rutabaga_restore(ptr: &mut rutabaga, dir: *const c_char) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let c_str_slice = CStr::from_ptr(dir);
+
+        let result = c_str_slice.to_str();
+        let directory = return_on_error!(result);
+
+        let result = ptr.restore(Path::new(directory));
         return_result(result)
     }))
     .unwrap_or(-ESRCH)

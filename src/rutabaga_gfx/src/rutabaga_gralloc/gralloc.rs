@@ -9,16 +9,57 @@ use std::collections::BTreeMap as Map;
 
 #[cfg(feature = "vulkano")]
 use log::error;
+use mesa3d_util::round_up_to_page_size;
+use mesa3d_util::MappedRegion;
+use mesa3d_util::MesaError;
+use mesa3d_util::MesaHandle;
 
 use crate::rutabaga_gralloc::formats::*;
-#[cfg(feature = "minigbm")]
+#[cfg(feature = "gbm")]
 use crate::rutabaga_gralloc::minigbm::MinigbmDevice;
 use crate::rutabaga_gralloc::system_gralloc::SystemGralloc;
 #[cfg(feature = "vulkano")]
 use crate::rutabaga_gralloc::vulkano_gralloc::VulkanoGralloc;
-use crate::rutabaga_os::round_up_to_page_size;
-use crate::rutabaga_os::MappedRegion;
-use crate::rutabaga_utils::*;
+use crate::rutabaga_utils::RutabagaError;
+use crate::rutabaga_utils::RutabagaResult;
+use crate::rutabaga_utils::VulkanInfo;
+
+const RUTABAGA_GRALLOC_BACKEND_SYSTEM: u32 = 1 << 0;
+const RUTABAGA_GRALLOC_BACKEND_GBM: u32 = 1 << 1;
+const RUTABAGA_GRALLOC_BACKEND_VULKANO: u32 = 1 << 2;
+
+/// Usage flags for constructing rutabaga gralloc backend
+#[derive(Copy, Clone, Eq, PartialEq, Default)]
+pub struct RutabagaGrallocBackendFlags(pub u32);
+
+impl RutabagaGrallocBackendFlags {
+    /// Returns new set of flags.
+    #[inline(always)]
+    pub fn new() -> RutabagaGrallocBackendFlags {
+        RutabagaGrallocBackendFlags(
+            RUTABAGA_GRALLOC_BACKEND_SYSTEM
+                | RUTABAGA_GRALLOC_BACKEND_GBM
+                | RUTABAGA_GRALLOC_BACKEND_VULKANO,
+        )
+    }
+
+    #[inline(always)]
+    pub fn disable_vulkano(self) -> RutabagaGrallocBackendFlags {
+        RutabagaGrallocBackendFlags(self.0 & !RUTABAGA_GRALLOC_BACKEND_VULKANO)
+    }
+
+    pub fn uses_system(&self) -> bool {
+        self.0 & RUTABAGA_GRALLOC_BACKEND_SYSTEM != 0
+    }
+
+    pub fn uses_gbm(&self) -> bool {
+        self.0 & RUTABAGA_GRALLOC_BACKEND_GBM != 0
+    }
+
+    pub fn uses_vulkano(&self) -> bool {
+        self.0 & RUTABAGA_GRALLOC_BACKEND_VULKANO != 0
+    }
+}
 
 /*
  * Rutabaga gralloc flags are copied from minigbm, but redundant legacy flags are left out.
@@ -171,7 +212,7 @@ pub trait Gralloc: Send {
     /// This function must return true if the implementation can:
     ///
     ///   (1) allocate GPU memory and
-    ///   (2) {export to}/{import from} into a OS-specific RutabagaHandle.
+    ///   (2) {export to}/{import from} into a OS-specific MesaHandle.
     fn supports_external_gpu_memory(&self) -> bool;
 
     /// This function must return true the implementation can {export to}/{import from} a Linux
@@ -185,19 +226,19 @@ pub trait Gralloc: Send {
         info: ImageAllocationInfo,
     ) -> RutabagaResult<ImageMemoryRequirements>;
 
-    /// Implementations must allocate memory given the requirements and return a RutabagaHandle
+    /// Implementations must allocate memory given the requirements and return a MesaHandle
     /// upon success.
-    fn allocate_memory(&mut self, reqs: ImageMemoryRequirements) -> RutabagaResult<RutabagaHandle>;
+    fn allocate_memory(&mut self, reqs: ImageMemoryRequirements) -> RutabagaResult<MesaHandle>;
 
     /// Implementations must import the given `handle` and return a mapping, suitable for use with
     /// KVM and other hypervisors.  This is optional and only works with the Vulkano backend.
     fn import_and_map(
         &mut self,
-        _handle: RutabagaHandle,
+        _handle: MesaHandle,
         _vulkan_info: VulkanInfo,
         _size: u64,
     ) -> RutabagaResult<Box<dyn MappedRegion>> {
-        Err(RutabagaError::Unsupported)
+        Err(MesaError::Unsupported.into())
     }
 }
 
@@ -219,14 +260,16 @@ pub struct RutabagaGralloc {
 impl RutabagaGralloc {
     /// Returns a new RutabagaGralloc instance upon success.  All allocation backends that have
     /// been built are initialized.  The default system allocator is always initialized.
-    pub fn new() -> RutabagaResult<RutabagaGralloc> {
+    pub fn new(flags: RutabagaGrallocBackendFlags) -> RutabagaResult<RutabagaGralloc> {
         let mut grallocs: Map<GrallocBackend, Box<dyn Gralloc>> = Default::default();
 
-        let system = SystemGralloc::init()?;
-        grallocs.insert(GrallocBackend::System, system);
+        if flags.uses_system() {
+            let system = SystemGralloc::init()?;
+            grallocs.insert(GrallocBackend::System, system);
+        }
 
-        #[cfg(feature = "minigbm")]
-        {
+        #[cfg(feature = "gbm")]
+        if flags.uses_gbm() {
             // crosvm integration tests build with the "wl-dmabuf" feature, which translates in
             // rutabaga to the "minigbm" feature.  These tests run on hosts where a rendernode is
             // not present, and minigbm can not be initialized.
@@ -238,7 +281,7 @@ impl RutabagaGralloc {
         }
 
         #[cfg(feature = "vulkano")]
-        {
+        if flags.uses_vulkano() {
             match VulkanoGralloc::init() {
                 Ok(vulkano) => {
                     grallocs.insert(GrallocBackend::Vulkano, vulkano);
@@ -285,7 +328,7 @@ impl RutabagaGralloc {
         #[allow(clippy::let_and_return)]
         let mut _backend = GrallocBackend::System;
 
-        #[cfg(feature = "minigbm")]
+        #[cfg(feature = "gbm")]
         {
             // See note on "wl-dmabuf" and Kokoro in Gralloc::new().
             if self.grallocs.contains_key(&GrallocBackend::Minigbm) {
@@ -319,10 +362,7 @@ impl RutabagaGralloc {
     }
 
     /// Allocates memory given the particular `reqs` upon success.
-    pub fn allocate_memory(
-        &mut self,
-        reqs: ImageMemoryRequirements,
-    ) -> RutabagaResult<RutabagaHandle> {
+    pub fn allocate_memory(&mut self, reqs: ImageMemoryRequirements) -> RutabagaResult<MesaHandle> {
         let backend = self.determine_optimal_backend(reqs.info);
 
         let gralloc = self
@@ -337,7 +377,7 @@ impl RutabagaGralloc {
     /// success.  Should not be used with minigbm or system gralloc backends.
     pub fn import_and_map(
         &mut self,
-        handle: RutabagaHandle,
+        handle: MesaHandle,
         vulkan_info: VulkanInfo,
         size: u64,
     ) -> RutabagaResult<Box<dyn MappedRegion>> {
@@ -357,7 +397,7 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn create_render_target() {
-        let gralloc_result = RutabagaGralloc::new();
+        let gralloc_result = RutabagaGralloc::new(RutabagaGrallocBackendFlags::new());
         if gralloc_result.is_err() {
             return;
         }
@@ -386,7 +426,7 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn create_video_buffer() {
-        let gralloc_result = RutabagaGralloc::new();
+        let gralloc_result = RutabagaGralloc::new(RutabagaGrallocBackendFlags::new());
         if gralloc_result.is_err() {
             return;
         }
@@ -424,7 +464,7 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn export_and_map() {
-        let gralloc_result = RutabagaGralloc::new();
+        let gralloc_result = RutabagaGralloc::new(RutabagaGrallocBackendFlags::new());
         if gralloc_result.is_err() {
             return;
         }

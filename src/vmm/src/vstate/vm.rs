@@ -134,6 +134,13 @@ impl Vm {
             attempt += 1;
         };
 
+        log::info!(
+            "KVM caps: MSI_DEVID={} IRQFD={} GSI_ROUTING={}",
+            fd.check_extension(kvm_ioctls::Cap::MsiDevid),
+            fd.check_extension(kvm_ioctls::Cap::Irqfd),
+            fd.check_extension(kvm_ioctls::Cap::IrqRouting),
+        );
+
         Ok(VmCommon {
             fd,
             max_memslots: kvm.max_nr_memslots(),
@@ -317,7 +324,7 @@ impl Vm {
         const ALIGN_2MIB: u64 = 2 << 20;
         let guest_phys_addr = self
             .resource_allocator()
-            .mmio64_memory // ← was: past_mmio64_memory
+            .mmio64_memory
             .allocate(size_bytes as u64, ALIGN_2MIB, AllocPolicy::FirstMatch)
             .map_err(VmError::ResourceAllocator)?
             .start();
@@ -573,12 +580,22 @@ impl Vm {
         let entries = self.common.interrupts.lock().expect("Poisoned lock");
         let mut routes = KvmIrqRouting::new(0)?;
 
+        let mut active = 0;
+        let mut masked = 0;
         for entry in entries.values() {
             if entry.masked {
+                masked += 1;
                 continue;
             }
+            active += 1;
             routes.push(entry.entry)?;
         }
+        log::info!(
+            "set_gsi_routes: total={} active={} masked={}",
+            entries.len(),
+            active,
+            masked
+        );
 
         self.common.fd.set_gsi_routing(&routes)?;
         Ok(())
