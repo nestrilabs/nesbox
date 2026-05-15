@@ -1,30 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["src/*"]
+members = ["vmm", "virtio-devices", "pci", "vm-core"]
 
-[workspace.lints.rust]
-missing_debug_implementations = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
-
-[workspace.lints.clippy]
-ptr_as_ptr = "warn"
-undocumented_unsafe_blocks = "warn"
-cast_possible_truncation = "warn"
-cast_possible_wrap = "warn"
-cast_sign_loss = "warn"
-exit = "warn"
-tests_outside_test_module = "warn"
-assertions_on_result_states = "warn"
-error_impl_error = "warn"
-or_fun_call = "warn"
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-lto = true
-strip = "none"
-
-[profile.bench]
-strip = "debuginfo"
+[workspace.dependencies]
+vm-memory = { version = "0.18", features = ["backend-mmap"] }
+linux-loader = { git = "https://github.com/rust-vmm/linux-loader.git", rev = "83c13bef18fdd8c9de6df47ff7463884cd402a09" }
+acpi_tables = "=0.2.0"
+#rutabaga_gfx = { git = "https://github.com/magma-gpu/rutabaga_gfx.git", rev = "2f0c6a55fd36e61b22a1b3679f69d4273c056602" }

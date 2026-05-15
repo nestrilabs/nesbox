@@ -1,0 +1,13 @@
+[package]
+name = "virtio-devices"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+log = "0.4"
+virtio-queue = "0.17"
+virtio-bindings = "0.2"
+vmm-sys-util = "0.15"
+vm-memory.workspace = true
+pci = { path = "../pci" }

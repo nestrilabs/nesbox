@@ -6,7 +6,7 @@ nesbox is a microVM hypervisor built for cloud gaming workloads. Each VM boots i
 
 ## What it is
 
-nesbox is a fork of [Firecracker](https://github.com/firecracker-microvm/firecracker) that embeds a virtio-gpu device in every virtual machine. The GPU is not an optional add-on: it is always present, always connected, and always ready. You get the full Firecracker security and isolation model with a GPU that behaves as if it were wired directly into the guest.
+nesbox is a VMM that embeds a virtio-gpu device in every virtual machine. The GPU is not an optional add-on: it is always present, always connected, and always ready. You get the full Firecracker security and isolation model with a GPU that behaves as if it were wired directly into the guest.
 
 The primary use case is **cloud streaming**: many lightweight VMs sharing one bare-metal GPU, each running a game or rendering workload at near-native frame rates, isolated from one another, started in the time it takes to launch a process.
 
@@ -14,15 +14,13 @@ The primary use case is **cloud streaming**: many lightweight VMs sharing one ba
 
 ### Kernel
 
-nesbox loads its guest kernel from [**`libkrunfw.so.5`**](https://github.com/nestrilabs/libkrun-nv) — a shared library that embeds a pre-compiled Linux kernel as a read-only symbol. Drop the library into `/usr/lib`, and every VM on that host shares the same kernel image without reading a file at boot time. No initrd is required; the kernel is self-contained. The root filesystem is provided by a virtio-blk block device, just like any other Firecracker VM.
+nesbox can load its guest kernel from [**`libkrunfw.so.5`**](https://github.com/nestrilabs/libkrun-nv) — a shared library that embeds a pre-compiled Linux kernel as a read-only symbol. Drop the library into `/usr/lib`, and every VM on that host shares the same kernel image without reading a file at boot time. No initrd is required; the kernel is self-contained. The root filesystem is provided by a virtio-blk block device, just like any other Firecracker VM.
 
 If you prefer to supply your own kernel, set `kernel_image_path` in the boot source config exactly as you would with stock Firecracker. nesbox will use it instead.
 
 ### GPU
 
-The virtio-gpu device is backed by [rutabaga_gfx](https://crates.io/crates/rutabaga_gfx) and [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer). The default configuration uses the **DRM native context** path (`VIRGLRENDERER_DRM`), which gives the guest near-baremetal access to the host GPU's render engine — no intermediate OpenGL/Vulkan translation layer, no shader recompilation on the host side.
-
-Guest VRAM is backed by a shared memory window sized to **half the total guest RAM** by default. This accounts for fragmentation across multiple concurrent VMs. On the guest side the [HK allocator](https://github.com/AsahiLinux/linux/blob/asahi/drivers/gpu/drm/asahi/mem.rs) respects the `HK_SYSMEM` environment variable if you want to override the heap size.
+The virtio-gpu device is backed by [rutabaga_gfx](https://crates.io/crates/rutabaga_gfx). It uses the **DRM native context** path (`VIRGLRENDERER_DRM`), which gives the guest near-baremetal access to the host GPU's render engine — no intermediate OpenGL/Vulkan translation layer, no shader recompilation on the host side.
 
 ### What nesbox is not
 
@@ -34,7 +32,7 @@ nesbox is not a container runtime. It is not a full virtual machine with BIOS, A
 
 ### Host
 
-- Linux kernel ≥ 5.10
+- Linux kernel ≥ 6.19
 - KVM enabled (`/dev/kvm`)
 - An **Intel or AMD GPU** with a DRM render node (`/dev/dri/renderD128` or similar)
 - `libkrunfw.so.5` installed in the library search path (or supply your own kernel)
@@ -47,7 +45,7 @@ nesbox is not a container runtime. It is not a full virtual machine with BIOS, A
 
 ### Guest
 
-- Any Linux distribution with `mesa` ≥ 23.0 and `drm` kernel modules
+- Any Linux distribution with `mesa` ≥ 26.0 and `drm` kernel modules
 - The GPU appears as a standard `virtio-gpu` device; no proprietary guest drivers are required
 
 ---
@@ -61,7 +59,7 @@ _// TODO_
 ## Performance characteristics
 
 | Property        | Detail                                                  |
-| --------------- | ------------------------------------------------------- |
+|-----------------|---------------------------------------------------------|
 | Boot time       | < 150 ms from API call to guest userspace               |
 | GPU overhead    | < 5 % vs bare-metal for typical rasterisation workloads |
 | Memory overhead | ~10 MiB VMM process RSS (excluding guest RAM)           |
@@ -88,10 +86,6 @@ The following items are planned for future releases, roughly in priority order:
 
 - **CPU pinning** — Pin vCPU threads to specific host cores to eliminate scheduler jitter during latency-sensitive rendering workloads.
 
-- **Jailer `/dev/dri` support** — The jailer currently does not mount DRM device nodes into the chroot. Correct `/dev/dri`, `/sys`, and `/proc` exposure inside the jailer is required before nesbox can run with the default security profile enabled.
-
-- **Seccomp filter updates** — The default seccomp filter set does not permit the syscalls required by virglrenderer (DRM ioctls, `epoll_create`, async fence operations). The filters need to be profiled and updated.
-
 - **User-facing RPC / REST API** — Add the HTTP management socket following the Firecracker API surface. Expose GPU health and VRAM usage metrics through the API.
 
 - **Shader cache mounting** — Expose a host directory as a persistent shader cache for virglrenderer. Eliminates per-boot shader recompilation; significant latency improvement for titles with large shader counts.
@@ -102,20 +96,8 @@ The following items are planned for future releases, roughly in priority order:
 
 - **Multi-GPU support** — Currently a single host GPU is shared across all VMs. Future work will allow selecting a specific GPU per VM, or striping workloads across multiple cards.
 
-- **rutabaga full-state snapshot (VirglRenderer mode)** — The libkrun-fork rutabaga we use supports `snapshot`/`restore` for 2-D mode only. Extending this to VirglRenderer mode would enable true live migration of GPU workloads. Blocked on upstream virglrenderer adding serialisation support.
-
-- **`HK_SYSMEM` guest-side integration** — Automate the guest-side VRAM heap size configuration to match the SHM window exposed by the host.
-
 ---
 
 ## Acknowledgements
-
-nesbox is built on the shoulders of three exceptional open-source projects:
-
-**[Firecracker](https://github.com/firecracker-microvm/firecracker)** — Amazon Web Services and contributors. The microVM engine, KVM integration, virtio transport layer, device manager, snapshot infrastructure, and security model that nesbox is built on. Most of what makes nesbox fast and safe is Firecracker.
-
-**[libkrun](https://github.com/containers/libkrun)** — The containers project and contributors. The virtio-gpu device implementation, rutabaga integration, SHM region management, DRM native context approach, and the libkrunfw kernel-as-library concept were all pioneered or refined in libkrun. nesbox's GPU subsystem is a direct port and adaptation of their work.
-
-**[crosvm](https://chromium.googlesource.com/chromiumos/platform/crosvm/)** — Google and the ChromiumOS contributors. The virtio-gpu protocol implementation, rutabaga_gfx library, EDID synthesis, capset infrastructure, and the overall architecture of the GPU device model originate in crosvm. We also referenced their snapshot approach for GPU state serialisation.
 
 ---
