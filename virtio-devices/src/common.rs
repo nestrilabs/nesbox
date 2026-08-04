@@ -308,6 +308,18 @@ impl<const N: usize> MsixTable<N> {
         if s < 8 { data[..e - s].copy_from_slice(&b[s..e]); data[e - s..].fill(0); } else { data.fill(0); }
     }
 
+    /// The eventfd an interrupt for `vector` would be delivered on: its MSI-X
+    /// vector, or the INTx line while MSI-X is disabled.
+    ///
+    /// Needed by devices whose queues are serviced by a vhost backend, since
+    /// the kernel signals completion itself and must be handed the fd.
+    pub fn call_fd(&self, vector: u16) -> Option<&Arc<EventFd>> {
+        if !self.enabled || vector == VIRTQ_MSI_NO_VECTOR {
+            return self.intx.as_ref();
+        }
+        self.vectors.get(vector as usize).map(|v| &v.irq_fd)
+    }
+
     pub fn masked(&self, idx: usize) -> bool {
         idx < N && self.entries[idx][12] & 1 != 0
     }

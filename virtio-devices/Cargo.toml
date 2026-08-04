@@ -11,3 +11,4 @@ virtio-bindings = "0.2"
 vmm-sys-util = "0.15"
 vm-memory.workspace = true
 pci = { path = "../pci" }
+vhost = { version = "0.17.0", features = ["vhost-vsock", "vhost-kern"] }

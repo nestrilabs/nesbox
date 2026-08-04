@@ -8,7 +8,7 @@ use std::io::stdin;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use termios::*;
-use virtio_devices::{BlkDevice, ConsoleDevice};
+use virtio_devices::{BlkDevice, ConsoleDevice, VsockDevice};
 
 /// Restores terminal settings on drop.
 struct RawMode {
@@ -81,6 +81,17 @@ fn main() -> Result<()> {
     console_device.bind_interrupts(con_vectors, irq.clone(), con_intx);
     let con_bdf = pci_bus.add_device(console_device)?;
     info!("virtio-console at {:02x}:{:02x}.{}", con_bdf.0, con_bdf.1, con_bdf.2);
+
+    // ── Vsock device (optional) ───────────────────────────────────────────
+    if let Some(vsock_cfg) = &config.vsock {
+        let vsock_device = VsockDevice::new(vsock_cfg.guest_cid, vm.mem.clone())?;
+        let vsock_vectors = irq.allocate_msi_vectors(4).context("vsock MSI-X vectors")?;
+        let slot = 3;
+        let vsock_intx = irq.legacy_irqfd(acpi_slot_gsi(slot)).context("vsock INTx")?;
+        vsock_device.bind_interrupts(vsock_vectors, irq.clone(), vsock_intx);
+        let bdf = pci_bus.add_device(vsock_device)?;
+        info!("virtio-vsock at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
+    }
 
     // ── Legacy COM1, for early boot output ────────────────────────────────
     let serial = Arc::new(nesbox_vmm::serial::Serial::new());

@@ -10,6 +10,16 @@ pub struct VmConfig {
     pub drives: Vec<Drive>,
     #[serde(default)]
     pub machine_config: MachineConfig,
+    /// Optional vsock device; the control channel a launcher talks over.
+    #[serde(default)]
+    pub vsock: Option<Vsock>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Vsock {
+    /// Context ID the guest is reachable at. Must be greater than 2.
+    pub guest_cid: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
