@@ -31,6 +31,12 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+/// The window BARs are allocated from. Must match both the `_CRS` of PCI0 in
+/// the DSDT and `layout::PCI_MMIO_{START,END}` in the VMM, or the guest will
+/// reassign BARs somewhere we do not decode.
+pub const MMIO_WINDOW_START: u64 = 0xC000_0000;
+pub const MMIO_WINDOW_END: u64 = 0xE000_0000;
+
 pub trait PciDevice: Send + Sync {
     /// Read from PCI configuration space. `offset` is byte offset, `data`
     /// is 1, 2 or 4 bytes wide.
@@ -89,7 +95,7 @@ impl Bus {
             anyhow::bail!("PCI bus full");
         }
 
-        // Assign BAR addresses (simple bump allocator starting at 0xC000_0000)
+        // Assign BAR addresses with a bump allocator over the MMIO window.
         let mut bars: Vec<Bar> = Vec::new();
         // Find the current high-water mark so devices added later don't overlap.
         let hwm: u64 = {
@@ -98,17 +104,28 @@ impl Bus {
                 .iter()
                 .map(|(base, size, _, _)| base + size)
                 .max()
-                .unwrap_or(0xC000_0000)
+                .unwrap_or(MMIO_WINDOW_START)
         };
-        let mut next_addr = hwm;
+        let mut next_addr = hwm.max(MMIO_WINDOW_START);
 
         for bar_idx in 0..6 {
             let size = device.bar_size(bar_idx);
             if size == 0 {
                 continue;
             }
+            if !size.is_power_of_two() {
+                anyhow::bail!("BAR {} size {:#x} is not a power of two", bar_idx, size);
+            }
             // Align up to `size` (which must be a power of two).
             let aligned = (next_addr + size - 1) & !(size - 1);
+            if aligned + size > MMIO_WINDOW_END {
+                anyhow::bail!(
+                    "PCI MMIO window exhausted: BAR {} of {:#x} bytes will not fit below {:#x}",
+                    bar_idx,
+                    size,
+                    MMIO_WINDOW_END
+                );
+            }
             bars.push(Bar {
                 bar_idx,
                 addr: aligned,

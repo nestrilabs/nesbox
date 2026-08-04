@@ -3,6 +3,7 @@ pub mod boot;
 pub mod config;
 pub mod gdt;
 pub mod interrupt;
+pub mod layout;
 pub mod regs;
 pub mod serial;
 pub mod vm;

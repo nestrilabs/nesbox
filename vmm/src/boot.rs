@@ -28,23 +28,18 @@ fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32)
     Ok(())
 }
 
-/// Sets up the x86 boot parameters and command line in guest memory
+/// Sets up the x86 boot parameters and command line in guest memory.
+///
+/// `ram_regions` describes guest RAM as laid out by [`crate::layout`]; each
+/// region becomes an e820 entry, with the ACPI block at the top of low RAM
+/// carved out and marked reserved.
 pub fn setup_boot_params(
     mem: &GuestMemoryMmap,
     entry_point: GuestAddress,
     cmdline_str: &str,
-    mem_size_mib: usize,
+    ram_regions: &[crate::layout::RamRegion],
     rsdp_addr: Option<GuestAddress>,
 ) -> Result<()> {
-    let mem_size_bytes = (mem_size_mib as u64) * 1024 * 1024;
-
-    // Reserve last 64 KiB for ACPI tables
-    let acpi_size: u64 = 0x1_0000;
-    let acpi_start = mem_size_bytes
-        .checked_sub(acpi_size)
-        .context("memory too small for ACPI reservation")?;
-    let usable_end = acpi_start;
-
     let mut params = boot_params::default();
 
     // Basic boot header fields
@@ -61,16 +56,30 @@ pub fn setup_boot_params(
         std::ffi::CString::new(cmdline_str).context("Command line contains null byte")?;
     params.hdr.cmdline_size = cmdline_cstring.as_bytes_with_nul().len() as u32;
 
-    // Setup e820 memory map
-    // Region 1: 0 – 1MiB (real mode IDT, GDT, etc.)
-    add_e820_entry(&mut params, 0, 0x100000, 1)?; // E820_RAM = 1
-    // Region 2: 1MiB – usable end
-    if usable_end > 0x100000 {
-        add_e820_entry(&mut params, 0x100000, usable_end - 0x100000, 1)?;
-    }
-    // Region 3: ACPI data (reserved)
-    if acpi_size > 0 {
-        add_e820_entry(&mut params, acpi_start, acpi_size, 3)?; // E820_ACPI = 3
+    // e820 map. The ACPI block sits at the top of the first region; report the
+    // RAM below it, then the ACPI block itself as E820_ACPI.
+    const E820_RAM: u32 = 1;
+    const E820_ACPI: u32 = 3;
+
+    let acpi_start = crate::layout::acpi_start(
+        ram_regions
+            .first()
+            .map(|(s, size)| s.raw_value() + *size as u64)
+            .context("no RAM regions")?,
+    )
+    .raw_value();
+
+    for (i, &(start, size)) in ram_regions.iter().enumerate() {
+        let (start, size) = (start.raw_value(), size as u64);
+        if i == 0 {
+            let usable = acpi_start
+                .checked_sub(start)
+                .context("memory too small for ACPI reservation")?;
+            add_e820_entry(&mut params, start, usable, E820_RAM)?;
+            add_e820_entry(&mut params, acpi_start, crate::layout::ACPI_SIZE, E820_ACPI)?;
+        } else {
+            add_e820_entry(&mut params, start, size, E820_RAM)?;
+        }
     }
 
     // Set ACPI RSDP address if provided

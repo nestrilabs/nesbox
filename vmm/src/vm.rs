@@ -1,9 +1,9 @@
-use crate::boot;
+use crate::{boot, layout};
 use anyhow::{Context, Result};
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use std::sync::Arc;
-use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap};
 
 pub struct Vm {
     pub kvm: Kvm,
@@ -25,26 +25,34 @@ impl Vm {
         // Create IRQ chip
         vm_fd.create_irq_chip().context("Failed to create IRQ chip")?;
 
-        // Memory
-        let mem_size = mem_size_mib * 1024 * 1024;
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)])
-            .context("Failed to create guest memory")?;
+        // Memory, split around the 3–4 GiB device hole.
+        let mem_size = (mem_size_mib as u64) * 1024 * 1024;
+        let regions = layout::ram_regions(mem_size);
+        let mem = GuestMemoryMmap::from_ranges(&regions).context("Failed to create guest memory")?;
         let mem = Arc::new(mem);
 
-        let host_addr = mem
-            .get_host_address(GuestAddress(0))
-            .context("Failed to get host address")?;
-
-        unsafe {
-            vm_fd
-                .set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
-                    slot: 0,
-                    guest_phys_addr: 0,
-                    memory_size: (mem_size_mib * 1024 * 1024) as u64,
-                    userspace_addr: host_addr as u64,
-                    flags: 0,
-                })
-                .context("Failed to set user memory region")?;
+        for (slot, &(start, size)) in regions.iter().enumerate() {
+            let host_addr = mem
+                .get_host_address(start)
+                .context("Failed to get host address")?;
+            log::info!(
+                "RAM slot {}: guest {:#x}..{:#x} ({} MiB)",
+                slot,
+                start.raw_value(),
+                start.raw_value() + size as u64,
+                size / (1024 * 1024)
+            );
+            unsafe {
+                vm_fd
+                    .set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                        slot: slot as u32,
+                        guest_phys_addr: start.raw_value(),
+                        memory_size: size as u64,
+                        userspace_addr: host_addr as u64,
+                        flags: 0,
+                    })
+                    .context("Failed to set user memory region")?;
+            }
         }
 
         // Load kernel
@@ -57,18 +65,11 @@ impl Vm {
             loader_result.setup_header.is_some()
         );
 
-        // Build ACPI tables at the top of RAM and get RSDP address
-        let acpi_size: u64 = 0x1_0000; // 64 KiB
-        let acpi_start = GuestAddress(mem_size as u64 - acpi_size);
+        // Build ACPI tables at the top of low RAM and get the RSDP address.
+        let acpi_start = layout::acpi_start(mem_size);
         let rsdp_addr = crate::acpi::setup_acpi(&mem, vcpu_count, acpi_start)?;
 
-        boot::setup_boot_params(
-            &mem,
-            entry_point,
-            cmdline_str,
-            mem_size_mib,
-            Some(rsdp_addr),
-        )?;
+        boot::setup_boot_params(&mem, entry_point, cmdline_str, &regions, Some(rsdp_addr))?;
 
         // Create vCPUs and configure registers
         let mut vcpus = Vec::with_capacity(vcpu_count as usize);

@@ -12,8 +12,6 @@
 //! The `add_cap` method automatically builds the linked list so capabilities
 //! never overlap.
 
-use std::mem::size_of;
-
 const HEADER_TYPE_DEVICE: u8 = 0x00;
 const CAP_LIST_HEAD: u8 = 0x34;
 const FIRST_CAP: u16 = 0x40;
