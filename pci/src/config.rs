@@ -12,15 +12,23 @@
 //! The `add_cap` method automatically builds the linked list so capabilities
 //! never overlap.
 
+/// Device/Port Type: Root Complex Integrated Endpoint.
+pub const PCIE_TYPE_RC_INTEGRATED: u8 = 0x9;
+
 const HEADER_TYPE_DEVICE: u8 = 0x00;
 const CAP_LIST_HEAD: u8 = 0x34;
 const FIRST_CAP: u16 = 0x40;
-const CAP_MAX: u16 = 0xC0;
+/// Capabilities may run to the end of the 256-byte config space.
+const CAP_MAX: u16 = 0x100;
 
 /// Builder for a 256-byte PCI configuration space.
 pub struct PciConfig {
     data: [u8; 256],
     last_cap_offset: Option<u16>,
+    /// Where the next capability may start. Tracked explicitly: a capability's
+    /// length cannot be recovered from its contents in general — only virtio
+    /// vendor capabilities happen to store it there.
+    next_cap_start: u16,
 }
 
 impl PciConfig {
@@ -53,7 +61,7 @@ impl PciConfig {
         c[0x2c..0x2e].copy_from_slice(&subsystem_vendor.to_le_bytes());
         c[0x2e..0x30].copy_from_slice(&subsystem_id.to_le_bytes());
 
-        Self { data: c, last_cap_offset: None }
+        Self { data: c, last_cap_offset: None, next_cap_start: FIRST_CAP }
     }
 
     /// Set interrupt pin (INTA# = 1).
@@ -81,13 +89,7 @@ impl PciConfig {
     /// `payload` is the capability data starting from byte 2 (after cap_id + next).
     pub fn add_cap(&mut self, cap_id: u8, payload: &[u8]) -> u16 {
         let total_cap_len = 2 + payload.len(); // id + next + payload
-        let start = match self.last_cap_offset {
-            Some(prev) => {
-                let prev_end = prev as usize + 2 + payload_at(self, prev).len();
-                next_dword(prev_end as u16)
-            }
-            None => FIRST_CAP,
-        };
+        let start = self.next_cap_start;
 
         assert!(start >= FIRST_CAP && start < CAP_MAX, "capability space exhausted");
         let s = start as usize;
@@ -107,6 +109,7 @@ impl PciConfig {
         }
 
         self.last_cap_offset = Some(start);
+        self.next_cap_start = next_dword(start + total_cap_len as u16);
         start
     }
 
@@ -151,18 +154,26 @@ impl PciConfig {
         self.add_cap(0x11, &payload)
     }
 
+    /// Add a PCI Express capability, version 2, making this a PCIe device
+    /// rather than a conventional PCI one.
+    ///
+    /// `device_type` is the Device/Port Type field: [`PCIE_TYPE_RC_INTEGRATED`]
+    /// for a device sitting directly on the root complex, which is what our
+    /// devices are — there is no root port above them, so the link registers
+    /// stay zero and are never consulted.
+    pub fn add_pcie_cap(&mut self, device_type: u8) -> u16 {
+        // 2 bytes of id+next, then 58 bytes of registers through Slot Status 2.
+        let mut payload = [0u8; 58];
+        // PCI Express Capabilities Register: version 2, device/port type.
+        let caps_reg: u16 = 0x0002 | ((device_type as u16 & 0xF) << 4);
+        payload[0..2].copy_from_slice(&caps_reg.to_le_bytes());
+        self.add_cap(0x10, &payload)
+    }
+
     /// Return the final 256-byte config space.
     pub fn build(&self) -> [u8; 256] {
         self.data
     }
-}
-
-fn payload_at(cfg: &PciConfig, cap_off: u16) -> &[u8] {
-    let cap_len = cfg.data[cap_off as usize + 2] as usize;
-    // cap_len includes id + next (2 bytes) + payload
-    let payload_len = cap_len.saturating_sub(2);
-    let start = cap_off as usize + 2;
-    &cfg.data[start..start + payload_len]
 }
 
 fn next_dword(offset: u16) -> u16 {

@@ -1,7 +1,7 @@
 //! Virtio console device over PCI transport (virtio 1.0 / modern).
 
 use crate::common::*;
-use pci::config::PciConfig;
+use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
 use pci::{MsiRouter, MsiVector, PciDevice};
 use std::io::Read;
 use std::io::Write as IoWrite;
@@ -137,6 +137,7 @@ impl ConsoleDevice {
         cfg.add_virtio_cap(3, 0, OFF_ISR as u32, 1);
         cfg.add_virtio_cap(4, 0, OFF_DEVICE as u32, 12);
         let msix_cap = cfg.add_msix_cap(MSIX_VECTORS - 1, OFF_MSIX_TABLE as u32, OFF_MSIX_PBA as u32);
+        cfg.add_pcie_cap(PCIE_TYPE_RC_INTEGRATED);
         (cfg.build(), msix_cap)
     }
 

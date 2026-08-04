@@ -2,7 +2,7 @@
 
 use crate::common::*;
 use anyhow::{Context, Result};
-use pci::config::PciConfig;
+use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
 use pci::{MsiRouter, MsiVector, PciDevice};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -140,6 +140,7 @@ impl BlkDevice {
         cfg.add_virtio_cap(3, 0, OFF_ISR as u32, 1);
         cfg.add_virtio_cap(4, 0, OFF_DEVICE as u32, 0x3C);
         let msix_cap = cfg.add_msix_cap(MSIX_VECTORS - 1, OFF_MSIX_TABLE as u32, OFF_MSIX_PBA as u32);
+        cfg.add_pcie_cap(PCIE_TYPE_RC_INTEGRATED);
         (cfg.build(), msix_cap)
     }
 
