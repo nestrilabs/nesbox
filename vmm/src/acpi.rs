@@ -3,31 +3,46 @@ use anyhow::{Context, Result};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use zerocopy::IntoBytes;
 
+/// GSI a PCI slot's INTx line is wired to.
+///
+/// INTx is the fallback path — a device that negotiates MSI-X never uses it.
+/// Slot 1 gets its own line; everything else shares one, which is legal
+/// because INTx is level-triggered and shareable.
+fn slot_gsi(slot: u32) -> u32 {
+    match slot {
+        1 => 10,
+        _ => 11,
+    }
+}
+
 fn build_dsdt() -> Vec<u8> {
     let mut dsdt = Sdt::new(*b"DSDT", 36, 6, *b"NESTRI", *b"DSDT    ", 1);
 
+    // _CRS: what the host bridge decodes. The memory window must agree with
+    // the BAR allocator in the `pci` crate, or the guest will reassign BARs
+    // to addresses we do not decode.
     let bus = aml::AddressSpace::new_bus_number(0x0u16, 0x0u16);
     let cam1 = aml::IO::new(0x0cf8, 0x0cf8, 1, 0x08);
     let mem32 = aml::AddressSpace::new_memory(
         aml::AddressSpaceCacheable::NotCacheable,
         true,
-        0xC000_0000u64,
-        0xDFFF_FFFFu64,
+        crate::layout::PCI_MMIO_START,
+        crate::layout::PCI_MMIO_END - 1,
         None,
     );
     let io_range1 = aml::AddressSpace::new_io(0x0000u16, 0x0cf7u16, None);
     let io_range2 = aml::AddressSpace::new_io(0x0d00u16, 0xffffu16, None);
     let crs = aml::ResourceTemplate::new(vec![&bus, &cam1, &mem32, &io_range1, &io_range2]);
 
-    let slot_irqs: [u32; 4] = [5, 10, 11, 12];
-    let addr_irq_pairs: Vec<(u32, u32)> = slot_irqs
-        .iter()
-        .enumerate()
-        .map(|(slot, irq)| (((slot as u32) << 16) | 0xFFFF, *irq))
+    // _PRT: one entry per slot, mapping INTA# to a GSI. Address 0xFFFF in the
+    // low word means "any function of this device".
+    let prt_data: Vec<(u32, u32)> = (0..32u32)
+        .map(|slot| ((slot << 16) | 0xFFFF, slot_gsi(slot)))
         .collect();
-    let prt_items: Vec<aml::Package> = addr_irq_pairs
+    let zero = 0u8;
+    let prt_items: Vec<aml::Package> = prt_data
         .iter()
-        .map(|(addr, irq)| aml::Package::new(vec![addr, &0u8, &0u8, irq]))
+        .map(|(addr, gsi)| aml::Package::new(vec![addr, &zero, &zero, gsi]))
         .collect();
     let prt_refs: Vec<&dyn Aml> = prt_items.iter().map(|p| p as &dyn Aml).collect();
     let prt = aml::Package::new(prt_refs);
@@ -39,30 +54,6 @@ fn build_dsdt() -> Vec<u8> {
     let name_adr = aml::Name::new("_ADR".into(), &aml::ZERO);
     let name_uid = aml::Name::new("_UID".into(), &aml::ZERO);
     let name_crs = aml::Name::new("_CRS".into(), &crs);
-
-    // _PRT: map device slots to GSIs for INTx routing
-    let prt_data: Vec<(u32, u32, u8, u32)> = (0..32u32)
-        .map(|slot| {
-            let addr: u32 = (slot << 16) | 0xFFFF;
-            let irq: u32 = match slot { 1 => 10, _ => 11 };
-            (addr, irq, 0u8, slot)
-        })
-        .collect();
-    let prt_items: Vec<aml::Package> = prt_data
-        .iter()
-        .map(|(addr, irq, z, _slot)| {
-            aml::Package::new(vec![addr, z, z, irq])
-        })
-        .collect();
-    let prt_refs: Vec<&dyn Aml> = prt_items.iter().map(|p| p as &dyn Aml).collect();
-    let prt = aml::Package::new(prt_refs);
-
-    let eisa_pnp0a08 = aml::EISAName::new("PNP0A08");
-    let eisa_pnp0a03 = aml::EISAName::new("PNP0A03");
-    let name_hid = aml::Name::new("_HID".into(), &eisa_pnp0a08);
-    let name_cid = aml::Name::new("_CID".into(), &eisa_pnp0a03);
-    let name_adr = aml::Name::new("_ADR".into(), &aml::ZERO);
-    let name_uid = aml::Name::new("_UID".into(), &aml::ZERO);
     let name_prt = aml::Name::new("_PRT".into(), &prt);
 
     let pci0_children: Vec<&dyn Aml> = vec![
