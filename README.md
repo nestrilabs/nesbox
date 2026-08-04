@@ -32,7 +32,7 @@ nesbox is not a container runtime. It is not a full virtual machine with BIOS, A
 
 ### Host
 
-- Linux kernel ≥ 6.19
+- Linux kernel ≥ 7.0
 - KVM enabled (`/dev/kvm`)
 - An **Intel or AMD GPU** with a DRM render node (`/dev/dri/renderD128` or similar)
 - `libkrunfw.so.5` installed in the library search path (or supply your own kernel)
@@ -45,7 +45,7 @@ nesbox is not a container runtime. It is not a full virtual machine with BIOS, A
 
 ### Guest
 
-- Any Linux distribution with `mesa` ≥ 26.0 and `drm` kernel modules
+- Any Linux distribution with `mesa` ≥ 26.1 and `drm` kernel modules
 - The GPU appears as a standard `virtio-gpu` device; no proprietary guest drivers are required
 
 ---

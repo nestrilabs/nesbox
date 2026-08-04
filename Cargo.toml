@@ -4,6 +4,6 @@ members = ["vmm", "virtio-devices", "pci", "vm-core"]
 
 [workspace.dependencies]
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
-linux-loader = { git = "https://github.com/rust-vmm/linux-loader.git", rev = "83c13bef18fdd8c9de6df47ff7463884cd402a09" }
-acpi_tables = "=0.2.0"
+linux-loader = "0.14"
+acpi_tables = "0.2"
 #rutabaga_gfx = { git = "https://github.com/magma-gpu/rutabaga_gfx.git", rev = "2f0c6a55fd36e61b22a1b3679f69d4273c056602" }

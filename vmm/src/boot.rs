@@ -23,7 +23,7 @@ fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32)
     }
     params.e820_table[idx].addr = addr;
     params.e820_table[idx].size = size;
-    params.e820_table[idx].type_ = mem_type;
+    params.e820_table[idx].r#type = mem_type;
     params.e820_entries += 1;
     Ok(())
 }
