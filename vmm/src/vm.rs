@@ -1,9 +1,10 @@
 use crate::{boot, layout};
 use anyhow::{Context, Result};
+use std::os::fd::FromRawFd;
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use std::sync::Arc;
-use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap};
+use vm_memory::{Address, FileOffset, GuestMemoryBackend, GuestMemoryMmap};
 
 pub struct Vm {
     pub kvm: Kvm,
@@ -28,7 +29,25 @@ impl Vm {
         // Memory, split around the 3–4 GiB device hole.
         let mem_size = (mem_size_mib as u64) * 1024 * 1024;
         let regions = layout::ram_regions(mem_size);
-        let mem = GuestMemoryMmap::from_ranges(&regions).context("Failed to create guest memory")?;
+
+        // Guest RAM is backed by a memfd and mapped shared, so vhost-user
+        // backends such as virtiofsd can map it into their own address space.
+        // Anonymous private memory would leave them unable to see it.
+        let mem_file = create_memfd(mem_size).context("Failed to create guest memory file")?;
+        let mut file_offset = 0u64;
+        let ranges = regions
+            .iter()
+            .map(|&(start, size)| {
+                let offset = file_offset;
+                file_offset += size as u64;
+                let file = mem_file
+                    .try_clone()
+                    .context("Failed to clone the guest memory file")?;
+                Ok((start, size, Some(FileOffset::new(file, offset))))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mem =
+            GuestMemoryMmap::from_ranges_with_files(&ranges).context("Failed to create guest memory")?;
         let mem = Arc::new(mem);
 
         for (slot, &(start, size)) in regions.iter().enumerate() {
@@ -99,6 +118,20 @@ impl Vm {
             vcpus,
         })
     }
+}
+
+/// Create an anonymous, sealable shared memory file of `size` bytes.
+fn create_memfd(size: u64) -> Result<std::fs::File> {
+    let name = c"nesbox-guest-ram";
+    // SAFETY: `name` is a valid NUL-terminated string and the flags are valid.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("memfd_create");
+    }
+    // SAFETY: memfd_create just handed us this fd and nothing else owns it.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.set_len(size).context("failed to size the guest memory file")?;
+    Ok(file)
 }
 
 pub fn run_vcpu_loop(

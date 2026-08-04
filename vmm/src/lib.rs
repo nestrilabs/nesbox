@@ -6,6 +6,7 @@ pub mod interrupt;
 pub mod layout;
 pub mod regs;
 pub mod serial;
+pub mod virtiofsd;
 pub mod vm;
 
 pub use acpi::slot_gsi as acpi_slot_gsi;

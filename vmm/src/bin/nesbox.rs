@@ -1,4 +1,4 @@
-use nesbox_vmm::{acpi_slot_gsi, config, interrupt::IrqManager, vm};
+use nesbox_vmm::{acpi_slot_gsi, config, interrupt::IrqManager, virtiofsd::Virtiofsd, vm};
 
 use anyhow::{Context, Result};
 use env_logger::Env;
@@ -8,7 +8,7 @@ use std::io::stdin;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use termios::*;
-use virtio_devices::{BlkDevice, ConsoleDevice, VsockDevice};
+use virtio_devices::{BlkDevice, ConsoleDevice, FsDevice, VsockDevice};
 
 /// Restores terminal settings on drop.
 struct RawMode {
@@ -91,6 +91,31 @@ fn main() -> Result<()> {
         vsock_device.bind_interrupts(vsock_vectors, irq.clone(), vsock_intx);
         let bdf = pci_bus.add_device(vsock_device)?;
         info!("virtio-vsock at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
+    }
+
+    // ── Shared directories over virtio-fs ─────────────────────────────────
+    // The daemons are kept alive for as long as the VM runs; dropping them
+    // kills virtiofsd.
+    let runtime_dir = std::env::temp_dir().join(format!("nesbox-{}", std::process::id()));
+    let mut fs_daemons = Vec::new();
+    for shared in &config.shared_directories {
+        let daemon = Virtiofsd::spawn(
+            &shared.tag,
+            &shared.path_on_host,
+            shared.read_only,
+            &runtime_dir,
+        )?;
+        let fs_device = FsDevice::new(&shared.tag, daemon.socket_path(), vm.mem.clone())?;
+        let vectors = irq.allocate_msi_vectors(4).context("virtio-fs MSI-X vectors")?;
+        let slot = 4 + fs_daemons.len() as u32;
+        let intx = irq.legacy_irqfd(acpi_slot_gsi(slot)).context("virtio-fs INTx")?;
+        fs_device.bind_interrupts(vectors, irq.clone(), intx);
+        let bdf = pci_bus.add_device(fs_device)?;
+        info!(
+            "virtio-fs \"{}\" at {:02x}:{:02x}.{}",
+            shared.tag, bdf.0, bdf.1, bdf.2
+        );
+        fs_daemons.push(daemon);
     }
 
     // ── Legacy COM1, for early boot output ────────────────────────────────

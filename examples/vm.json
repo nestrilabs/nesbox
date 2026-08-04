@@ -14,5 +14,20 @@
   "machine-config": {
     "vcpu_count": 1,
     "mem_size_mib": 1024
-  }
+  },
+  "vsock": {
+    "guest-cid": 42
+  },
+  "shared-directories": [
+    {
+      "tag": "prefix",
+      "path-on-host": "/path/to/compat/prefix",
+      "read-only": false
+    },
+    {
+      "tag": "install",
+      "path-on-host": "/path/to/game/install",
+      "read-only": true
+    }
+  ]
 }

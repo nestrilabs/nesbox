@@ -13,6 +13,21 @@ pub struct VmConfig {
     /// Optional vsock device; the control channel a launcher talks over.
     #[serde(default)]
     pub vsock: Option<Vsock>,
+    /// Host directories exported to the guest over virtio-fs.
+    #[serde(default)]
+    pub shared_directories: Vec<SharedDirectory>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SharedDirectory {
+    /// Mount tag the guest uses: `mount -t virtiofs <tag> /somewhere`.
+    pub tag: String,
+    pub path_on_host: PathBuf,
+    /// Export read-only. A game's install directory wants this: it makes
+    /// "only the downloader writes here" true by construction.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
