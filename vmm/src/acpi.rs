@@ -63,7 +63,24 @@ fn build_dsdt() -> Vec<u8> {
         &name_hid, &name_cid, &name_adr, &name_uid, &name_crs, &name_prt,
     ];
     let pci0_dev = aml::Device::new("PCI0".into(), pci0_children);
-    let sb_scope = aml::Scope::new("_SB_".into(), vec![&pci0_dev]);
+
+    // A motherboard resource device claiming the ECAM window. Linux accepts
+    // either this or an e820 reservation as proof the window is real; we
+    // provide both.
+    let ecam_mem = aml::Memory32Fixed::new(
+        true,
+        crate::layout::MMCONFIG_START as u32,
+        crate::layout::MMCONFIG_SIZE as u32,
+    );
+    let ecam_crs = aml::ResourceTemplate::new(vec![&ecam_mem]);
+    let eisa_pnp0c02 = aml::EISAName::new("PNP0C02");
+    let mbrd_hid = aml::Name::new("_HID".into(), &eisa_pnp0c02);
+    let mbrd_uid = aml::Name::new("_UID".into(), &aml::ZERO);
+    let mbrd_crs = aml::Name::new("_CRS".into(), &ecam_crs);
+    let mbrd_children: Vec<&dyn Aml> = vec![&mbrd_hid, &mbrd_uid, &mbrd_crs];
+    let mbrd_dev = aml::Device::new("MBRD".into(), mbrd_children);
+
+    let sb_scope = aml::Scope::new("_SB_".into(), vec![&pci0_dev, &mbrd_dev]);
     let mut aml_bytes = Vec::new();
     sb_scope.to_aml_bytes(&mut aml_bytes);
 
@@ -117,7 +134,7 @@ fn build_madt(vcpu_count: u8, ioapic_id: u8, ioapic_addr: u32, gsi_base: u32) ->
 
 fn build_mcfg() -> Vec<u8> {
     let mut mcfg = Sdt::new(*b"MCFG", 60, 1, *b"NESTRI", *b"MCFG    ", 1);
-    mcfg.write_u64(44, 0xE000_0000); // MMCONFIG base
+    mcfg.write_u64(44, crate::layout::MMCONFIG_START); // MMCONFIG base
     mcfg.write_u16(52, 0); // segment 0
     mcfg.write_u16(54, 0); // start bus = 0, end bus = 0
     mcfg.as_slice().to_vec()

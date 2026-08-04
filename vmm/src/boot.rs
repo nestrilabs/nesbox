@@ -59,6 +59,7 @@ pub fn setup_boot_params(
     // e820 map. The ACPI block sits at the top of the first region; report the
     // RAM below it, then the ACPI block itself as E820_ACPI.
     const E820_RAM: u32 = 1;
+    const E820_RESERVED: u32 = 2;
     const E820_ACPI: u32 = 3;
 
     let acpi_start = crate::layout::acpi_start(
@@ -68,6 +69,15 @@ pub fn setup_boot_params(
             .context("no RAM regions")?,
     )
     .raw_value();
+
+    // Linux will not use ECAM unless the window is reserved, however loudly
+    // MCFG advertises it.
+    add_e820_entry(
+        &mut params,
+        crate::layout::MMCONFIG_START,
+        crate::layout::MMCONFIG_SIZE,
+        E820_RESERVED,
+    )?;
 
     for (i, &(start, size)) in ram_regions.iter().enumerate() {
         let (start, size) = (start.raw_value(), size as u64);

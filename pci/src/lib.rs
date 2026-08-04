@@ -13,6 +13,15 @@
 //!
 //!   0xCFC  CONFIG_DATA  (8/16/32-bit read/write)
 //!
+//! The same config space is also reachable through ECAM (PCIe "enhanced"
+//! config access), an MMIO window where the address encodes the device:
+//!
+//!   addr = ECAM_BASE | bus << 20 | device << 15 | function << 12 | register
+//!
+//! Both paths land in the same `config_read`/`config_write`. Which one the
+//! guest uses is its own choice; Linux prefers ECAM when the firmware both
+//! advertises it in MCFG and reserves the window.
+//!
 //! BAR handling
 //! ------------
 //! The bus pre-assigns a base address to every BAR at `add_device` time.
@@ -39,6 +48,15 @@ use std::sync::{Arc, Mutex, RwLock};
 /// reassign BARs somewhere we do not decode.
 pub const MMIO_WINDOW_START: u64 = 0xC000_0000;
 pub const MMIO_WINDOW_END: u64 = 0xE000_0000;
+
+/// ECAM window. Must match the MCFG table and the reservation the guest is
+/// given, or Linux advertises it and then refuses to use it.
+pub const ECAM_BASE: u64 = 0xE000_0000;
+/// One bus worth of config space: 32 devices x 8 functions x 4 KiB.
+pub const ECAM_SIZE: u64 = 0x10_0000;
+/// Config space per function under ECAM, of which we implement the first 256
+/// bytes; the extended area reads as zero.
+const ECAM_FUNCTION_SIZE: u64 = 0x1000;
 
 pub trait PciDevice: Send + Sync {
     /// Read from PCI configuration space. `offset` is byte offset, `data`
@@ -376,7 +394,30 @@ impl Bus {
 
     // ── MMIO dispatch ─────────────────────────────────────────────────────────
 
+    /// Decode an ECAM address into (bdf, register offset).
+    fn ecam_decode(addr: u64) -> ((u8, u8, u8), u32) {
+        let off = addr - ECAM_BASE;
+        let bus = ((off >> 20) & 0xff) as u8;
+        let dev = ((off >> 15) & 0x1f) as u8;
+        let func = ((off >> 12) & 0x07) as u8;
+        let reg = (off % ECAM_FUNCTION_SIZE) as u32;
+        ((bus, dev, func), reg)
+    }
+
+    fn in_ecam(addr: u64) -> bool {
+        (ECAM_BASE..ECAM_BASE + ECAM_SIZE).contains(&addr)
+    }
+
     pub fn handle_mmio_write(&self, addr: u64, data: &[u8]) -> bool {
+        if Self::in_ecam(addr) {
+            let (bdf, reg) = Self::ecam_decode(addr);
+            // Extended config space (0x100..0x1000) is not implemented.
+            if reg < 0x100 {
+                self.config_write(bdf, reg, data);
+            }
+            return true;
+        }
+
         let mmio_regions = self.mmio_regions.read().unwrap();
         for &(base, size, bdf, bar_idx) in mmio_regions.iter() {
             if addr >= base && addr < base + size {
@@ -391,6 +432,19 @@ impl Bus {
     }
 
     pub fn handle_mmio_read(&self, addr: u64, data: &mut [u8]) -> bool {
+        if Self::in_ecam(addr) {
+            let (bdf, reg) = Self::ecam_decode(addr);
+            log::trace!("ECAM read {:02x}:{:02x}.{} reg={:#x} len={}", bdf.0, bdf.1, bdf.2, reg, data.len());
+            if reg >= 0x100 {
+                // No extended capabilities: reads must return zero, not 0xFF,
+                // or the guest will walk a bogus capability list.
+                data.fill(0);
+            } else if !self.config_read(bdf, reg, data) {
+                data.fill(0xFF); // no such device
+            }
+            return true;
+        }
+
         let mmio_regions = self.mmio_regions.read().unwrap();
         for &(base, size, bdf, bar_idx) in mmio_regions.iter() {
             if addr >= base && addr < base + size {
