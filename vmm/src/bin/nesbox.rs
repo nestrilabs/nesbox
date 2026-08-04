@@ -14,7 +14,6 @@ use virtio_devices::{BlkDevice, ConsoleDevice};
 struct RawMode {
     orig: Termios,
 }
-
 impl RawMode {
     fn enter() -> Result<Self> {
         let fd = stdin().as_raw_fd();
@@ -25,7 +24,6 @@ impl RawMode {
         Ok(Self { orig })
     }
 }
-
 impl Drop for RawMode {
     fn drop(&mut self) {
         let fd = stdin().as_raw_fd();
@@ -82,6 +80,9 @@ fn main() -> Result<()> {
     console_device.set_mem(vm.mem.clone());
     let _console_pci_device = pci_bus.add_device(console_device)?;
 
+    // ── Legacy COM1, for early boot output ────────────────────────────────
+    let serial = Arc::new(nesbox_vmm::serial::Serial::new());
+
     // ── Run vCPUs ─────────────────────────────────────────────────────────
     let handles: Vec<_> = vm
         .vcpus
@@ -89,8 +90,9 @@ fn main() -> Result<()> {
         .map(|vcpu_fd| {
             let mem = vm.mem.clone();
             let pci_bus = pci_bus.clone();
+            let serial = serial.clone();
             std::thread::spawn(move || {
-                if let Err(e) = vm::run_vcpu_loop(mem, vcpu_fd, pci_bus) {
+                if let Err(e) = vm::run_vcpu_loop(mem, vcpu_fd, pci_bus, serial) {
                     eprintln!("vCPU thread error: {}", e);
                 }
             })

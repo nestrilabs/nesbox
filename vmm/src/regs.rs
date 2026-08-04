@@ -114,7 +114,9 @@ pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &VcpuFd) -> Result<()> {
         gdt_entry(0, 0, 0),            // NULL
         gdt_entry(0xa09b, 0, 0xfffff), // Code segment (64-bit)
         gdt_entry(0xc093, 0, 0xfffff), // Data segment
-        gdt_entry(0x0089, 0, 0xffff),  // TSS
+        // TSS. The type must be 11 (busy 64-bit TSS), not 9 (available) —
+        // VMX rejects VM entry into long mode with an available TSS.
+        gdt_entry(0x808b, 0, 0xfffff),
     ];
 
     write_gdt_table(mem, &gdt_table)?;
@@ -138,6 +140,11 @@ pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &VcpuFd) -> Result<()> {
     sregs.gs = data_seg;
     sregs.ss = data_seg;
     sregs.tr = tss_seg;
+
+    // KVM's reset LDTR is a null selector that is still marked present and
+    // usable, which VMX rejects when entering long mode. Mark it unusable.
+    sregs.ldt.unusable = 1;
+    sregs.ldt.present = 0;
 
     // Enable protected mode and long mode
     // Clear cache-disable bits KVM may have pre-set, then set what we need

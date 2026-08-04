@@ -4,4 +4,5 @@ pub mod config;
 pub mod gdt;
 pub mod interrupt;
 pub mod regs;
+pub mod serial;
 pub mod vm;

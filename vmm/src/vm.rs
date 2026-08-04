@@ -50,6 +50,12 @@ impl Vm {
         // Load kernel
         let loader_result = boot::load_kernel(&mem, &kernel_path)?;
         let entry_point = loader_result.kernel_load;
+        log::info!(
+            "kernel: load/entry={:#x} end={:?} setup_header={:?}",
+            entry_point.raw_value(),
+            loader_result.kernel_end,
+            loader_result.setup_header.is_some()
+        );
 
         // Build ACPI tables at the top of RAM and get RSDP address
         let acpi_size: u64 = 0x1_0000; // 64 KiB
@@ -98,30 +104,37 @@ pub fn run_vcpu_loop(
     _mem: Arc<GuestMemoryMmap>,
     mut vcpu_fd: VcpuFd,
     pci_bus: Arc<pci::Bus>,
+    serial: Arc<crate::serial::Serial>,
 ) -> Result<()> {
     loop {
         match vcpu_fd.run() {
             Ok(vcpu_exit) => match vcpu_exit {
+                VcpuExit::IoOut(port, data) if crate::serial::Serial::handles(port) => {
+                    serial.write(port, data);
+                }
+                VcpuExit::IoIn(port, data) if crate::serial::Serial::handles(port) => {
+                    serial.read(port, data);
+                }
                 VcpuExit::IoOut(port, data) => {
                     if !pci_bus.handle_pio_write(port, data) {
-                        //log::trace!("Unhandled PIO out: port={:#x}, len={}", port, data.len());
+                        log::trace!("PIO out: port={:#x}, len={}", port, data.len());
                     }
                 }
                 VcpuExit::IoIn(port, data) => {
                     if !pci_bus.handle_pio_read(port, data) {
                         data.fill(0xff);
-                        //log::trace!("Unhandled PIO in: port={:#x}", port);
+                        log::trace!("PIO in: port={:#x}", port);
                     }
                 }
                 VcpuExit::MmioRead(addr, data) => {
                     if !pci_bus.handle_mmio_read(addr, data) {
                         data.fill(0xff);
-                        //log::trace!("Unhandled MMIO read: addr={:#x}", addr);
+                        log::trace!("Unhandled MMIO read: addr={:#x}", addr);
                     }
                 }
                 VcpuExit::MmioWrite(addr, data) => {
                     if !pci_bus.handle_mmio_write(addr, data) {
-                        //log::trace!("Unhandled MMIO write: addr={:#x}, len={}", addr, data.len());
+                        log::trace!("Unhandled MMIO write: addr={:#x}, len={}", addr, data.len());
                     }
                 }
                 VcpuExit::Hlt => {
@@ -135,6 +148,23 @@ pub fn run_vcpu_loop(
                 VcpuExit::Exception => {
                     log::error!("vCPU triple fault or other exception!");
                     // break to see where it happens
+                    break;
+                }
+                VcpuExit::FailEntry(reason, cpu) => {
+                    log::error!("VM entry failed: reason={:#x} cpu={}", reason, cpu);
+                    if let Ok(r) = vcpu_fd.get_regs() {
+                        log::error!("regs: rip={:#x} rsp={:#x} rsi={:#x} rflags={:#x}", r.rip, r.rsp, r.rsi, r.rflags);
+                    }
+                    if let Ok(s) = vcpu_fd.get_sregs() {
+                        log::error!("cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x}", s.cr0, s.cr3, s.cr4, s.efer);
+                        log::error!("cs: sel={:#x} base={:#x} limit={:#x} type={:#x} l={} db={} g={} p={} s={} unusable={}",
+                            s.cs.selector, s.cs.base, s.cs.limit, s.cs.type_, s.cs.l, s.cs.db, s.cs.g, s.cs.present, s.cs.s, s.cs.unusable);
+                        log::error!("ds: sel={:#x} type={:#x} p={} s={} unusable={}", s.ds.selector, s.ds.type_, s.ds.present, s.ds.s, s.ds.unusable);
+                        log::error!("tr: sel={:#x} base={:#x} limit={:#x} type={:#x} p={} s={} unusable={}",
+                            s.tr.selector, s.tr.base, s.tr.limit, s.tr.type_, s.tr.present, s.tr.s, s.tr.unusable);
+                        log::error!("ldt: sel={:#x} type={:#x} p={} unusable={}", s.ldt.selector, s.ldt.type_, s.ldt.present, s.ldt.unusable);
+                        log::error!("gdt: base={:#x} limit={:#x}  idt: base={:#x} limit={:#x}", s.gdt.base, s.gdt.limit, s.idt.base, s.idt.limit);
+                    }
                     break;
                 }
                 other => {
