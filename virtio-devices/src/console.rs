@@ -1,8 +1,8 @@
 //! Virtio console device over PCI transport (virtio 1.0 / modern).
 
 use crate::common::*;
-use pci::PciDevice;
 use pci::config::PciConfig;
+use pci::{MsiRouter, MsiVector, PciDevice};
 use std::io::Read;
 use std::io::Write as IoWrite;
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,8 @@ use vm_memory::Bytes;
 use vmm_sys_util::eventfd::EventFd;
 
 const QUEUE_SIZE: u16 = 256;
+/// rx, tx, and a config vector, rounded up to a power of two.
+const MSIX_VECTORS: u16 = 4;
 
 struct Inner {
     com: ComCfg,
@@ -17,10 +19,12 @@ struct Inner {
     rx: QState,
     tx: QState,
     isr: u8,
+    /// MSI-X vector for configuration-change interrupts.
+    cfg_vec: u16,
     mem: Option<Arc<vm_memory::GuestMemoryMmap>>,
-    irq_tx: Option<Arc<EventFd>>,
-    irq_rx: Option<Arc<EventFd>>,
     msix: MsixTable<4>,
+    cfg: [u8; 256],
+    msix_cap: u16,
     stdin_buf: Arc<Mutex<Vec<u8>>>,
     cols: u16,
     rows: u16,
@@ -48,7 +52,8 @@ impl Inner {
             push_used(&mem, &self.tx, head, total);
         }
         self.isr |= 1;
-        fire_irq_intx(&self.irq_tx);
+        let vec = self.tx.vec;
+        self.msix.trigger(vec);
     }
 
     fn process_rx(&mut self) {
@@ -71,7 +76,8 @@ impl Inner {
         }
         if self.isr & 1 == 0 {
             self.isr |= 1;
-            fire_irq_intx(&self.irq_rx);
+            let vec = self.rx.vec;
+            self.msix.trigger(vec);
         }
     }
 }
@@ -83,12 +89,14 @@ pub struct ConsoleDevice {
 impl ConsoleDevice {
     pub fn new() -> Self {
         let stdin_buf = Arc::new(Mutex::new(Vec::new()));
+        let (cfg, msix_cap) = Self::build_pci_config();
         let inner = Arc::new(Mutex::new(Inner {
             com: ComCfg::default(), qs: 0,
             rx: QState { size: QUEUE_SIZE, ..Default::default() },
             tx: QState { size: QUEUE_SIZE, vec: 1, ..Default::default() },
-            isr: 0, mem: None, irq_tx: None, irq_rx: None,
-            msix: MsixTable::default(), stdin_buf: stdin_buf.clone(), cols: 80, rows: 25,
+            isr: 0, cfg_vec: VIRTQ_MSI_NO_VECTOR, mem: None,
+            msix: MsixTable::default(), cfg, msix_cap,
+            stdin_buf: stdin_buf.clone(), cols: 80, rows: 25,
         }));
 
         // Stdin reader thread — reads from host stdin and pushes into guest RX queue
@@ -112,10 +120,14 @@ impl ConsoleDevice {
         Self { inner }
     }
     pub fn set_mem(&self, m: Arc<vm_memory::GuestMemoryMmap>) { self.inner.lock().unwrap().mem = Some(m); }
-    pub fn set_irq_tx(&self, f: Arc<EventFd>) { self.inner.lock().unwrap().irq_tx = Some(f); }
-    pub fn set_irq_rx(&self, f: Arc<EventFd>) { self.inner.lock().unwrap().irq_rx = Some(f); }
 
-    fn pci_config(&self) -> [u8; 256] {
+    /// Attach the host interrupt resources: one MSI-X vector per table entry
+    /// and the legacy INTx line used before the guest enables MSI-X.
+    pub fn bind_interrupts(&self, vectors: Vec<MsiVector>, router: Arc<dyn MsiRouter>, intx: Arc<EventFd>) {
+        self.inner.lock().unwrap().msix.bind(vectors, router, intx);
+    }
+
+    fn build_pci_config() -> ([u8; 256], u16) {
         let mut cfg = PciConfig::new(0x1AF4, 0x1043, 0x01, 0x07_80_00, 0x1AF4, 0x0003);
         cfg.set_bar_mem(0, BAR0_SIZE);
         cfg.set_irq_pin(1);
@@ -124,15 +136,14 @@ impl ConsoleDevice {
         cfg.add_virtio_notify_cap(0, OFF_NOTIFY as u32, 0x100, NOTIFY_MULT);
         cfg.add_virtio_cap(3, 0, OFF_ISR as u32, 1);
         cfg.add_virtio_cap(4, 0, OFF_DEVICE as u32, 12);
-        cfg.add_msix_cap(3, OFF_MSIX_TABLE as u32, OFF_MSIX_PBA as u32);
-        cfg.build()
+        let msix_cap = cfg.add_msix_cap(MSIX_VECTORS - 1, OFF_MSIX_TABLE as u32, OFF_MSIX_PBA as u32);
+        (cfg.build(), msix_cap)
     }
 
     fn com_read(&self, off: u64, d: &mut [u8]) {
         let i = self.inner.lock().unwrap();
-        let msix_cfg = (if i.msix.enabled { 1u16 << 15 } else { 0u16 }) as u64 | 2;
         let q = i.sq();
-        let v = com_read(&i.com, off, VIRTIO_F_VERSION_1 | 1, 2, msix_cfg,
+        let v = com_read(&i.com, off, VIRTIO_F_VERSION_1 | 1, 2, i.cfg_vec as u64,
             i.qs as u64, q.size as u64, q.vec as u64, q.enabled as u64, i.qs as u64,
             q.desc & 0xFFFF_FFFF, q.desc >> 32, q.avail & 0xFFFF_FFFF, q.avail >> 32, q.used & 0xFFFF_FFFF, q.used >> 32);
         write_val(d, v);
@@ -145,7 +156,7 @@ impl ConsoleDevice {
             CFG_DEVICE_FEAT_SEL => i.com.dfs = v3,
             CFG_DRIVER_FEAT_SEL => i.com.dff = v3,
             CFG_DRIVER_FEAT => if i.com.dff == 0 { i.com.df = (i.com.df & 0xFFFF_FFFF_0000_0000) | (v3 as u64) } else { i.com.df = (i.com.df & 0xFFFF_FFFF) | ((v3 as u64) << 32) },
-            CFG_MSIX_CONFIG => i.msix.enabled = (v2 >> 15) & 1 != 0,
+            CFG_MSIX_CONFIG => i.cfg_vec = v2,
             CFG_STATUS => { i.com.st = v1; if v1 == 0 { i.rx = QState { size: QUEUE_SIZE, ..Default::default() }; i.tx = QState { size: QUEUE_SIZE, vec: 1, ..Default::default() }; i.qs = 0; } if v1 & STATUS_DRIVER_OK != 0 { log::info!("virtio-console: DRIVER_OK"); } }
             CFG_QUEUE_SEL => i.qs = v2,
             CFG_QUEUE_SIZE => i.sqm().size = v2,
@@ -182,8 +193,7 @@ impl ConsoleDevice {
         else if o < OFF_MSIX_PBA {
             let mut i = self.inner.lock().unwrap();
             if i.msix.write(o - OFF_MSIX_TABLE, d) {
-                let idx = ((o - OFF_MSIX_TABLE) / 16) as usize;
-                if idx == 1 { fire_irq_intx(&i.irq_tx); } else { fire_irq_intx(&i.irq_rx); }
+                i.msix.trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
             }
         }
     }
@@ -191,14 +201,14 @@ impl ConsoleDevice {
 
 impl PciDevice for ConsoleDevice {
     fn read_config(&self, o: u32, d: &mut [u8]) {
-        let c = self.pci_config(); let s = o as usize; let e = (s + d.len()).min(256);
-        if s < 256 { d[..e-s].copy_from_slice(&c[s..e]); d[e-s..].fill(0xff); } else { d.fill(0xff); }
+        let i = self.inner.lock().unwrap();
+        read_cfg_space(&i.cfg, o, d);
     }
     fn write_config(&self, o: u32, d: &[u8]) {
-        if o == 0x82 && d.len() >= 2 {
-            let mc = u16::from_le_bytes([d[0], d[1]]);
-            self.inner.lock().unwrap().msix.enabled = (mc >> 15) & 1 != 0;
-        }
+        let mut i = self.inner.lock().unwrap();
+        let cap = i.msix_cap;
+        write_msix_control(&mut i.cfg, cap, o, d);
+        i.msix.enabled = msix_enabled(&i.cfg, cap);
     }
     fn read_bar(&self, bi: usize, o: u64, d: &mut [u8]) -> bool { if bi == 0 { self.bar0_read(o, d); true } else { false } }
     fn write_bar(&self, bi: usize, o: u64, d: &[u8]) -> bool { if bi == 0 { self.bar0_write(o, d); true } else { false } }

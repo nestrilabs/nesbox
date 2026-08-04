@@ -79,7 +79,7 @@ impl PciConfig {
     /// Add a generic PCI capability.
     /// `cap_id` is the PCI capability ID (e.g. 0x09 for vendor, 0x11 for MSI-X).
     /// `payload` is the capability data starting from byte 2 (after cap_id + next).
-    pub fn add_cap(&mut self, cap_id: u8, payload: &[u8]) {
+    pub fn add_cap(&mut self, cap_id: u8, payload: &[u8]) -> u16 {
         let total_cap_len = 2 + payload.len(); // id + next + payload
         let start = match self.last_cap_offset {
             Some(prev) => {
@@ -107,6 +107,7 @@ impl PciConfig {
         }
 
         self.last_cap_offset = Some(start);
+        start
     }
 
     /// Add a virtio PCI capability (type 0x09 = vendor-specific).
@@ -139,14 +140,15 @@ impl PciConfig {
         self.add_cap(0x09, &payload);
     }
 
-    /// Add an MSI-X capability.
+    /// Add an MSI-X capability. Returns the capability's config-space offset,
+    /// which the device needs in order to decode writes to Message Control.
     /// `table_size`: number of vectors - 1
-    pub fn add_msix_cap(&mut self, table_size: u16, table_off: u32, pba_off: u32) {
+    pub fn add_msix_cap(&mut self, table_size: u16, table_off: u32, pba_off: u32) -> u16 {
         let mut payload = [0u8; 10];
         payload[0..2].copy_from_slice(&table_size.to_le_bytes()); // msg_ctl
         payload[2..6].copy_from_slice(&table_off.to_le_bytes());  // table offset + BIR
         payload[6..10].copy_from_slice(&pba_off.to_le_bytes());   // PBA offset + BIR
-        self.add_cap(0x11, &payload);
+        self.add_cap(0x11, &payload)
     }
 
     /// Return the final 256-byte config space.

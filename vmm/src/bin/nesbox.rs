@@ -1,4 +1,4 @@
-use nesbox_vmm::{config, interrupt, vm};
+use nesbox_vmm::{acpi_slot_gsi, config, interrupt::IrqManager, vm};
 
 use anyhow::{Context, Result};
 use env_logger::Env;
@@ -54,8 +54,9 @@ fn main() -> Result<()> {
         &config.boot_source.boot_args,
     )?;
 
-    // Create PCI bus
+    // Create PCI bus and interrupt routing
     let pci_bus = Arc::new(Bus::new());
+    let irq = IrqManager::new(vm.vm_fd.clone())?;
 
     // ── Block device ──────────────────────────────────────────────────────
     let root_drive = config
@@ -65,20 +66,21 @@ fn main() -> Result<()> {
         .context("No root drive specified")?;
     let blk_device = BlkDevice::new(&root_drive.path_on_host, root_drive.is_read_only)?;
 
-    let blk_irq0 = interrupt::MsixVector::new(&vm.vm_fd).context("blk irq0")?;
-    let blk_irq1 = interrupt::MsixVector::new(&vm.vm_fd).context("blk irq1")?;
-    blk_device.set_irq_fds(vec![Arc::new(blk_irq0.irq_fd), Arc::new(blk_irq1.irq_fd)]);
     blk_device.set_mem(vm.mem.clone());
-    let _blk_pci_device = pci_bus.add_device(blk_device)?;
+    let blk_vectors = irq.allocate_msi_vectors(2).context("blk MSI-X vectors")?;
+    let blk_intx = irq.legacy_irqfd(acpi_slot_gsi(1)).context("blk INTx")?;
+    blk_device.bind_interrupts(blk_vectors, irq.clone(), blk_intx);
+    let blk_bdf = pci_bus.add_device(blk_device)?;
+    info!("virtio-blk at {:02x}:{:02x}.{}", blk_bdf.0, blk_bdf.1, blk_bdf.2);
 
     // ── Console device ────────────────────────────────────────────────────
     let console_device = ConsoleDevice::new();
-    let con_irq_tx = interrupt::MsixVector::new(&vm.vm_fd).context("console irq tx")?;
-    let con_irq_rx = interrupt::MsixVector::new(&vm.vm_fd).context("console irq rx")?;
-    console_device.set_irq_tx(Arc::new(con_irq_tx.irq_fd));
-    console_device.set_irq_rx(Arc::new(con_irq_rx.irq_fd));
     console_device.set_mem(vm.mem.clone());
-    let _console_pci_device = pci_bus.add_device(console_device)?;
+    let con_vectors = irq.allocate_msi_vectors(4).context("console MSI-X vectors")?;
+    let con_intx = irq.legacy_irqfd(acpi_slot_gsi(2)).context("console INTx")?;
+    console_device.bind_interrupts(con_vectors, irq.clone(), con_intx);
+    let con_bdf = pci_bus.add_device(console_device)?;
+    info!("virtio-console at {:02x}:{:02x}.{}", con_bdf.0, con_bdf.1, con_bdf.2);
 
     // ── Legacy COM1, for early boot output ────────────────────────────────
     let serial = Arc::new(nesbox_vmm::serial::Serial::new());

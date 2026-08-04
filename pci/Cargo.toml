@@ -7,3 +7,4 @@ edition = "2024"
 anyhow = "1.0"
 log = "0.4"
 vm-memory.workspace = true
+vmm-sys-util = "0.15"

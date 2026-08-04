@@ -247,6 +247,7 @@ dependencies = [
  "anyhow",
  "log",
  "vm-memory 0.18.0",
+ "vmm-sys-util",
 ]
 
 [[package]]

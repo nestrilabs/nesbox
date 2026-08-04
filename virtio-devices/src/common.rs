@@ -1,4 +1,5 @@
 //! Shared constants and types for virtio-pci devices.
+use pci::{MsiRouter, MsiVector};
 use std::sync::Arc;
 use vm_memory::{Bytes, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
@@ -141,19 +142,88 @@ pub fn fire_irq_intx(fd: &Option<Arc<EventFd>>) {
     if let Some(f) = fd { let _ = f.write(1); }
 }
 
-// ── MSI-X table helpers ─────────────────────────────────────────────────────
+// ── PCI config-space helpers ────────────────────────────────────────────────
 
+/// MSI-X Message Control sits two bytes into the capability.
+const MSIX_MSG_CTL: u32 = 2;
+const MSIX_ENABLE: u16 = 1 << 15;
+/// Bits the guest is allowed to change: MSI-X Enable and Function Mask.
+const MSIX_MSG_CTL_WRITABLE: u16 = MSIX_ENABLE | (1 << 14);
+
+/// Serve a read from a device's 256-byte config space.
+pub fn read_cfg_space(cfg: &[u8; 256], offset: u32, data: &mut [u8]) {
+    let s = offset as usize;
+    let e = (s + data.len()).min(256);
+    if s < 256 {
+        data[..e - s].copy_from_slice(&cfg[s..e]);
+        data[e - s..].fill(0xff);
+    } else {
+        data.fill(0xff);
+    }
+}
+
+/// Apply a config-space write, which for our devices means the writable bits
+/// of MSI-X Message Control and nothing else.
+pub fn write_msix_control(cfg: &mut [u8; 256], msix_cap: u16, offset: u32, data: &[u8]) {
+    let ctl_off = msix_cap as u32 + MSIX_MSG_CTL;
+    for (i, byte) in data.iter().enumerate() {
+        let off = offset + i as u32;
+        if off < ctl_off || off >= ctl_off + 2 {
+            continue;
+        }
+        let lane = (off - ctl_off) as usize; // 0 = low byte, 1 = high byte
+        let mask = (MSIX_MSG_CTL_WRITABLE >> (8 * lane)) as u8;
+        let idx = off as usize;
+        cfg[idx] = (cfg[idx] & !mask) | (byte & mask);
+    }
+}
+
+/// Is MSI-X enabled in this config space?
+pub fn msix_enabled(cfg: &[u8; 256], msix_cap: u16) -> bool {
+    let idx = msix_cap as usize + MSIX_MSG_CTL as usize;
+    let ctl = u16::from_le_bytes([cfg[idx], cfg[idx + 1]]);
+    ctl & MSIX_ENABLE != 0
+}
+
+// ── MSI-X table ─────────────────────────────────────────────────────────────
+
+/// A device's MSI-X table plus the host-side vectors it drives.
+///
+/// Entry layout, 16 bytes per vector: address_lo, address_hi, data, then
+/// vector control whose bit 0 is the mask bit.
 pub struct MsixTable<const N: usize> {
     pub entries: [[u8; 16]; N],
     pub pba: u64,
     pub enabled: bool,
+    /// One host vector per table entry, filled in by [`MsixTable::bind`].
+    vectors: Vec<MsiVector>,
+    router: Option<Arc<dyn MsiRouter>>,
+    /// Legacy INTx line, used until the guest enables MSI-X.
+    intx: Option<Arc<EventFd>>,
 }
 
 impl<const N: usize> Default for MsixTable<N> {
-    fn default() -> Self { Self { entries: [[0u8; 16]; N], pba: 0, enabled: false } }
+    fn default() -> Self {
+        Self {
+            entries: [[0u8; 16]; N],
+            pba: 0,
+            enabled: false,
+            vectors: Vec::new(),
+            router: None,
+            intx: None,
+        }
+    }
 }
 
 impl<const N: usize> MsixTable<N> {
+    /// Attach host interrupt resources: one vector per table entry, the router
+    /// that programs them, and the legacy INTx eventfd.
+    pub fn bind(&mut self, vectors: Vec<MsiVector>, router: Arc<dyn MsiRouter>, intx: Arc<EventFd>) {
+        self.vectors = vectors;
+        self.router = Some(router);
+        self.intx = Some(intx);
+    }
+
     pub fn read(&self, offset: u64, data: &mut [u8]) {
         let ei = (offset / 16) as usize;
         if ei >= N { data.fill(0); return; }
@@ -163,7 +233,10 @@ impl<const N: usize> MsixTable<N> {
         data[end - so..].fill(0);
     }
 
-    /// Write to the MSI-X table. Returns true if a previously-masked vector is now unmasked AND had a PBA bit set.
+    /// Write to the MSI-X table, then reprogram the affected vector's route.
+    ///
+    /// Returns true if the entry went from masked to unmasked while an
+    /// interrupt was pending in the PBA, meaning it should be delivered now.
     pub fn write(&mut self, offset: u64, data: &[u8]) -> bool {
         let ei = (offset / 16) as usize;
         if ei >= N { return false; }
@@ -172,10 +245,60 @@ impl<const N: usize> MsixTable<N> {
         let was_masked = self.entries[ei][12] & 1 != 0;
         self.entries[ei][so..end].copy_from_slice(&data[..end - so]);
         let now_unmasked = self.entries[ei][12] & 1 == 0;
+
+        self.program_route(ei);
+
         let had_pending = (self.pba >> ei) & 1 != 0;
-        let result = was_masked && now_unmasked && had_pending;
-        if result { self.pba &= !(1 << ei); }
-        result
+        let deliver_now = was_masked && now_unmasked && had_pending;
+        if deliver_now { self.pba &= !(1 << ei); }
+        deliver_now
+    }
+
+    /// Point this entry's GSI at the address/data pair the guest programmed.
+    fn program_route(&self, ei: usize) {
+        let e = &self.entries[ei];
+        let addr = u64::from(u32::from_le_bytes([e[0], e[1], e[2], e[3]]))
+            | (u64::from(u32::from_le_bytes([e[4], e[5], e[6], e[7]])) << 32);
+        let msg_data = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
+        if addr == 0 {
+            return; // not programmed yet
+        }
+        let (Some(router), Some(vector)) = (self.router.as_ref(), self.vectors.get(ei)) else {
+            return;
+        };
+        if let Err(err) = router.set_msi_route(vector.gsi, addr, msg_data) {
+            log::error!("failed to route MSI-X vector {} (gsi {}): {err:#}", ei, vector.gsi);
+        }
+    }
+
+    /// Deliver an interrupt for `vector`, honouring the mask and MSI-X enable.
+    ///
+    /// Falls back to the legacy INTx line while the guest has not enabled
+    /// MSI-X, which is how the device gets through early probing.
+    pub fn trigger(&mut self, vector: u16) {
+        if !self.enabled || vector == VIRTQ_MSI_NO_VECTOR {
+            log::trace!("INTx fallback: vector={vector} msix_enabled={}", self.enabled);
+            if let Some(intx) = &self.intx { let _ = intx.write(1); }
+            return;
+        }
+        let idx = vector as usize;
+        if idx >= N {
+            return;
+        }
+        if self.masked(idx) {
+            // Record it in the Pending Bit Array; it fires on unmask.
+            self.pba |= 1 << idx;
+            return;
+        }
+        match self.vectors.get(idx) {
+            Some(v) => v.trigger(),
+            None => log::warn!("MSI-X vector {} has no host vector bound", idx),
+        }
+    }
+
+    /// Deliver an interrupt that a table write just unmasked.
+    pub fn trigger_unmasked(&self, idx: usize) {
+        if let Some(v) = self.vectors.get(idx) { v.trigger(); }
     }
 
     pub fn read_pba(&self, offset: u64, data: &mut [u8]) {

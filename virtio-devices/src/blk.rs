@@ -2,8 +2,8 @@
 
 use crate::common::*;
 use anyhow::{Context, Result};
-use pci::PciDevice;
 use pci::config::PciConfig;
+use pci::{MsiRouter, MsiVector, PciDevice};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,8 @@ use vm_memory::{Bytes, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 const QUEUE_SIZE: u16 = 256;
+/// One vector for the queue, one for config changes.
+const MSIX_VECTORS: u16 = 2;
 const SECTOR_SIZE: u64 = 512;
 
 const BLK_T_IN: u32 = 0;
@@ -29,9 +31,14 @@ struct BlkInner {
     qs: u16,
     q: QState,
     isr: u8,
+    /// MSI-X vector for configuration-change interrupts.
+    cfg_vec: u16,
     mem: Option<Arc<GuestMemoryMmap>>,
     msix: MsixTable<2>,
-    irq_fds: Vec<Option<Arc<EventFd>>>,
+    /// Config space, built once; the guest can write MSI-X Message Control.
+    cfg: [u8; 256],
+    /// Config-space offset of the MSI-X capability.
+    msix_cap: u16,
 }
 
 impl BlkInner {
@@ -48,14 +55,8 @@ impl BlkInner {
             push_used(&mem, &self.q, head, n);
         }
         self.isr |= 1;
-        if self.msix.enabled && self.q.vec != VIRTQ_MSI_NO_VECTOR {
-            let idx = self.q.vec as usize;
-            if !self.msix.masked(idx) {
-                if let Some(Some(f)) = self.irq_fds.get(idx) { let _ = f.write(1); }
-            }
-        } else {
-            if let Some(Some(f)) = self.irq_fds.get(0) { let _ = f.write(1); }
-        }
+        let vec = self.q.vec;
+        self.msix.trigger(vec);
     }
 
     fn do_request(&mut self, mem: &GuestMemoryMmap, _head: u16, descs: &[(u64, u32, u16)]) -> u32 {
@@ -114,19 +115,22 @@ impl BlkDevice {
             .with_context(|| format!("Failed to open block device: {:?}", path))?;
         let disk_sectors = file.metadata().context("Failed to stat disk image")?.len() / SECTOR_SIZE;
         log::info!("virtio-blk: {:?}  {} sectors  read_only={}", path, disk_sectors, read_only);
+        let (cfg, msix_cap) = Self::build_pci_config();
         Ok(Self { inner: Mutex::new(BlkInner {
             file, read_only, disk_sectors, com: ComCfg::default(), qs: 0,
             q: QState { size: QUEUE_SIZE, ..Default::default() }, isr: 0,
-            mem: None, msix: MsixTable::default(), irq_fds: vec![None; 2],
+            cfg_vec: VIRTQ_MSI_NO_VECTOR, mem: None, msix: MsixTable::default(), cfg, msix_cap,
         })})
     }
     pub fn set_mem(&self, m: Arc<GuestMemoryMmap>) { self.inner.lock().unwrap().mem = Some(m); }
-    pub fn set_irq_fds(&self, fds: Vec<Arc<EventFd>>) {
-        let mut i = self.inner.lock().unwrap();
-        for (j, f) in fds.into_iter().enumerate() { if j < i.irq_fds.len() { i.irq_fds[j] = Some(f); } }
+
+    /// Attach the host interrupt resources: one MSI-X vector per table entry
+    /// and the legacy INTx line used before the guest enables MSI-X.
+    pub fn bind_interrupts(&self, vectors: Vec<MsiVector>, router: Arc<dyn MsiRouter>, intx: Arc<EventFd>) {
+        self.inner.lock().unwrap().msix.bind(vectors, router, intx);
     }
 
-    fn pci_config(&self) -> [u8; 256] {
+    fn build_pci_config() -> ([u8; 256], u16) {
         let mut cfg = PciConfig::new(0x1AF4, 0x1042, 0x01, 0x01_00_00, 0x1AF4, 0x0002);
         cfg.set_bar_mem(0, BAR0_SIZE);
         cfg.set_irq_pin(1);
@@ -135,14 +139,13 @@ impl BlkDevice {
         cfg.add_virtio_notify_cap(0, OFF_NOTIFY as u32, 0x100, NOTIFY_MULT);
         cfg.add_virtio_cap(3, 0, OFF_ISR as u32, 1);
         cfg.add_virtio_cap(4, 0, OFF_DEVICE as u32, 0x3C);
-        cfg.add_msix_cap(0, OFF_MSIX_TABLE as u32, OFF_MSIX_PBA as u32);
-        cfg.build()
+        let msix_cap = cfg.add_msix_cap(MSIX_VECTORS - 1, OFF_MSIX_TABLE as u32, OFF_MSIX_PBA as u32);
+        (cfg.build(), msix_cap)
     }
 
     fn com_read(&self, off: u64, d: &mut [u8]) {
         let i = self.inner.lock().unwrap();
-        let msix_cfg = (if i.msix.enabled { 1u16 << 15 } else { 0u16 }) as u64 | 1;
-        let v = com_read(&i.com, off, i.features(), 1, msix_cfg,
+        let v = com_read(&i.com, off, i.features(), 1, i.cfg_vec as u64,
             i.qs as u64, i.q.size as u64, i.q.vec as u64, i.q.enabled as u64, 0,
             i.q.desc & 0xFFFF_FFFF, i.q.desc >> 32, i.q.avail & 0xFFFF_FFFF, i.q.avail >> 32, i.q.used & 0xFFFF_FFFF, i.q.used >> 32);
         write_val(d, v);
@@ -155,7 +158,7 @@ impl BlkDevice {
             CFG_DEVICE_FEAT_SEL => i.com.dfs = v3,
             CFG_DRIVER_FEAT_SEL => i.com.dff = v3,
             CFG_DRIVER_FEAT => if i.com.dff == 0 { i.com.df = (i.com.df & 0xFFFF_FFFF_0000_0000) | (v3 as u64) } else { i.com.df = (i.com.df & 0xFFFF_FFFF) | ((v3 as u64) << 32) },
-            CFG_MSIX_CONFIG => i.msix.enabled = (v2 >> 15) & 1 != 0,
+            CFG_MSIX_CONFIG => i.cfg_vec = v2,
             CFG_STATUS => { let old = i.com.st; i.com.st = v1; if old & 4 == 0 && v1 & STATUS_DRIVER_OK != 0 { log::info!("virtio-blk: Driver OK"); } },
             CFG_QUEUE_SEL => i.qs = v2,
             CFG_QUEUE_SIZE => if i.qs == 0 { i.q.size = v2; },
@@ -192,10 +195,7 @@ impl BlkDevice {
         else if o < OFF_MSIX_PBA {
             let mut i = self.inner.lock().unwrap();
             if i.msix.write(o - OFF_MSIX_TABLE, d) {
-                let idx = ((o - OFF_MSIX_TABLE) / 16) as usize;
-                if !i.msix.masked(idx) {
-                    if let Some(Some(f)) = i.irq_fds.get(idx) { let _ = f.write(1); }
-                }
+                i.msix.trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
             }
         }
     }
@@ -203,14 +203,14 @@ impl BlkDevice {
 
 impl PciDevice for BlkDevice {
     fn read_config(&self, o: u32, d: &mut [u8]) {
-        let c = self.pci_config(); let s = o as usize; let e = (s + d.len()).min(256);
-        if s < 256 { d[..e-s].copy_from_slice(&c[s..e]); d[e-s..].fill(0xff); } else { d.fill(0xff); }
+        let i = self.inner.lock().unwrap();
+        read_cfg_space(&i.cfg, o, d);
     }
     fn write_config(&self, o: u32, d: &[u8]) {
-        if o == 0x82 && d.len() >= 2 {
-            let mc = u16::from_le_bytes([d[0], d[1]]);
-            self.inner.lock().unwrap().msix.enabled = (mc >> 15) & 1 != 0;
-        }
+        let mut i = self.inner.lock().unwrap();
+        let cap = i.msix_cap;
+        write_msix_control(&mut i.cfg, cap, o, d);
+        i.msix.enabled = msix_enabled(&i.cfg, cap);
     }
     fn read_bar(&self, bi: usize, o: u64, d: &mut [u8]) -> bool { if bi == 0 { self.bar0_read(o, d); true } else { false } }
     fn write_bar(&self, bi: usize, o: u64, d: &[u8]) -> bool { if bi == 0 { self.bar0_write(o, d); true } else { false } }

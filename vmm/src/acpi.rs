@@ -3,12 +3,15 @@ use anyhow::{Context, Result};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use zerocopy::IntoBytes;
 
-/// GSI a PCI slot's INTx line is wired to.
+/// GSI a PCI slot's INTx line is wired to, as published in the DSDT's _PRT.
+///
+/// Re-exported from the crate root as `acpi_slot_gsi`; device wiring must use
+/// it so the INTx eventfd lands on the pin the guest is told to expect.
 ///
 /// INTx is the fallback path — a device that negotiates MSI-X never uses it.
 /// Slot 1 gets its own line; everything else shares one, which is legal
 /// because INTx is level-triggered and shareable.
-fn slot_gsi(slot: u32) -> u32 {
+pub fn slot_gsi(slot: u32) -> u32 {
     match slot {
         1 => 10,
         _ => 11,

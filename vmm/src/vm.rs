@@ -7,7 +7,7 @@ use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap};
 
 pub struct Vm {
     pub kvm: Kvm,
-    pub vm_fd: VmFd,
+    pub vm_fd: Arc<VmFd>,
     pub mem: Arc<GuestMemoryMmap>,
     pub vcpus: Vec<VcpuFd>,
 }
@@ -20,7 +20,7 @@ impl Vm {
         cmdline_str: &str,
     ) -> Result<Self> {
         let kvm = Kvm::new().context("Failed to open KVM")?;
-        let vm_fd = kvm.create_vm().context("Failed to create VM")?;
+        let vm_fd = Arc::new(kvm.create_vm().context("Failed to create VM")?);
 
         // Create IRQ chip
         vm_fd.create_irq_chip().context("Failed to create IRQ chip")?;

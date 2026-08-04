@@ -26,6 +26,9 @@
 //! assigned address via the initial read).
 
 pub mod config;
+pub mod msi;
+
+pub use msi::{MsiRouter, MsiVector};
 
 use anyhow::Result;
 use std::collections::HashMap;
