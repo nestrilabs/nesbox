@@ -21,6 +21,31 @@ pub struct VmConfig {
     /// Optional network device. Absent means the guest has no link at all.
     #[serde(default)]
     pub network: Option<Network>,
+    /// Optional GPU. Absent means the guest has no display device.
+    #[serde(default)]
+    pub gpu: Option<Gpu>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Gpu {
+    /// Host render node to give the guest, e.g. `/dev/dri/renderD128`.
+    #[serde(default = "default_render_node")]
+    pub render_node: PathBuf,
+    #[serde(default = "default_width")]
+    pub width: u32,
+    #[serde(default = "default_height")]
+    pub height: u32,
+}
+
+fn default_render_node() -> PathBuf {
+    PathBuf::from("/dev/dri/renderD128")
+}
+fn default_width() -> u32 {
+    1920
+}
+fn default_height() -> u32 {
+    1080
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

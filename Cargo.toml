@@ -6,4 +6,4 @@ members = ["vmm", "virtio-devices", "pci", "vm-core"]
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
 linux-loader = "0.14"
 acpi_tables = "0.2"
-#rutabaga_gfx = { git = "https://github.com/magma-gpu/rutabaga_gfx.git", rev = "2f0c6a55fd36e61b22a1b3679f69d4273c056602" }
+rutabaga_gfx = { version = "0.1.80", features = ["virgl_renderer"] }

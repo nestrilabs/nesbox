@@ -24,6 +24,11 @@
     "netmask": "255.255.255.0",
     "mac": "02:00:00:00:00:01"
   },
+  "gpu": {
+    "render-node": "/dev/dri/renderD128",
+    "width": 1920,
+    "height": 1080
+  },
   "shared-directories": [
     {
       "tag": "prefix",

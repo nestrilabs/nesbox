@@ -11,5 +11,8 @@ virtio-bindings = "0.2"
 vmm-sys-util = "0.15"
 vm-memory.workspace = true
 pci = { path = "../pci" }
+rutabaga_gfx.workspace = true
+thiserror = "2.0"
+displaydoc = "0.2"
 libc = "0.2.189"
 vhost = { version = "0.17.0", features = ["vhost-vsock", "vhost-net", "vhost-kern", "vhost-user-frontend"] }

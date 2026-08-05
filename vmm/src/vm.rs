@@ -15,6 +15,9 @@ pub struct Vm {
     pub vcpus: Vec<VcpuFd>,
     /// Where 64-bit BARs may be placed, given this CPU's address width.
     pub mmio64: layout::Mmio64Window,
+    /// How many KVM memory slots guest RAM took. Anything mapped later —
+    /// the GPU's shared window — must start after these.
+    pub ram_slot_count: u32,
 }
 
 /// How many bits of physical address the guest CPU will have.
@@ -164,6 +167,7 @@ impl Vm {
             mem,
             vcpus,
             mmio64,
+            ram_slot_count: regions.len() as u32,
         })
     }
 }

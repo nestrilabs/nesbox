@@ -155,6 +155,27 @@ impl PciConfig {
         self.add_cap(0x09, &payload);
     }
 
+    /// Add a virtio shared-memory capability (cfg_type 8), telling the guest
+    /// that `length` bytes at `offset` into `bar_idx` are a shared window it
+    /// may map, identified by `shmid`.
+    ///
+    /// This is the 64-bit form of the virtio capability: the offset and length
+    /// each get a high half, because such a window is routinely larger than
+    /// 4 GiB. It is how a GPU's host-visible blob memory reaches the guest.
+    pub fn add_virtio_shm_cap(&mut self, shmid: u8, bar_idx: u8, offset: u64, length: u64) {
+        let mut payload = [0u8; 22];
+        payload[0] = 24; // cap_len, including vndr + next
+        payload[1] = 8; // cfg_type = SharedMemoryCfg
+        payload[2] = bar_idx;
+        payload[3] = shmid;
+        // padding at 4,5
+        payload[6..10].copy_from_slice(&(offset as u32).to_le_bytes());
+        payload[10..14].copy_from_slice(&(length as u32).to_le_bytes());
+        payload[14..18].copy_from_slice(&((offset >> 32) as u32).to_le_bytes());
+        payload[18..22].copy_from_slice(&((length >> 32) as u32).to_le_bytes());
+        self.add_cap(0x09, &payload);
+    }
+
     /// Add an MSI-X capability. Returns the capability's config-space offset,
     /// which the device needs in order to decode writes to Message Control.
     /// `table_size`: number of vectors - 1
@@ -190,4 +211,79 @@ impl PciConfig {
 
 fn next_dword(offset: u16) -> u16 {
     (offset + 3) & !3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walk the capability list the way `pci_find_next_capability` does.
+    fn capabilities(cfg: &[u8; 256]) -> Vec<(u16, u8)> {
+        let mut out = Vec::new();
+        let mut pos = cfg[CAP_LIST_HEAD as usize] as u16;
+        while pos != 0 && (pos as usize) < 256 {
+            out.push((pos, cfg[pos as usize]));
+            pos = cfg[pos as usize + 1] as u16;
+        }
+        out
+    }
+
+    /// The capability layout the GPU builds.
+    fn gpu_like() -> ([u8; 256], u16) {
+        let mut cfg = PciConfig::new(0x1AF4, 0x1050, 0x01, 0x03_00_00, 0x1AF4, 16);
+        cfg.set_bar_mem(0, 0x1000);
+        cfg.set_bar_mem64(2, 8 << 30);
+        cfg.add_virtio_cap(1, 0, 0, 0x38);
+        cfg.add_virtio_notify_cap(0, 0x300, 0x100, 4);
+        cfg.add_virtio_cap(3, 0, 0x100, 1);
+        cfg.add_virtio_cap(4, 0, 0x200, 16);
+        cfg.add_virtio_shm_cap(1, 2, 0, 8 << 30);
+        let msix = cfg.add_msix_cap(3, 0x400, 0x500);
+        cfg.add_pcie_cap(PCIE_TYPE_RC_INTEGRATED);
+        (cfg.build(), msix)
+    }
+
+    #[test]
+    fn every_capability_is_reachable_from_the_list_head() {
+        let (cfg, _) = gpu_like();
+        let caps = capabilities(&cfg);
+        // Five vendor capabilities, then MSI-X, then PCI Express.
+        assert_eq!(caps.iter().filter(|(_, id)| *id == 0x09).count(), 5);
+        assert!(caps.iter().any(|(_, id)| *id == 0x11), "MSI-X missing");
+        assert!(caps.iter().any(|(_, id)| *id == 0x10), "PCIe missing");
+    }
+
+    #[test]
+    fn the_shared_memory_capability_is_what_linux_looks_for() {
+        let (cfg, _) = gpu_like();
+        // Linux filters vendor capabilities on cfg_type at offset 3, then
+        // insists cap_len at offset 2 equals sizeof(virtio_pci_cap64) = 24.
+        let shm = capabilities(&cfg)
+            .into_iter()
+            .find(|&(pos, id)| id == 0x09 && cfg[pos as usize + 3] == 8)
+            .expect("no shared-memory capability in the list");
+        let pos = shm.0 as usize;
+        assert_eq!(cfg[pos + 2], 24, "cap_len must be sizeof(virtio_pci_cap64)");
+        assert_eq!(cfg[pos + 4], 2, "bar");
+        assert_eq!(cfg[pos + 5], 1, "shmid");
+        let offset = u32::from_le_bytes([cfg[pos + 8], cfg[pos + 9], cfg[pos + 10], cfg[pos + 11]]);
+        let length =
+            u32::from_le_bytes([cfg[pos + 12], cfg[pos + 13], cfg[pos + 14], cfg[pos + 15]]);
+        let length_hi =
+            u32::from_le_bytes([cfg[pos + 20], cfg[pos + 21], cfg[pos + 22], cfg[pos + 23]]);
+        assert_eq!(offset, 0);
+        assert_eq!(
+            ((length_hi as u64) << 32) | length as u64,
+            8 << 30,
+            "the 8 GiB length must survive the split into two registers"
+        );
+    }
+
+    #[test]
+    fn capabilities_fit_in_config_space() {
+        let (cfg, _) = gpu_like();
+        for (pos, _) in capabilities(&cfg) {
+            assert!(pos >= FIRST_CAP && pos < CAP_MAX);
+        }
+    }
 }

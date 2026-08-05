@@ -11,7 +11,14 @@ use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
 use termios::*;
-use virtio_devices::{BlkDevice, ConsoleDevice, FsDevice, NetConfig, NetDevice, VsockDevice};
+use nesbox_vmm::memslot::MemorySlots;
+use virtio_devices::gpu::display::DisplayInfo;
+use virtio_devices::{
+    BlkDevice, ConsoleDevice, FsDevice, GpuConfig, GpuDevice, NetConfig, NetDevice, VsockDevice,
+};
+
+/// BAR index the GPU puts its shared memory window in.
+const GPU_SHM_BAR: usize = 2;
 
 /// Puts the terminal in raw mode so guest console input is unbuffered, and
 /// restores it on drop.
@@ -129,6 +136,37 @@ fn main() -> Result<()> {
         info!("virtio-net at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
     }
 
+    // ── GPU (optional) ────────────────────────────────────────────────────
+    // Added before virtio-fs so its slot does not shift when a share is added
+    // or removed. Its shared window is a real memory slot, taken after the
+    // ones guest RAM already occupies.
+    if let Some(gpu_cfg) = &config.gpu {
+        let slots = MemorySlots::new(vm.vm_fd.clone(), vm.ram_slot_count);
+        let gpu_device = Arc::new(GpuDevice::new(
+            &GpuConfig {
+                render_node: gpu_cfg.render_node.clone(),
+                displays: vec![DisplayInfo::new(gpu_cfg.width, gpu_cfg.height)],
+            },
+            vm.mem.clone(),
+        )?);
+        let gpu_vectors = irq.allocate_msi_vectors(4).context("GPU MSI-X vectors")?;
+        let slot = 5;
+        let gpu_intx = irq.legacy_irqfd(acpi_slot_gsi(slot)).context("GPU INTx")?;
+        gpu_device.bind_interrupts(gpu_vectors, irq.clone(), gpu_intx);
+        gpu_device.bind_mapper(slots);
+        let bdf = pci_bus.add_device_arc(gpu_device.clone())?;
+        // The shared window has to appear at whatever address the bus gave
+        // BAR2, so the device only learns it now.
+        let shm_addr = pci_bus
+            .bar_address(bdf, GPU_SHM_BAR)
+            .context("the GPU has no BAR2")?;
+        gpu_device.set_shm_guest_addr(shm_addr);
+        info!(
+            "virtio-gpu at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
+            bdf.0, bdf.1, bdf.2
+        );
+    }
+
     // ── Shared directories over virtio-fs ─────────────────────────────────
     // The daemons are kept alive for as long as the VM runs; dropping them
     // kills virtiofsd.
@@ -137,7 +175,13 @@ fn main() -> Result<()> {
     // Devices take PCI slots in the order they are added, and the INTx line
     // follows the slot, so where these start depends on whether there is a
     // network device ahead of them.
-    let first_fs_slot = if config.network.is_some() { 5 } else { 4 };
+    let mut first_fs_slot = 4;
+    if config.network.is_some() {
+        first_fs_slot += 1;
+    }
+    if config.gpu.is_some() {
+        first_fs_slot += 1;
+    }
     for shared in &config.shared_directories {
         let daemon = Virtiofsd::spawn(
             &shared.tag,

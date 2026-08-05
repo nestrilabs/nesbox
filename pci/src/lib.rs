@@ -176,6 +176,24 @@ impl Bus {
 
     /// Register a PCI device and assign BAR addresses.  Returns the BDF.
     pub fn add_device(&self, device: impl PciDevice + 'static) -> Result<(u8, u8, u8)> {
+        self.add_device_arc(Arc::new(device))
+    }
+
+    /// Where a device's BAR was placed, once it has been added. A device that
+    /// has to tell the guest about its own BAR — a virtio shared-memory window,
+    /// say — asks here rather than predicting what the allocator will do.
+    pub fn bar_address(&self, bdf: (u8, u8, u8), bar_idx: usize) -> Option<u64> {
+        let devices = self.devices.read().unwrap();
+        devices
+            .get(&bdf)?
+            .bars
+            .iter()
+            .find(|b| b.bar_idx == bar_idx)
+            .map(|b| b.addr)
+    }
+
+    /// As [`Bus::add_device`], but keeps the caller's handle to the device.
+    pub fn add_device_arc(&self, device: Arc<dyn PciDevice>) -> Result<(u8, u8, u8)> {
         let mut next_bdf = self.next_bdf.lock().unwrap();
         let (bus, dev, func) = *next_bdf;
         if bus > 0 || dev > 31 {
@@ -250,10 +268,7 @@ impl Bus {
             let mut devices = self.devices.write().unwrap();
             devices.insert(
                 bdf,
-                PciDeviceEntry {
-                    device: Arc::new(device),
-                    bars,
-                },
+                PciDeviceEntry { device, bars },
             );
         }
 
