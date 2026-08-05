@@ -56,25 +56,48 @@ impl Inner {
         self.msix.trigger(vec);
     }
 
+    /// Move buffered host input into the guest's receive queue.
     fn process_rx(&mut self) {
-        let mem = match self.mem.clone() { Some(m) => m, None => return };
-        if !self.rx.enabled || self.rx.desc == 0 { return; }
-        let mut stdin_buf = self.stdin_buf.lock().unwrap();
-        if stdin_buf.is_empty() { return; }
+        let Some(mem) = self.mem.clone() else { return };
+        if !self.rx.enabled || self.rx.desc == 0 {
+            return;
+        }
+        let stdin_buf = self.stdin_buf.clone();
+        let mut delivered = 0u32;
+
         loop {
+            if stdin_buf.lock().unwrap().is_empty() {
+                break;
+            }
+            // Only take a buffer off the queue when there is input for it;
+            // completing spare buffers with zero length just burns them.
             let Some((head, descs)) = pop_avail(&mem, &mut self.rx) else { break };
             let mut written = 0u32;
             for &(addr, len, flags) in &descs {
-                if flags & VRING_DESC_F_WRITE != 0 && !stdin_buf.is_empty() {
-                    let n = (len as usize).min(stdin_buf.len());
-                    let data: Vec<u8> = stdin_buf.drain(..n).collect();
-                    let _ = mem.write_slice(&data, vm_memory::GuestAddress(addr));
-                    written += n as u32;
+                if flags & VRING_DESC_F_WRITE == 0 {
+                    continue;
+                }
+                let data: Vec<u8> = {
+                    let mut buf = stdin_buf.lock().unwrap();
+                    if buf.is_empty() {
+                        break;
+                    }
+                    let n = (len as usize).min(buf.len());
+                    buf.drain(..n).collect()
+                };
+                if mem.write_slice(&data, vm_memory::GuestAddress(addr)).is_ok() {
+                    written += data.len() as u32;
                 }
             }
             push_used(&mem, &self.rx, head, written);
+            delivered += written;
         }
-        if self.isr & 1 == 0 {
+
+        if delivered > 0 {
+            // The ISR bit is only meaningful for INTx, and is cleared by the
+            // guest reading it — which an MSI-X driver never does. Gating the
+            // interrupt on it meant one byte of console output suppressed
+            // every later keystroke.
             self.isr |= 1;
             let vec = self.rx.vec;
             self.msix.trigger(vec);
@@ -188,8 +211,14 @@ impl ConsoleDevice {
         else if o < OFF_DEVICE {}
         else if o < OFF_NOTIFY {}
         else if o < OFF_MSIX_TABLE {
-            let qi = if d.len() >= 2 { u16::from_le_bytes([d[0], d[1]]) } else { 0 };
-            if qi == 1 { self.inner.lock().unwrap().process_tx(); }
+            // The notify address identifies the queue.
+            let idx = (o - OFF_NOTIFY) / NOTIFY_MULT as u64;
+            let mut i = self.inner.lock().unwrap();
+            match idx {
+                0 => i.process_rx(), // buffers posted; deliver pending input
+                1 => i.process_tx(),
+                _ => {}
+            }
         }
         else if o < OFF_MSIX_PBA {
             let mut i = self.inner.lock().unwrap();
