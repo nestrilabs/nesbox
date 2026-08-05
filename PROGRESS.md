@@ -47,8 +47,8 @@ codes: 0 clean or signalled, 1 VMM error, 2 guest reset, 3 guest fault.
 
 | What | Where | Notes |
 |---|---|---|
-| Guest kernel | `/mnt/nekopool/PROJEKT/NestriWork/linux/vmlinux` | 7.1.5, ELF. Has PCI, `PCI_MMCONFIG`, virtio-pci/blk/console/net, `DRM_VIRTIO_GPU`, vsock, `VIRTIO_FS`, 8250, ext4, x2APIC |
-| Rootfs | `/mnt/nekopool/PROJEKT/NestriWork/rootfs-builder/output/rootfs.ext4` | 2 GiB Alpine + Nestri stack. Root-owned mode 644, so run it `"is_read_only": true` |
+| Guest kernel | `/mnt/nekopool/PROJEKT/NestriWork/linux/vmlinux` | 7.1.5, ELF. Has PCI, `PCI_MMCONFIG`, virtio-pci/blk/console/net, `DRM_VIRTIO_GPU`, vsock, `VIRTIO_FS`, 8250, ext4, x2APIC. **No native GPU driver is needed in the guest** — native context means the guest only ever binds virtio-gpu |
+| Rootfs | `/mnt/nekopool/PROJEKT/NestriWork/rootfs-builder/output/rootfs.ext4` | 2 GiB Alpine + Nestri stack, built from `rootfs-builder/Containerfile`. Root-owned mode 644, so run it `"is_read_only": true`. Mesa needs `-Dvulkan-drivers=…,intel`, `-Dgallium-drivers=…,iris` and `-Dintel-virtio-experimental=true` for the GPU to work |
 | Kernel source | same `linux/` dir | Build with `./scripts/config --enable X && make olddefconfig && make -j12 vmlinux`, ~10 min |
 | Reference clones | `cloudhypervisor-for-llm-ref/`, `linux-for-llm-ref/` | Read-only references, untracked, **do not build in them** |
 
@@ -134,7 +134,7 @@ RUST_LOG=trace ./target/debug/nesbox cfg.json 2>&1 | grep -c 'INTx fallback'   #
 | virtio-net | kernel, `/dev/vhost-net` | guest pings the host end of the tap both ways, no INTx fallback, tap gone after exit. Needs CAP_NET_ADMIN, see §9 |
 | 16550A serial | in-process, TX only | earlyprintk output |
 | SMP | KVM | 8 vCPUs, `smpboot: Total of 8 processors activated`, all online, clean poweroff and SIGTERM |
-| virtio-gpu | rutabaga, in-process | guest ends up with `/dev/dri/card0` + `renderD128` and reports `+virgl +edid +resource_blob +host_visible +context_init`. **Rendering itself untested** |
+| virtio-gpu | rutabaga, in-process | `vulkaninfo` in the guest reports the host's real GPU — `Intel(R) Arc(tm) A310 Graphics (DG2)`, `0x8086:0x56a6`, discrete — through ANV over native context |
 
 The vsock check, with a VM running at CID 42:
 
@@ -191,6 +191,13 @@ Do not re-derive these.
 - **rutabaga needs the `virgl_renderer` cargo feature.** Without it the crate
   still builds and `RutabagaBuilder` still runs, but the component the DRM
   native context needs is not there.
+- **The host's virglrenderer supplies the native context, not the guest.** It
+  has renderers for `amdgpu`, `asahi`, `i915`, `msm` and `panfrost`; check with
+  `strings /usr/lib/libvirglrenderer.so.1 | grep -oE '^[a-z0-9]+_ccmd_[a-z_]+'`.
+  The guest needs no GPU driver of its own.
+- **Mesa's `i915` gallium driver is not the modern Intel one.** It is the gen3
+  driver for i830–i945; anything recent wants `iris`. Picking the wrong one
+  builds cleanly and produces a driver that never matches the hardware.
 
 ---
 
@@ -235,13 +242,44 @@ holding the host-visible window blob resources are mapped into, advertised to
 the guest through a virtio shared-memory capability and backed by a KVM memory
 slot so guest access never traps to us.
 
-What is not done: nothing has ever been rendered. The test rootfs has no Mesa
-and no client to draw with, so everything past "the driver initialised" is
-unverified. A real check needs a guest with the virtio-gpu Mesa driver.
+### Verifying it
+
+The guest needs `/proc` **and `/sys`** mounted before any of this works: libdrm
+enumerates through sysfs, so without it Mesa finds no devices and says only
+"Failed to detect any valid GPUs" — which looks exactly like a broken device.
+Under `init=/bin/sh` nothing is mounted for you.
+
+```bash
+mount -t proc proc /proc; mount -t sysfs sysfs /sys
+export XDG_RUNTIME_DIR=/tmp
+vulkaninfo --summary
+```
+
+That reports the host GPU by name and PCI id if native context is working.
+`RUST_LOG=off` makes the guest's own output readable.
+
+`glxinfo`/`eglinfo` still fail, for two separate reasons: there is no display
+server in the test rootfs, and `iris_dri.so` is built without virtio support
+(`grep -c virtgpu /usr/lib/dri/iris_dri.so` is 0, against 13 for
+`libvulkan_intel.so`). GL over native context would need a Mesa rebuild.
+Vulkan is what Proton uses, so this has not been chased.
+
+### Still rough
+
+- `map_blob` logs `resource_map failed (MagmaGpuError(Unsupported))` and falls
+  back to `export_blob` on every mapping. The fallback works — Vulkan comes up
+  regardless — but the fast path does not, and that is worth understanding
+  before profiling anything.
+- The guest logs `*ERROR* response 0x1200 (command 0x200)` once at startup.
+  That is Mesa probing for a context with no capset before retrying with capset
+  6, which succeeds. Harmless, and expected given only `RUTABAGA_CAPSET_DRM` is
+  enabled.
+- Nothing has drawn to a surface; there is no display path and no compositor.
 
 ## 8. Suggested order
 
-1. Render something, to find out what the port actually got wrong.
+1. Work out why `map_blob`'s `resource_map` is unsupported and only the
+   `export_blob` fallback works (§7).
 2. Decide where the host's NAT rules live (§9), so egress actually works.
 3. `virtio-blk` is synchronous on the vCPU thread; it will need a worker
    under game load.
