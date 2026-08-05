@@ -105,10 +105,16 @@ impl Vm {
                 .context("Failed to get supported CPUID")?;
             vcpu_fd.set_cpuid2(&cpuid).context("Failed to set CPUID")?;
 
-            // Configure registers
-            crate::regs::setup_fpu(&vcpu_fd)?;
-            crate::regs::setup_regs(&vcpu_fd, entry_point.raw_value())?;
-            crate::regs::setup_sregs(&mem, &vcpu_fd)?;
+            // Only the bootstrap processor starts executing the kernel. The
+            // application processors must be left in the reset state KVM gave
+            // them, halted until the guest sends INIT/SIPI — putting them in
+            // long mode at the kernel entry point would start several CPUs
+            // racing through the boot path at once.
+            if cpu_id == 0 {
+                crate::regs::setup_fpu(&vcpu_fd)?;
+                crate::regs::setup_regs(&vcpu_fd, entry_point.raw_value())?;
+                crate::regs::setup_sregs(&mem, &vcpu_fd)?;
+            }
 
             vcpus.push(vcpu_fd);
         }
@@ -228,6 +234,14 @@ pub fn run_vcpu_loop(
             },
             Err(e) if e.errno() == libc::EINTR => {
                 // Woken to notice the stop request; the loop head checks it.
+                continue;
+            }
+            Err(e) if e.errno() == libc::EAGAIN => {
+                // An application processor that has not been started yet.
+                // KVM_RUN on a vCPU still in KVM_MP_STATE_UNINITIALIZED sleeps
+                // in the kernel until INIT/SIPI arrives and then returns
+                // EAGAIN, expecting to be called again. This is not a busy
+                // wait: the blocking happens on the other side of the ioctl.
                 continue;
             }
             Err(e) => {

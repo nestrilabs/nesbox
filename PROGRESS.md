@@ -133,6 +133,7 @@ RUST_LOG=trace ./target/debug/nesbox cfg.json 2>&1 | grep -c 'INTx fallback'   #
 | virtio-fs | virtiofsd, vhost-user | `mount -t virtiofs`, reading a host file, EROFS on a read-only export |
 | virtio-net | kernel, `/dev/vhost-net` | guest pings the host end of the tap both ways, no INTx fallback, tap gone after exit. Needs CAP_NET_ADMIN, see §9 |
 | 16550A serial | in-process, TX only | earlyprintk output |
+| SMP | KVM | 8 vCPUs, `smpboot: Total of 8 processors activated`, all online, clean poweroff and SIGTERM |
 
 The vsock check, with a VM running at CID 42:
 
@@ -159,6 +160,12 @@ Do not re-derive these.
 - **The guest TSS descriptor must be type 11**, busy 64-bit TSS. Type 9 makes
   every `KVM_RUN` fail VM entry with `FailEntry(0x80000021)` before a single
   instruction runs, silently. This cost the project months.
+- **Only the bootstrap processor gets boot register state.** Application
+  processors must be left in KVM's reset state so they sit in
+  `KVM_MP_STATE_UNINITIALIZED` until the guest sends INIT/SIPI. Giving them all
+  the BSP's long-mode entry state starts several CPUs racing through the boot
+  path. `KVM_RUN` on a vCPU in that state sleeps in the kernel and then returns
+  **EAGAIN**, which the vCPU loop must retry rather than treat as fatal.
 - **Linux ignores ECAM unless the window is reserved**, no matter what MCFG
   says. It is reserved twice here: an `E820_RESERVED` entry and a `PNP0C02`
   motherboard device.
@@ -176,14 +183,6 @@ Do not re-derive these.
 
 ## 6. Known gaps
 
-- **SMP is broken.** Any `vcpu_count` above 1 fails immediately with
-  `KVM_RUN failed: EAGAIN`. An application processor starts in
-  `KVM_MP_STATE_UNINITIALIZED` and stays there until it gets INIT/SIPI, and
-  KVM answers `KVM_RUN` on such a vCPU with EAGAIN. We treat that as fatal and
-  tear down the VM. Two things are missing: the vCPU loop must wait rather than
-  die, and the MADT/boot path must actually start the APs. **The configured
-  default is 2**, so the default config does not boot — every test so far
-  happened to use 1.
 - **The net link works, egress does not.** The guest can reach the host end of
   its tap and nothing further, because routing the subnet outward is host-global
   state nesbox does not install. §9 has the rules; where they belong is open.
@@ -232,11 +231,10 @@ that before porting device code.
 
 ## 8. Suggested order
 
-1. Verify virtio-net end to end (§9) and fix whatever it turns up.
-2. SMP, which the default config already asks for and does not get.
-3. 64-bit prefetchable BAR support in `pci`, which the GPU needs anyway.
-4. The GPU port.
-5. Delete `vm-core`; make the README describe what is actually true.
+1. 64-bit prefetchable BAR support in `pci`, which the GPU needs anyway.
+2. The GPU port.
+3. Decide where the host's NAT rules live (§9), so egress actually works.
+4. Delete `vm-core`; make the README describe what is actually true.
 
 ## 9. Running virtio-net
 
