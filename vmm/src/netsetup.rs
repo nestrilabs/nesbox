@@ -71,10 +71,12 @@ impl Problem {
             Self::ForwardingDisabled | Self::NoMasquerade(_) => {
                 "run `nesbox setup <config.json>` once, as root".to_string()
             }
+            // Both directions, because replies arrive addressed to the
+            // subnet once conntrack has undone the masquerade.
             Self::ForwardingBlocked(subnet) => format!(
-                "allow the subnet through that firewall, e.g. \
-                 `sudo iptables -I DOCKER-USER -s {subnet} -j ACCEPT` for Docker \
-                 or `sudo ufw route allow from {subnet}` for ufw"
+                "allow the subnet through that firewall in both directions, e.g. for Docker \
+                 `sudo iptables -I DOCKER-USER -s {subnet} -j ACCEPT` and \
+                 `sudo iptables -I DOCKER-USER -d {subnet} -j ACCEPT`"
             ),
             Self::CannotTell(_) => {
                 "check by hand: `sysctl net.ipv4.ip_forward` and `nft list table ip nesbox`"
@@ -216,38 +218,39 @@ fn masquerade_present(ruleset: &str, subnet: Subnet) -> bool {
         .any(|line| line.contains("masquerade") && line.contains(&subnet))
 }
 
-/// Does some other chain drop forwarded packets by default?
+/// Does some other chain drop forwarded packets by default, with nothing
+/// letting the guest's subnet back through?
 ///
-/// Docker sets this the moment it starts, and ufw ships with it. Detecting it
-/// matters more than it looks: with forwarding on and a masquerade rule in
-/// place, everything we install is correct and the guest still cannot reach
-/// anything, which is the hardest version of this failure to place.
+/// Docker sets a dropping forward policy the moment it starts, and ufw ships
+/// with one. Detecting it matters more than it looks: with forwarding on and a
+/// masquerade rule in place, everything nesbox installs is correct and the
+/// guest still reaches nothing, which is the hardest version of this failure to
+/// place.
+///
+/// **Both directions have to be allowed.** An accept for the subnet as a source
+/// passes the guest's outbound packets, and is not enough on its own: conntrack
+/// has already reversed the masquerade by the time a reply reaches the forward
+/// chain, so replies arrive addressed *to* the subnet and match nothing. That
+/// was not a guess — a host with only the outbound rule dropped every reply.
+///
+/// Accepts are looked for anywhere in the ruleset rather than only inside the
+/// dropping chain, because they usually live in a chain it jumps to, such as
+/// Docker's `DOCKER-USER`.
 fn forwarding_blocked(ruleset: &str, subnet: Subnet) -> bool {
-    let subnet = subnet.to_string();
-    let mut in_dropping_forward_chain = false;
-    for line in ruleset.lines() {
-        let line = line.trim();
-        if line.contains("hook forward") {
-            in_dropping_forward_chain = line.contains("policy drop");
-            continue;
-        }
-        if !in_dropping_forward_chain {
-            continue;
-        }
-        // A chain that drops by default is only a problem if nothing in it
-        // lets our subnet through first.
-        if line.contains(&subnet) && (line.contains("accept") || line.contains("jump")) {
-            return false;
-        }
-        if line == "}" {
-            in_dropping_forward_chain = false;
-        }
-    }
-    // Re-scan: any dropping forward chain at all, once we know none of them
-    // named our subnet.
-    ruleset
+    let drops = ruleset
         .lines()
-        .any(|l| l.contains("hook forward") && l.contains("policy drop"))
+        .any(|l| l.contains("hook forward") && l.contains("policy drop"));
+    if !drops {
+        return false;
+    }
+    let subnet = subnet.to_string();
+    let accepts = |direction: &str| {
+        let pattern = format!("{direction} {subnet}");
+        ruleset
+            .lines()
+            .any(|l| l.contains(&pattern) && l.contains("accept"))
+    };
+    !(accepts("saddr") && accepts("daddr"))
 }
 
 fn read_ruleset() -> Result<String> {
@@ -426,13 +429,32 @@ table ip nesbox {
 }
 "#;
 
-    /// The same host after the subnet has been allowed through.
+    /// A real host part-way fixed: outbound allowed, replies still dropped.
+    /// This exact shape passed the first version of the check and dropped every
+    /// reply packet, which is why the test exists.
+    const DOCKER_LIKE_HALF_ALLOWED: &str = r#"
+table ip filter {
+    chain FORWARD {
+        type filter hook forward priority filter; policy drop;
+        counter jump DOCKER-USER
+    }
+    chain DOCKER-USER {
+        ip saddr 172.30.0.0/24 counter accept
+    }
+}
+"#;
+
+    /// The same host once both directions are allowed. Verified working: the
+    /// guest reached 1.1.1.1.
     const DOCKER_LIKE_ALLOWED: &str = r#"
 table ip filter {
     chain FORWARD {
         type filter hook forward priority filter; policy drop;
+        counter jump DOCKER-USER
+    }
+    chain DOCKER-USER {
+        ip daddr 172.30.0.0/24 counter accept
         ip saddr 172.30.0.0/24 counter accept
-        iifname "docker0" counter accept
     }
 }
 "#;
@@ -459,8 +481,18 @@ table ip nesbox {
     }
 
     #[test]
-    fn allowing_the_subnet_clears_it() {
+    fn allowing_both_directions_clears_it() {
+        // Accepts live in a chain the forward chain jumps to, so the check
+        // cannot only look inside the dropping chain.
         assert!(!forwarding_blocked(DOCKER_LIKE_ALLOWED, test_subnet()));
+    }
+
+    #[test]
+    fn allowing_only_the_outbound_direction_is_still_blocked() {
+        // Replies come back addressed *to* the subnet, because conntrack has
+        // already undone the masquerade. Measured, not assumed: this host
+        // dropped every reply until the second rule was added.
+        assert!(forwarding_blocked(DOCKER_LIKE_HALF_ALLOWED, test_subnet()));
     }
 
     #[test]

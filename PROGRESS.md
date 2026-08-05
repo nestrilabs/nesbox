@@ -131,7 +131,7 @@ RUST_LOG=trace ./target/debug/nesbox cfg.json 2>&1 | grep -c 'INTx fallback'   #
 | virtio-console | in-process | typed commands execute in the guest |
 | virtio-vsock | kernel, `/dev/vhost-vsock` | host connect to the guest CID gets ECONNRESET from the guest's own stack; an unused CID gets ENODEV |
 | virtio-fs | virtiofsd, vhost-user | `mount -t virtiofs`, reading a host file, EROFS on a read-only export |
-| virtio-net | kernel, `/dev/vhost-net` | guest pings the host end of the tap both ways, no INTx fallback, tap gone after exit. Needs CAP_NET_ADMIN, see §9 |
+| virtio-net | kernel, `/dev/vhost-net` | guest reaches 1.1.1.1 through the host's NAT, 0% loss; no INTx fallback; tap gone after exit. Needs CAP_NET_ADMIN and the host rules in §9 |
 | 16550A serial | in-process, TX only | earlyprintk output |
 | SMP | KVM | 8 vCPUs, `smpboot: Total of 8 processors activated`, all online, clean poweroff and SIGTERM |
 | virtio-gpu | rutabaga, in-process | `vulkaninfo` in the guest reports the host's real GPU — `Intel(R) Arc(tm) A310 Graphics (DG2)`, `0x8086:0x56a6`, discrete — through ANV over native context |
@@ -203,11 +203,12 @@ Do not re-derive these.
 
 ## 6. Known gaps
 
-- **Egress is installable but unproven.** `nesbox setup` writes the rules (§9),
-  but no guest has yet reached the internet through them — that needs a run as
-  root, which has not happened. The capability-lending in `netsetup::nft` is
-  likewise untested: without `CAP_NET_ADMIN` it correctly falls back to "could
-  not tell", but the path where it works has never run.
+- **Egress works, but the host needs three privileged one-offs**, not one:
+  `nesbox setup`, plus a forward accept in each direction if Docker or ufw is
+  running (§9). Verified: guest to 1.1.1.1, 0% loss, 11.5ms.
+- **`nesbox setup` does not check for a blocking firewall.** It reports success
+  having written correct rules, while the preflight separately reports that
+  traffic cannot pass. Setup should run the same check and say so.
 - **passt versus tap is not settled.** The nessh side raised a risk worth more
   than the CPU argument: iroh's hole punching is developed against conntrack,
   and passt is a second NAT with its own mapping semantics. If direct
@@ -333,6 +334,23 @@ an existing rule from libvirt or Docker is left alone. The rule matches on
 destination rather than the tap's name, because the name carries a
 kernel-assigned number no one knows until a VM starts. Neither change survives a
 reboot; persist them the way your distribution expects.
+
+**A third-party firewall can block all of this and there is nothing nesbox can
+do about it.** Docker sets the forward chain's policy to drop the moment it
+starts, and ufw ships with the same; in nftables a drop is final, so an accept
+in our table cannot rescue a packet another chain already refused. Both
+directions have to be allowed, because conntrack has already reversed the
+masquerade by the time a reply reaches the forward chain, so replies arrive
+addressed *to* the guest's subnet:
+
+```bash
+sudo iptables -I DOCKER-USER -s 172.30.0.0/24 -j ACCEPT
+sudo iptables -I DOCKER-USER -d 172.30.0.0/24 -j ACCEPT
+```
+
+With only the first rule the guest's packets leave and every reply is dropped —
+that is measured on this host, not inferred, and it is what the preflight's
+two-direction check is built from.
 
 Every VM start with a `network` section runs a preflight and says which piece is
 missing — "IP forwarding is disabled" and "no masquerade rule for 172.30.0.0/24"
