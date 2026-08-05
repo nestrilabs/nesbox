@@ -18,6 +18,12 @@
   "vsock": {
     "guest-cid": 42
   },
+  "network": {
+    "tap-name": "nesbox%d",
+    "host-ip": "172.30.0.1",
+    "netmask": "255.255.255.0",
+    "mac": "02:00:00:00:00:01"
+  },
   "shared-directories": [
     {
       "tag": "prefix",

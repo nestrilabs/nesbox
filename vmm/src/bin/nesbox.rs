@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
 use termios::*;
-use virtio_devices::{BlkDevice, ConsoleDevice, FsDevice, VsockDevice};
+use virtio_devices::{BlkDevice, ConsoleDevice, FsDevice, NetConfig, NetDevice, VsockDevice};
 
 /// Puts the terminal in raw mode so guest console input is unbuffered, and
 /// restores it on drop.
@@ -107,11 +107,34 @@ fn main() -> Result<()> {
         info!("virtio-vsock at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
     }
 
+    // ── Network device (optional) ─────────────────────────────────────────
+    if let Some(net_cfg) = &config.network {
+        let net_device = NetDevice::new(
+            &NetConfig {
+                tap_name: net_cfg.tap_name.clone(),
+                host_ip: net_cfg.host_ip,
+                netmask: net_cfg.netmask,
+                mac: net_cfg.parsed_mac()?,
+            },
+            vm.mem.clone(),
+        )?;
+        let net_vectors = irq.allocate_msi_vectors(4).context("net MSI-X vectors")?;
+        let slot = 4;
+        let net_intx = irq.legacy_irqfd(acpi_slot_gsi(slot)).context("net INTx")?;
+        net_device.bind_interrupts(net_vectors, irq.clone(), net_intx);
+        let bdf = pci_bus.add_device(net_device)?;
+        info!("virtio-net at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
+    }
+
     // ── Shared directories over virtio-fs ─────────────────────────────────
     // The daemons are kept alive for as long as the VM runs; dropping them
     // kills virtiofsd.
     let runtime_dir = std::env::temp_dir().join(format!("nesbox-{}", std::process::id()));
     let mut fs_daemons = Vec::new();
+    // Devices take PCI slots in the order they are added, and the INTx line
+    // follows the slot, so where these start depends on whether there is a
+    // network device ahead of them.
+    let first_fs_slot = if config.network.is_some() { 5 } else { 4 };
     for shared in &config.shared_directories {
         let daemon = Virtiofsd::spawn(
             &shared.tag,
@@ -121,7 +144,7 @@ fn main() -> Result<()> {
         )?;
         let fs_device = FsDevice::new(&shared.tag, daemon.socket_path(), vm.mem.clone())?;
         let vectors = irq.allocate_msi_vectors(4).context("virtio-fs MSI-X vectors")?;
-        let slot = 4 + fs_daemons.len() as u32;
+        let slot = first_fs_slot + fs_daemons.len() as u32;
         let intx = irq.legacy_irqfd(acpi_slot_gsi(slot)).context("virtio-fs INTx")?;
         fs_device.bind_interrupts(vectors, irq.clone(), intx);
         let bdf = pci_bus.add_device(fs_device)?;

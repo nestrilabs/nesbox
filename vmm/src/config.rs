@@ -1,4 +1,6 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -16,6 +18,62 @@ pub struct VmConfig {
     /// Host directories exported to the guest over virtio-fs.
     #[serde(default)]
     pub shared_directories: Vec<SharedDirectory>,
+    /// Optional network device. Absent means the guest has no link at all.
+    #[serde(default)]
+    pub network: Option<Network>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Network {
+    /// Tap interface to create. `%d` is filled in by the kernel with the
+    /// lowest free number, which is what you want when several VMs run at
+    /// once.
+    #[serde(default = "default_tap_name")]
+    pub tap_name: String,
+    /// Address for the host end of the tap. The guest is expected to take
+    /// another address on the same subnet and route through this one.
+    #[serde(default = "default_host_ip")]
+    pub host_ip: Ipv4Addr,
+    #[serde(default = "default_netmask")]
+    pub netmask: Ipv4Addr,
+    /// Guest MAC, as `aa:bb:cc:dd:ee:ff`. Generated if absent.
+    #[serde(default)]
+    pub mac: Option<String>,
+}
+
+fn default_tap_name() -> String {
+    "nesbox%d".to_string()
+}
+fn default_host_ip() -> Ipv4Addr {
+    Ipv4Addr::new(172, 30, 0, 1)
+}
+fn default_netmask() -> Ipv4Addr {
+    Ipv4Addr::new(255, 255, 255, 0)
+}
+
+impl Network {
+    /// Parse the configured MAC, if there is one.
+    pub fn parsed_mac(&self) -> anyhow::Result<Option<[u8; 6]>> {
+        let Some(text) = &self.mac else {
+            return Ok(None);
+        };
+        let octets: Vec<&str> = text.split(':').collect();
+        anyhow::ensure!(
+            octets.len() == 6,
+            "mac {text:?} should have six colon-separated octets"
+        );
+        let mut mac = [0u8; 6];
+        for (slot, octet) in mac.iter_mut().zip(octets) {
+            *slot = u8::from_str_radix(octet, 16)
+                .with_context(|| format!("mac {text:?} has a bad octet {octet:?}"))?;
+        }
+        anyhow::ensure!(
+            mac[0] & 0x01 == 0,
+            "mac {text:?} is a multicast address; the low bit of the first octet must be clear"
+        );
+        Ok(Some(mac))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
