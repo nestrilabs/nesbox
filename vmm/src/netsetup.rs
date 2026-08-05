@@ -55,6 +55,11 @@ pub enum Problem {
     /// Forwarding is on, but nothing rewrites the guest's source address, so
     /// replies have nowhere to come back to.
     NoMasquerade(Subnet),
+    /// Some other firewall drops forwarded packets by default. Docker does
+    /// this, and so does ufw. We cannot fix it from our own table: in nftables
+    /// a drop anywhere is final, so an accept of ours cannot rescue a packet
+    /// another chain has already refused.
+    ForwardingBlocked(Subnet),
     /// We could not tell either way.
     CannotTell(String),
 }
@@ -66,6 +71,11 @@ impl Problem {
             Self::ForwardingDisabled | Self::NoMasquerade(_) => {
                 "run `nesbox setup <config.json>` once, as root".to_string()
             }
+            Self::ForwardingBlocked(subnet) => format!(
+                "allow the subnet through that firewall, e.g. \
+                 `sudo iptables -I DOCKER-USER -s {subnet} -j ACCEPT` for Docker \
+                 or `sudo ufw route allow from {subnet}` for ufw"
+            ),
             Self::CannotTell(_) => {
                 "check by hand: `sysctl net.ipv4.ip_forward` and `nft list table ip nesbox`"
                     .to_string()
@@ -84,6 +94,12 @@ impl std::fmt::Display for Problem {
             Self::NoMasquerade(subnet) => write!(
                 f,
                 "no masquerade rule for {subnet}, so replies to the guest have no route back"
+            ),
+            Self::ForwardingBlocked(subnet) => write!(
+                f,
+                "another firewall drops forwarded packets by default, so traffic from \
+                 {subnet} never leaves the host — nesbox cannot override this from its \
+                 own table"
             ),
             Self::CannotTell(why) => {
                 write!(f, "could not check the host's egress rules: {why}")
@@ -193,7 +209,48 @@ fn lend_net_admin_to_child() {
 /// The whole ruleset is checked, not just ours: a host that already masquerades
 /// this range through libvirt, Docker or a hand-written rule needs nothing from
 /// us, and telling it otherwise would be wrong.
-fn masquerade_present(subnet: Subnet) -> Result<bool> {
+fn masquerade_present(ruleset: &str, subnet: Subnet) -> bool {
+    let subnet = subnet.to_string();
+    ruleset
+        .lines()
+        .any(|line| line.contains("masquerade") && line.contains(&subnet))
+}
+
+/// Does some other chain drop forwarded packets by default?
+///
+/// Docker sets this the moment it starts, and ufw ships with it. Detecting it
+/// matters more than it looks: with forwarding on and a masquerade rule in
+/// place, everything we install is correct and the guest still cannot reach
+/// anything, which is the hardest version of this failure to place.
+fn forwarding_blocked(ruleset: &str, subnet: Subnet) -> bool {
+    let subnet = subnet.to_string();
+    let mut in_dropping_forward_chain = false;
+    for line in ruleset.lines() {
+        let line = line.trim();
+        if line.contains("hook forward") {
+            in_dropping_forward_chain = line.contains("policy drop");
+            continue;
+        }
+        if !in_dropping_forward_chain {
+            continue;
+        }
+        // A chain that drops by default is only a problem if nothing in it
+        // lets our subnet through first.
+        if line.contains(&subnet) && (line.contains("accept") || line.contains("jump")) {
+            return false;
+        }
+        if line == "}" {
+            in_dropping_forward_chain = false;
+        }
+    }
+    // Re-scan: any dropping forward chain at all, once we know none of them
+    // named our subnet.
+    ruleset
+        .lines()
+        .any(|l| l.contains("hook forward") && l.contains("policy drop"))
+}
+
+fn read_ruleset() -> Result<String> {
     let out = nft(&["list", "ruleset"])?;
     if !out.status.success() {
         bail!(
@@ -201,11 +258,7 @@ fn masquerade_present(subnet: Subnet) -> Result<bool> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let ruleset = String::from_utf8_lossy(&out.stdout);
-    let subnet = subnet.to_string();
-    Ok(ruleset
-        .lines()
-        .any(|line| line.contains("masquerade") && line.contains(&subnet)))
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Check the host can actually carry the guest's traffic outward.
@@ -223,9 +276,15 @@ pub fn preflight(network: &Network) -> Vec<Problem> {
         Err(err) => problems.push(Problem::CannotTell(format!("{err:#}"))),
     }
 
-    match masquerade_present(subnet) {
-        Ok(true) => {}
-        Ok(false) => problems.push(Problem::NoMasquerade(subnet)),
+    match read_ruleset() {
+        Ok(ruleset) => {
+            if !masquerade_present(&ruleset, subnet) {
+                problems.push(Problem::NoMasquerade(subnet));
+            }
+            if forwarding_blocked(&ruleset, subnet) {
+                problems.push(Problem::ForwardingBlocked(subnet));
+            }
+        }
         Err(err) => problems.push(Problem::CannotTell(format!("{err:#}"))),
     }
 
@@ -268,7 +327,7 @@ pub fn install(network: &Network) -> Result<()> {
         );
     }
 
-    if masquerade_present(subnet)? {
+    if masquerade_present(&read_ruleset()?, subnet) {
         log::info!("a masquerade rule for {subnet} is already present");
         return Ok(());
     }
@@ -351,12 +410,87 @@ mod tests {
         assert_eq!(s.to_string(), "10.0.5.128/26");
     }
 
+    /// What Docker leaves in the ruleset: a forward chain that drops by default.
+    const DOCKER_LIKE: &str = r#"
+table ip filter {
+    chain FORWARD {
+        type filter hook forward priority filter; policy drop;
+        iifname "docker0" counter accept
+    }
+}
+table ip nesbox {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr 172.30.0.0/24 ip daddr != 172.30.0.0/24 masquerade
+    }
+}
+"#;
+
+    /// The same host after the subnet has been allowed through.
+    const DOCKER_LIKE_ALLOWED: &str = r#"
+table ip filter {
+    chain FORWARD {
+        type filter hook forward priority filter; policy drop;
+        ip saddr 172.30.0.0/24 counter accept
+        iifname "docker0" counter accept
+    }
+}
+"#;
+
+    /// A host with no firewall of its own.
+    const OPEN: &str = r#"
+table ip nesbox {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr 172.30.0.0/24 ip daddr != 172.30.0.0/24 masquerade
+    }
+}
+"#;
+
+    fn test_subnet() -> Subnet {
+        Subnet::from_network(&network([172, 30, 0, 1], [255, 255, 255, 0]))
+    }
+
+    #[test]
+    fn a_dropping_forward_chain_is_noticed() {
+        // The case that actually bit: everything nesbox installs is correct and
+        // the guest still cannot reach anything.
+        assert!(forwarding_blocked(DOCKER_LIKE, test_subnet()));
+    }
+
+    #[test]
+    fn allowing_the_subnet_clears_it() {
+        assert!(!forwarding_blocked(DOCKER_LIKE_ALLOWED, test_subnet()));
+    }
+
+    #[test]
+    fn a_host_without_a_firewall_is_not_blocked() {
+        assert!(!forwarding_blocked(OPEN, test_subnet()));
+        assert!(!forwarding_blocked("", test_subnet()));
+    }
+
+    #[test]
+    fn the_masquerade_rule_is_found_by_subnet() {
+        assert!(masquerade_present(OPEN, test_subnet()));
+        // A rule for somebody else's subnet must not count as ours.
+        let other = Subnet::from_network(&network([10, 1, 2, 1], [255, 255, 255, 0]));
+        assert!(!masquerade_present(OPEN, other));
+    }
+
+    #[test]
+    fn a_blocked_forward_names_a_fix_mentioning_the_subnet() {
+        let p = Problem::ForwardingBlocked(test_subnet());
+        assert!(p.remedy().contains("172.30.0.0/24"));
+        assert!(p.to_string().contains("172.30.0.0/24"));
+    }
+
     #[test]
     fn every_problem_says_what_to_do_about_it() {
         let subnet = Subnet::from_network(&network([172, 30, 0, 1], [255, 255, 255, 0]));
         for problem in [
             Problem::ForwardingDisabled,
             Problem::NoMasquerade(subnet),
+            Problem::ForwardingBlocked(subnet),
             Problem::CannotTell("nft is missing".into()),
         ] {
             assert!(!problem.to_string().is_empty());
