@@ -1,3 +1,5 @@
+use nesbox_vmm::lifecycle::{ExitReason, Shutdown};
+use nesbox_vmm::power::PowerDevice;
 use nesbox_vmm::{acpi_slot_gsi, config, interrupt::IrqManager, virtiofsd::Virtiofsd, vm};
 
 use anyhow::{Context, Result};
@@ -6,28 +8,40 @@ use log::info;
 use pci::Bus;
 use std::io::stdin;
 use std::os::fd::AsRawFd;
+use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
 use termios::*;
 use virtio_devices::{BlkDevice, ConsoleDevice, FsDevice, VsockDevice};
 
-/// Restores terminal settings on drop.
+/// Puts the terminal in raw mode so guest console input is unbuffered, and
+/// restores it on drop.
+///
+/// A no-op when stdin is not a terminal: a launcher spawns the VMM with pipes,
+/// and failing to start in that case would make it unusable as a child
+/// process.
 struct RawMode {
-    orig: Termios,
+    orig: Option<Termios>,
 }
 impl RawMode {
     fn enter() -> Result<Self> {
         let fd = stdin().as_raw_fd();
+        // SAFETY: isatty only inspects the fd.
+        if unsafe { libc::isatty(fd) } != 1 {
+            log::debug!("stdin is not a terminal; leaving it as it is");
+            return Ok(Self { orig: None });
+        }
         let orig = Termios::from_fd(fd).context("tcgetattr")?;
         let mut raw = orig;
         cfmakeraw(&mut raw);
         tcsetattr(fd, TCSANOW, &raw).context("tcsetattr")?;
-        Ok(Self { orig })
+        Ok(Self { orig: Some(orig) })
     }
 }
 impl Drop for RawMode {
     fn drop(&mut self) {
-        let fd = stdin().as_raw_fd();
-        let _ = tcsetattr(fd, TCSANOW, &self.orig);
+        if let Some(orig) = self.orig {
+            let _ = tcsetattr(stdin().as_raw_fd(), TCSANOW, &orig);
+        }
     }
 }
 
@@ -121,6 +135,11 @@ fn main() -> Result<()> {
     // ── Legacy COM1, for early boot output ────────────────────────────────
     let serial = Arc::new(nesbox_vmm::serial::Serial::new());
 
+    // ── Lifetime ──────────────────────────────────────────────────────────
+    let shutdown = Shutdown::new();
+    let power = Arc::new(PowerDevice::new(shutdown.clone()));
+    install_signal_handlers(shutdown.clone())?;
+
     // ── Run vCPUs ─────────────────────────────────────────────────────────
     let handles: Vec<_> = vm
         .vcpus
@@ -129,17 +148,80 @@ fn main() -> Result<()> {
             let mem = vm.mem.clone();
             let pci_bus = pci_bus.clone();
             let serial = serial.clone();
+            let power = power.clone();
+            let shutdown = shutdown.clone();
             std::thread::spawn(move || {
-                if let Err(e) = vm::run_vcpu_loop(mem, vcpu_fd, pci_bus, serial) {
+                if let Err(e) = vm::run_vcpu_loop(mem, vcpu_fd, pci_bus, serial, power, shutdown) {
                     eprintln!("vCPU thread error: {}", e);
                 }
             })
         })
         .collect();
 
+    // A vCPU blocked in KVM_RUN only notices the stop request when a signal
+    // interrupts it, so wake every thread once the VM is asked to stop.
+    let watcher = {
+        let shutdown = shutdown.clone();
+        let vcpu_threads: Vec<_> = handles.iter().map(|h| h.as_pthread_t()).collect();
+        std::thread::spawn(move || {
+            while !shutdown.is_requested() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            for thread in vcpu_threads {
+                // SAFETY: the vCPU threads are joined below, so these ids stay
+                // valid until after this signal is delivered.
+                unsafe { libc::pthread_kill(thread, VCPU_WAKE_SIGNAL) };
+            }
+        })
+    };
+
     for handle in handles {
         handle.join().unwrap();
     }
+    shutdown.request(ExitReason::Error("all vCPUs stopped".into()));
+    let _ = watcher.join();
 
+    // Devices and their backends are torn down here: dropping the virtiofsd
+    // supervisors kills them, and the VM's memory goes with the process.
+    drop(fs_daemons);
+
+    let reason = shutdown.reason().unwrap_or(ExitReason::GuestFault);
+    if reason.is_clean() {
+        info!("VM stopped: {reason}");
+    } else {
+        log::error!("VM stopped: {reason}");
+    }
+    std::process::exit(reason.exit_code());
+}
+
+/// Signal used to wake a vCPU out of KVM_RUN. Its handler does nothing; the
+/// EINTR it causes is the point.
+const VCPU_WAKE_SIGNAL: libc::c_int = libc::SIGUSR1;
+
+extern "C" fn wake_handler(_: libc::c_int) {}
+
+extern "C" fn stop_handler(_: libc::c_int) {
+    // Async-signal-safe: just flips an atomic.
+    if let Some(shutdown) = SHUTDOWN.get() {
+        shutdown.request(ExitReason::HostSignal);
+    }
+}
+
+static SHUTDOWN: std::sync::OnceLock<Arc<Shutdown>> = std::sync::OnceLock::new();
+
+/// SIGTERM and SIGINT ask the VM to stop; SIGUSR1 just interrupts KVM_RUN.
+fn install_signal_handlers(shutdown: Arc<Shutdown>) -> Result<()> {
+    let _ = SHUTDOWN.set(shutdown);
+    // SAFETY: both handlers are async-signal-safe.
+    unsafe {
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            if libc::signal(signal, stop_handler as libc::sighandler_t) == libc::SIG_ERR {
+                anyhow::bail!("failed to install handler for signal {signal}");
+            }
+        }
+        if libc::signal(VCPU_WAKE_SIGNAL, wake_handler as libc::sighandler_t) == libc::SIG_ERR {
+            anyhow::bail!("failed to install the vCPU wake handler");
+        }
+    }
     Ok(())
 }

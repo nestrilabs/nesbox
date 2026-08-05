@@ -72,7 +72,15 @@ fn build_dsdt() -> Vec<u8> {
         crate::layout::MMCONFIG_START as u32,
         crate::layout::MMCONFIG_SIZE as u32,
     );
-    let ecam_crs = aml::ResourceTemplate::new(vec![&ecam_mem]);
+    // Claim the sleep and reset registers too, so nothing else is handed them.
+    let sleep_io = aml::IO::new(
+        crate::power::SLEEP_CONTROL_PORT,
+        crate::power::SLEEP_CONTROL_PORT,
+        1,
+        2,
+    );
+    let reset_io = aml::IO::new(crate::power::RESET_PORT, crate::power::RESET_PORT, 1, 1);
+    let ecam_crs = aml::ResourceTemplate::new(vec![&ecam_mem, &sleep_io, &reset_io]);
     let eisa_pnp0c02 = aml::EISAName::new("PNP0C02");
     let mbrd_hid = aml::Name::new("_HID".into(), &eisa_pnp0c02);
     let mbrd_uid = aml::Name::new("_UID".into(), &aml::ZERO);
@@ -84,14 +92,59 @@ fn build_dsdt() -> Vec<u8> {
     let mut aml_bytes = Vec::new();
     sb_scope.to_aml_bytes(&mut aml_bytes);
 
+    // \_S5: the sleep type to write for soft off. Linux refuses to power off
+    // without it, however well the FADT describes the registers.
+    let s5_typ = crate::power::SLP_TYP_S5;
+    let s5_package = aml::Package::new(vec![&s5_typ, &s5_typ]);
+    let s5 = aml::Name::new("_S5_".into(), &s5_package);
+    s5.to_aml_bytes(&mut aml_bytes);
+
     dsdt.append_slice(aml_bytes.as_slice());
     dsdt.as_slice().to_vec()
 }
 
+/// Write a Generic Address Structure describing a byte-wide system I/O port.
+fn write_io_gas(fadt: &mut Sdt, offset: usize, port: u16) {
+    fadt.write_u8(offset, 1); // address space: system I/O
+    fadt.write_u8(offset + 1, 8); // register bit width
+    fadt.write_u8(offset + 2, 0); // register bit offset
+    fadt.write_u8(offset + 3, 1); // access size: byte
+    fadt.write_u64(offset + 4, port as u64);
+}
+
 fn build_fadt(dsdt_addr: u64) -> Vec<u8> {
+    const FLAG_RESET_REG_SUP: u32 = 1 << 10;
+    const FLAG_HW_REDUCED_ACPI: u32 = 1 << 20;
+
+    // FADT revision 6 field offsets.
+    const OFF_FLAGS: usize = 112;
+    const OFF_RESET_REG: usize = 116;
+    const OFF_RESET_VALUE: usize = 128;
+    const OFF_MINOR_VERSION: usize = 131;
+    const OFF_X_DSDT: usize = 140;
+    const OFF_SLEEP_CONTROL_REG: usize = 244;
+    const OFF_SLEEP_STATUS_REG: usize = 256;
+
     let mut fadt = Sdt::new(*b"FACP", 276, 6, *b"NESTRI", *b"FACP    ", 1);
-    fadt.write_u32(112, 1 << 20); // flags: HW_REDUCED_ACPI
-    fadt.write_u64(140, dsdt_addr); // DSDT address
+    fadt.write_u32(OFF_FLAGS, FLAG_HW_REDUCED_ACPI | FLAG_RESET_REG_SUP);
+    fadt.write_u8(OFF_MINOR_VERSION, 1);
+    fadt.write_u64(OFF_X_DSDT, dsdt_addr);
+
+    // Without these a hardware-reduced guest has no way to power off or
+    // reboot: it halts instead and the VM hangs.
+    write_io_gas(&mut fadt, OFF_RESET_REG, crate::power::RESET_PORT);
+    fadt.write_u8(OFF_RESET_VALUE, crate::power::RESET_VALUE);
+    write_io_gas(
+        &mut fadt,
+        OFF_SLEEP_CONTROL_REG,
+        crate::power::SLEEP_CONTROL_PORT,
+    );
+    write_io_gas(
+        &mut fadt,
+        OFF_SLEEP_STATUS_REG,
+        crate::power::SLEEP_STATUS_PORT,
+    );
+
     fadt.as_slice().to_vec()
 }
 

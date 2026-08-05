@@ -1,3 +1,5 @@
+use crate::lifecycle::{ExitReason, Shutdown};
+use crate::power::PowerDevice;
 use crate::{boot, layout};
 use anyhow::{Context, Result};
 use std::os::fd::FromRawFd;
@@ -139,10 +141,21 @@ pub fn run_vcpu_loop(
     mut vcpu_fd: VcpuFd,
     pci_bus: Arc<pci::Bus>,
     serial: Arc<crate::serial::Serial>,
+    power: Arc<PowerDevice>,
+    shutdown: Arc<Shutdown>,
 ) -> Result<()> {
     loop {
+        if shutdown.is_requested() {
+            break;
+        }
         match vcpu_fd.run() {
             Ok(vcpu_exit) => match vcpu_exit {
+                VcpuExit::IoOut(port, data) if PowerDevice::handles(port) => {
+                    power.write(port, data);
+                }
+                VcpuExit::IoIn(port, data) if PowerDevice::handles(port) => {
+                    power.read(port, data);
+                }
                 VcpuExit::IoOut(port, data) if crate::serial::Serial::handles(port) => {
                     serial.write(port, data);
                 }
@@ -172,19 +185,27 @@ pub fn run_vcpu_loop(
                     }
                 }
                 VcpuExit::Hlt => {
-                    log::debug!("vCPU halted");
+                    // With an in-kernel irqchip this only happens when the
+                    // guest halted with no way to be woken.
+                    log::debug!("vCPU halted with interrupts disabled");
+                    shutdown.request(ExitReason::GuestFault);
                     break;
                 }
                 VcpuExit::Shutdown => {
-                    log::debug!("vCPU shutdown");
+                    // A triple fault, or a reset we did not see through the
+                    // reset register.
+                    shutdown.request(ExitReason::GuestFault);
                     break;
                 }
                 VcpuExit::Exception => {
-                    log::error!("vCPU triple fault or other exception!");
-                    // break to see where it happens
+                    log::error!("vCPU exception");
+                    shutdown.request(ExitReason::GuestFault);
                     break;
                 }
                 VcpuExit::FailEntry(reason, cpu) => {
+                    shutdown.request(ExitReason::Error(format!(
+                        "VM entry failed with reason {reason:#x}"
+                    )));
                     log::error!("VM entry failed: reason={:#x} cpu={}", reason, cpu);
                     if let Ok(r) = vcpu_fd.get_regs() {
                         log::error!("regs: rip={:#x} rsp={:#x} rsi={:#x} rflags={:#x}", r.rip, r.rsp, r.rsi, r.rflags);
@@ -205,8 +226,13 @@ pub fn run_vcpu_loop(
                     log::debug!("Unhandled vCPU exit: {:?}", other);
                 }
             },
+            Err(e) if e.errno() == libc::EINTR => {
+                // Woken to notice the stop request; the loop head checks it.
+                continue;
+            }
             Err(e) => {
                 log::error!("vCPU run error: {}", e);
+                shutdown.request(ExitReason::Error(format!("KVM_RUN failed: {e}")));
                 break;
             }
         }
