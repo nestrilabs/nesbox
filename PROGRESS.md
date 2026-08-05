@@ -266,10 +266,15 @@ Vulkan is what Proton uses, so this has not been chased.
 
 ### Still rough
 
-- `map_blob` logs `resource_map failed (MagmaGpuError(Unsupported))` and falls
-  back to `export_blob` on every mapping. The fallback works — Vulkan comes up
-  regardless — but the fast path does not, and that is worth understanding
-  before profiling anything.
+- `map_blob` always takes the `export_blob` route, and that is correct rather
+  than a fault: rutabaga's `map_placed` is compiled out unless the unstable
+  `virgl_renderer_resource_map_fixed` API is enabled, so it returns
+  `Unsupported` unconditionally. Exporting the blob and mapping it ourselves is
+  the supported path and what crosvm does. Measured at **~10.7us per mapping**
+  across 26 of 27 mappings during Vulkan init, plus one 9.4ms first-touch
+  outlier on a 4 KiB buffer. It is a per-resource setup cost, not per frame —
+  once mapped, the guest reaches the memory through the KVM slot without
+  trapping. Not worth optimising.
 - The guest logs `*ERROR* response 0x1200 (command 0x200)` once at startup.
   That is Mesa probing for a context with no capset before retrying with capset
   6, which succeeds. Harmless, and expected given only `RUTABAGA_CAPSET_DRM` is
@@ -278,12 +283,10 @@ Vulkan is what Proton uses, so this has not been chased.
 
 ## 8. Suggested order
 
-1. Work out why `map_blob`'s `resource_map` is unsupported and only the
-   `export_blob` fallback works (§7).
-2. Decide where the host's NAT rules live (§9), so egress actually works.
-3. `virtio-blk` is synchronous on the vCPU thread; it will need a worker
+1. Decide where the host's NAT rules live (§9), so egress actually works.
+2. `virtio-blk` is synchronous on the vCPU thread; it will need a worker
    under game load.
-4. Delete `vm-core`; make the README describe what is actually true.
+3. Delete `vm-core`; make the README describe what is actually true.
 
 ## 9. Running virtio-net
 

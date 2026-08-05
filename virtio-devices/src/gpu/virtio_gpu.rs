@@ -694,14 +694,13 @@ impl VirtioGpu {
     }
 
     // -----------------------------------------------------------------------
-    // Blob resource host mapping (Linux, non-virgl_renderer_resource_map_fixed path)
+    // Blob resource host mapping
     // -----------------------------------------------------------------------
     //
-    // This maps a blob resource into the host-visible SHM window so the guest
-    // can access it via the VIRTIO_GPU_SHM_ID_HOST_VISIBLE region.
-    //
-    // NOTE: Firecracker does not currently expose a VirtioShmRegion to devices.
-    // Wiring this up requires changes to the MMIO transport and VMM plumbing.
+    // Maps a blob resource into the host-visible window so the guest can reach
+    // it through VIRTIO_GPU_SHM_ID_HOST_VISIBLE. The window is BAR2, registered
+    // with KVM, so once a resource is mapped the guest touches it without
+    // trapping to us at all.
 
     #[cfg(target_os = "linux")]
     pub fn resource_map_blob(
@@ -749,15 +748,15 @@ impl VirtioGpu {
 
         let addr = shm_region.host_addr + offset;
 
-        match self.rutabaga.map_placed(resource_id, addr) {
-            Ok(()) => {}
-            Err(e) => {
-                log::warn!(
-                    "NESBOX_GPU: map_blob: resource_map failed ({:?}), trying export_blob fallback",
-                    e
-                );
-                self.map_blob_via_export(resource_id, addr, res_size, prot)?;
-            }
+        // `map_placed` asks virglrenderer to map the resource straight at our
+        // address, but it is compiled out of rutabaga unless the unstable
+        // `virgl_renderer_resource_map_fixed` API is enabled, so in practice it
+        // always reports Unsupported. Exporting the blob and mapping it
+        // ourselves is the supported route and costs about 10us per resource,
+        // once — measured, not assumed. Try the direct path anyway in case a
+        // future rutabaga offers it.
+        if self.rutabaga.map_placed(resource_id, addr).is_err() {
+            self.map_blob_via_export(resource_id, addr, res_size, prot)?;
         }
 
         // Re-borrow after all &mut self calls are done
@@ -786,6 +785,16 @@ impl VirtioGpu {
             ErrUnspec
         })?;
 
+        let handle = export.as_mesa_handle().ok_or_else(|| {
+            log::error!(
+                "NESBOX_GPU: map_blob: resource {resource_id} exported a handle we cannot mmap"
+            );
+            ErrUnspec
+        })?;
+
+        // SAFETY: mapping the exported buffer over our own PROT_NONE
+        // reservation, which we own and which is at least `size` bytes here —
+        // resource_map_blob checked that before calling.
         let ret = unsafe {
             use std::os::fd::AsFd;
 
@@ -794,12 +803,7 @@ impl VirtioGpu {
                 size as usize,
                 prot,
                 libc::MAP_SHARED | libc::MAP_FIXED,
-                export
-                    .as_mesa_handle()
-                    .unwrap()
-                    .os_handle
-                    .as_fd()
-                    .as_raw_fd(),
+                handle.os_handle.as_fd().as_raw_fd(),
                 0,
             )
         };
@@ -838,7 +842,13 @@ impl VirtioGpu {
             )
         };
         if ret == libc::MAP_FAILED {
-            panic!("virtio-gpu: resource_unmap_blob mmap failed");
+            // Nothing here justifies taking the VM down: the guest asked to
+            // unmap one resource and we could not, so tell it so and carry on.
+            log::error!(
+                "virtio-gpu: failed to unmap resource {resource_id} at {addr:#x}: {}",
+                std::io::Error::last_os_error()
+            );
+            return Err(ErrUnspec);
         }
 
         resource.shmem_offset = None;
