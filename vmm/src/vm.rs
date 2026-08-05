@@ -13,6 +13,29 @@ pub struct Vm {
     pub vm_fd: Arc<VmFd>,
     pub mem: Arc<GuestMemoryMmap>,
     pub vcpus: Vec<VcpuFd>,
+    /// Where 64-bit BARs may be placed, given this CPU's address width.
+    pub mmio64: layout::Mmio64Window,
+}
+
+/// How many bits of physical address the guest CPU will have.
+///
+/// CPUID leaf 0x80000008, EAX bits 7:0. This decides where the 64-bit MMIO
+/// window can go: Linux quietly discards a host bridge window it cannot
+/// address, so guessing high breaks PCI on exactly the desktop parts most
+/// likely to be running this.
+fn host_phys_addr_bits(kvm: &Kvm) -> Result<u8> {
+    let cpuid = kvm
+        .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+        .context("Failed to get supported CPUID")?;
+    let bits = cpuid
+        .as_slice()
+        .iter()
+        .find(|e| e.function == 0x8000_0008)
+        .map(|e| (e.eax & 0xff) as u8)
+        .filter(|&b| b >= 32)
+        // Every x86-64 CPU has at least 36; if the leaf is missing, assume it.
+        .unwrap_or(36);
+    Ok(bits)
 }
 
 impl Vm {
@@ -31,6 +54,22 @@ impl Vm {
         // Memory, split around the 3–4 GiB device hole.
         let mem_size = (mem_size_mib as u64) * 1024 * 1024;
         let regions = layout::ram_regions(mem_size);
+
+        let phys_bits = host_phys_addr_bits(&kvm)?;
+        let mmio64 = layout::mmio64_window(phys_bits);
+        let ram_top = layout::ram_top(mem_size);
+        anyhow::ensure!(
+            mmio64.fits_above(ram_top),
+            "{mem_size_mib} MiB of RAM reaches {ram_top:#x}, which collides with the \
+             64-bit MMIO window at {:#x}. This CPU addresses {phys_bits} bits; \
+             give the guest less memory.",
+            mmio64.start
+        );
+        log::info!(
+            "CPU addresses {phys_bits} bits; 64-bit MMIO window {:#x}..{:#x}",
+            mmio64.start,
+            mmio64.end()
+        );
 
         // Guest RAM is backed by a memfd and mapped shared, so vhost-user
         // backends such as virtiofsd can map it into their own address space.
@@ -88,7 +127,7 @@ impl Vm {
 
         // Build ACPI tables at the top of low RAM and get the RSDP address.
         let acpi_start = layout::acpi_start(mem_size);
-        let rsdp_addr = crate::acpi::setup_acpi(&mem, vcpu_count, acpi_start)?;
+        let rsdp_addr = crate::acpi::setup_acpi(&mem, vcpu_count, acpi_start, mmio64)?;
 
         boot::setup_boot_params(&mem, entry_point, cmdline_str, &regions, Some(rsdp_addr))?;
 
@@ -124,6 +163,7 @@ impl Vm {
             vm_fd,
             mem,
             vcpus,
+            mmio64,
         })
     }
 }

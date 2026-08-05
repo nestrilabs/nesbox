@@ -18,7 +18,7 @@ pub fn slot_gsi(slot: u32) -> u32 {
     }
 }
 
-fn build_dsdt() -> Vec<u8> {
+fn build_dsdt(mmio64: crate::layout::Mmio64Window) -> Vec<u8> {
     let mut dsdt = Sdt::new(*b"DSDT", 36, 6, *b"NESTRI", *b"DSDT    ", 1);
 
     // _CRS: what the host bridge decodes. The memory window must agree with
@@ -33,9 +33,21 @@ fn build_dsdt() -> Vec<u8> {
         crate::layout::PCI_MMIO_END - 1,
         None,
     );
+    // The second window is where large prefetchable BARs go. Without it in
+    // _CRS the guest will not assign a 64-bit BAR at all, whatever the device
+    // asks for.
+    let mem64 = aml::AddressSpace::new_memory(
+        aml::AddressSpaceCacheable::PreFetchable,
+        true,
+        mmio64.start,
+        mmio64.end() - 1,
+        None,
+    );
     let io_range1 = aml::AddressSpace::new_io(0x0000u16, 0x0cf7u16, None);
     let io_range2 = aml::AddressSpace::new_io(0x0d00u16, 0xffffu16, None);
-    let crs = aml::ResourceTemplate::new(vec![&bus, &cam1, &mem32, &io_range1, &io_range2]);
+    let crs = aml::ResourceTemplate::new(vec![
+        &bus, &cam1, &mem32, &mem64, &io_range1, &io_range2,
+    ]);
 
     // _PRT: one entry per slot, mapping INTA# to a GSI. Address 0xFFFF in the
     // low word means "any function of this device".
@@ -211,8 +223,9 @@ pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     vcpu_count: u8,
     start_addr: GuestAddress,
+    mmio64: crate::layout::Mmio64Window,
 ) -> Result<GuestAddress> {
-    let dsdt = build_dsdt();
+    let dsdt = build_dsdt(mmio64);
     let dsdt_addr = start_addr.0;
 
     let fadt = build_fadt(dsdt_addr);

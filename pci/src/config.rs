@@ -84,6 +84,18 @@ impl PciConfig {
         self.data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
     }
 
+    /// Declare a 64-bit prefetchable memory BAR at the given offset.
+    ///
+    /// This occupies two consecutive BAR registers — `bar_idx` and the one
+    /// after it — so the following index must be left unused. The actual
+    /// address and the type bits come from the bus at read time; only the
+    /// reservation matters here.
+    pub fn set_bar_mem64(&mut self, bar_idx: usize, _size: u64) {
+        assert!(bar_idx < 5, "a 64-bit BAR needs a register after it");
+        let off = 0x10 + bar_idx * 4;
+        self.data[off..off + 8].copy_from_slice(&0u64.to_le_bytes());
+    }
+
     /// Add a generic PCI capability.
     /// `cap_id` is the PCI capability ID (e.g. 0x09 for vendor, 0x11 for MSI-X).
     /// `payload` is the capability data starting from byte 2 (after cap_id + next).

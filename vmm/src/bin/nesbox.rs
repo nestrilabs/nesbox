@@ -69,7 +69,10 @@ fn main() -> Result<()> {
     )?;
 
     // Create PCI bus and interrupt routing
-    let pci_bus = Arc::new(Bus::new());
+    let pci_bus = Arc::new(Bus::new(pci::Mmio64Window::new(
+        vm.mmio64.start,
+        vm.mmio64.size,
+    )));
     let irq = IrqManager::new(vm.vm_fd.clone())?;
 
     // ── Block device ──────────────────────────────────────────────────────
