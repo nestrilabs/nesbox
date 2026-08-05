@@ -157,8 +157,16 @@ impl Inner {
         } else {
             VNET_HDR_SIZE_PLAIN
         };
+        let offloads = Self::tap_offload_flags(acked);
+        // Worth having on hand: if traffic does not flow, the first question is
+        // always whether the guest and the tap agreed on the header size, and
+        // the second is which offloads are actually in play.
+        log::debug!(
+            "virtio-net negotiated features {acked:#x}, vnet header {hdr_size} bytes, \
+             tap offloads {offloads:#04x}"
+        );
         self.tap.set_vnet_hdr_size(hdr_size)?;
-        self.tap.set_offload(Self::tap_offload_flags(acked))?;
+        self.tap.set_offload(offloads)?;
 
         self.backend.set_owner().context("VHOST_SET_OWNER")?;
         self.backend
