@@ -134,6 +134,7 @@ RUST_LOG=trace ./target/debug/nesbox cfg.json 2>&1 | grep -c 'INTx fallback'   #
 | virtio-net | kernel, `/dev/vhost-net` | guest pings the host end of the tap both ways, no INTx fallback, tap gone after exit. Needs CAP_NET_ADMIN, see §9 |
 | 16550A serial | in-process, TX only | earlyprintk output |
 | SMP | KVM | 8 vCPUs, `smpboot: Total of 8 processors activated`, all online, clean poweroff and SIGTERM |
+| virtio-gpu | rutabaga, in-process | guest ends up with `/dev/dri/card0` + `renderD128` and reports `+virgl +edid +resource_blob +host_visible +context_init`. **Rendering itself untested** |
 
 The vsock check, with a VM running at CID 42:
 
@@ -178,6 +179,18 @@ Do not re-derive these.
   Message Control there.
 - The DSDT `_CRS` window, `pci::MMIO_WINDOW_*` and `layout::PCI_MMIO_*` must
   agree. Same for the ECAM base across MCFG, `layout`, and the reservation.
+- **The 64-bit MMIO window must fit the CPU's physical address width.** Linux
+  discards a host bridge window it cannot address and then declines to assign
+  the BAR, saying nothing about why. This machine reports 39 bits, so a window
+  at 1 TiB vanished; `vm.rs` reads the width from CPUID and places it at the top
+  of what is addressable.
+- **`VIRTIO_GPU_SHM_ID_HOST_VISIBLE` is 1, not 0.** Zero is
+  `VIRTIO_GPU_SHM_ID_UNDEFINED`. A guest that finds the shared-memory
+  capability under id 0 rejects it silently, and the only symptom is
+  `-host_visible` in the DRM feature line.
+- **rutabaga needs the `virgl_renderer` cargo feature.** Without it the crate
+  still builds and `RutabagaBuilder` still runs, but the component the DRM
+  native context needs is not there.
 
 ---
 
@@ -186,7 +199,7 @@ Do not re-derive these.
 - **The net link works, egress does not.** The guest can reach the host end of
   its tap and nothing further, because routing the subnet outward is host-global
   state nesbox does not install. §9 has the rules; where they belong is open.
-- **No GPU.** §7.
+- **The GPU has never rendered.** §7.
 - No API socket, no jailer, no seccomp, no snapshots, no CPU pinning. All were
   in the Firecracker fork; none exist here.
 - `virtio-blk` is synchronous on the vCPU thread. Fine for boot, will need an
@@ -196,44 +209,42 @@ Do not re-derive these.
 
 ---
 
-## 7. Next: the GPU
+## 7. The GPU
 
-The old Firecracker fork has a working-ish DRM native-context virtio-gpu, about
-3800 lines, at commit `caade9c` (branch `main`, also `wip/rutabaga_gfx-update-junk`):
+Ported from the old fork and living in `virtio-devices/src/gpu/`. rutabaga comes
+from crates.io — `rutabaga_gfx = { version = "0.1.80", features =
+["virgl_renderer"] }` — not the git revision the old workspace pinned. Every
+symbol the old code used still exists at that version.
 
 ```
-src/vmm/src/devices/virtio/gpu/{device,virtio_gpu,protocol,worker,edid,
-                                display,descriptor_utils,event_handler,mod}.rs
+gpu/protocol.rs         command and response wire format, ported unchanged
+gpu/virtio_gpu.rs       the rutabaga bridge: resources, blobs, fences
+gpu/worker.rs           command dispatch, on its own thread
+gpu/descriptor_utils.rs Reader/Writer over a descriptor chain
+gpu/display.rs, edid.rs scanout description and generated EDID
+gpu/device.rs           the PCI transport — the only part written from scratch
 ```
 
-`git show main:src/vmm/src/devices/virtio/gpu/virtio_gpu.rs` to read one
-without checking anything out. `protocol.rs` (870 lines) and `virtio_gpu.rs`
-(909 lines) are transport-agnostic and should port nearly unchanged;
-`device.rs`, `event_handler.rs` and `worker.rs` are tied to Firecracker's
-virtio-MMIO transport and its event manager, and are the real work.
+Three seams carry it: `GpuQueues` (pop and complete on the control queue, a
+trait because rutabaga's fence callbacks run on its threads), `HostMemoryMapper`
+(implemented by `vmm/src/memslot.rs`, registers the shared window with KVM), and
+`Reader`/`Writer` taking the descriptor tuples our queues already produce.
 
-The rutabaga dependency is pinned but commented out in the workspace
-`Cargo.toml`:
+BAR0 holds the virtio registers. **BAR2 is a 8 GiB 64-bit prefetchable BAR**
+holding the host-visible window blob resources are mapped into, advertised to
+the guest through a virtio shared-memory capability and backed by a KVM memory
+slot so guest access never traps to us.
 
-```toml
-#rutabaga_gfx = { git = "https://github.com/magma-gpu/rutabaga_gfx.git", rev = "2f0c6a55fd36e61b22a1b3679f69d4273c056602" }
-```
-
-`caade9c` also vendored the whole crate under `src/rutabaga_gfx/`, which is why
-that commit is 577 files. Decide early whether to depend on the fork or vendor
-it again.
-
-Host GPU is at `/dev/dri/renderD128` (card1). The guest kernel already has
-`DRM_VIRTIO_GPU=y`. Expect to need a large, likely 64-bit prefetchable BAR for
-the GPU's host-visible memory, which the current BAR allocator does not support
-— it only does 32-bit non-prefetchable BARs inside a 512 MiB window. Plan for
-that before porting device code.
+What is not done: nothing has ever been rendered. The test rootfs has no Mesa
+and no client to draw with, so everything past "the driver initialised" is
+unverified. A real check needs a guest with the virtio-gpu Mesa driver.
 
 ## 8. Suggested order
 
-1. 64-bit prefetchable BAR support in `pci`, which the GPU needs anyway.
-2. The GPU port.
-3. Decide where the host's NAT rules live (§9), so egress actually works.
+1. Render something, to find out what the port actually got wrong.
+2. Decide where the host's NAT rules live (§9), so egress actually works.
+3. `virtio-blk` is synchronous on the vCPU thread; it will need a worker
+   under game load.
 4. Delete `vm-core`; make the README describe what is actually true.
 
 ## 9. Running virtio-net
