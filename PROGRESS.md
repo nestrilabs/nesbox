@@ -131,6 +131,7 @@ RUST_LOG=trace ./target/debug/nesbox cfg.json 2>&1 | grep -c 'INTx fallback'   #
 | virtio-console | in-process | typed commands execute in the guest |
 | virtio-vsock | kernel, `/dev/vhost-vsock` | host connect to the guest CID gets ECONNRESET from the guest's own stack; an unused CID gets ENODEV |
 | virtio-fs | virtiofsd, vhost-user | `mount -t virtiofs`, reading a host file, EROFS on a read-only export |
+| virtio-net | kernel, `/dev/vhost-net` | **not yet verified end to end** — needs CAP_NET_ADMIN, see §9 |
 | 16550A serial | in-process, TX only | earlyprintk output |
 
 The vsock check, with a VM running at CID 42:
@@ -175,11 +176,15 @@ Do not re-derive these.
 
 ## 6. Known gaps
 
-- **virtio-net does not exist.** nessh's contract says no host networking, but
-  iroh needs egress, so a net device is needed regardless. Planned as vhost-net
-  (`/dev/vhost-net` is available) over a tap device, or passt for an
-  unprivileged path. This is unresolved *between* the two projects, not just
-  unimplemented — worth confirming which side sets up the tap.
+- **SMP is broken.** Any `vcpu_count` above 1 fails immediately with
+  `KVM_RUN failed: EAGAIN`. An application processor starts in
+  `KVM_MP_STATE_UNINITIALIZED` and stays there until it gets INIT/SIPI, and
+  KVM answers `KVM_RUN` on such a vCPU with EAGAIN. We treat that as fatal and
+  tear down the VM. Two things are missing: the vCPU loop must wait rather than
+  die, and the MADT/boot path must actually start the APs. **The configured
+  default is 2**, so the default config does not boot — every test so far
+  happened to use 1.
+- **virtio-net is written but unverified.** §9.
 - **No GPU.** §7.
 - No API socket, no jailer, no seccomp, no snapshots, no CPU pinning. All were
   in the Firecracker fork; none exist here.
@@ -225,7 +230,47 @@ that before porting device code.
 
 ## 8. Suggested order
 
-1. virtio-net, since it is small and unblocks the guest reaching the network.
-2. 64-bit prefetchable BAR support in `pci`, which the GPU needs anyway.
-3. The GPU port.
-4. Delete `vm-core`; make the README describe what is actually true.
+1. Verify virtio-net end to end (§9) and fix whatever it turns up.
+2. SMP, which the default config already asks for and does not get.
+3. 64-bit prefetchable BAR support in `pci`, which the GPU needs anyway.
+4. The GPU port.
+5. Delete `vm-core`; make the README describe what is actually true.
+
+## 9. Verifying virtio-net
+
+The device is written and unit-tested but has never moved a packet, because
+creating a tap needs `CAP_NET_ADMIN` and this machine's sudo wants a password.
+
+Grant the capability once:
+
+```bash
+sudo setcap cap_net_admin+ep ./target/debug/nesbox
+```
+
+`cargo build` replaces the binary and drops the capability, so this has to be
+redone after every rebuild. Then boot with a `network` section — the tap is
+created and addressed automatically — and inside the guest:
+
+```bash
+ip addr add 172.30.0.2/24 dev eth0 && ip link set eth0 up && ping -c2 172.30.0.1
+```
+
+That checks the tap, vhost-net, and the queues. It does **not** check egress:
+reaching the internet additionally needs, on the host,
+
+```bash
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo nft add table ip nesbox
+sudo nft 'add chain ip nesbox postrouting { type nat hook postrouting priority 100 ; }'
+sudo nft add rule ip nesbox postrouting ip saddr 172.30.0.0/24 oifname != "nesbox0" masquerade
+```
+
+That is host-global state, which is why nesbox does not install it. Where it
+should live — an install step, a systemd unit, or nessh — is still open.
+
+Things most likely to be wrong on the first run, in order: the vnet header size
+disagreeing with the guest (every frame misparsed, no traffic at all), the
+offload flags being rejected by `TUNSETOFFLOAD` (startup error), and the
+feature mask passed to `VHOST_SET_FEATURES` containing a bit vhost-net does not
+know (EOPNOTSUPP — it is already masked with `get_features`, but that mask is
+the thing to check first).
