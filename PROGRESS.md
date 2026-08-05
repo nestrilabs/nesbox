@@ -203,9 +203,17 @@ Do not re-derive these.
 
 ## 6. Known gaps
 
-- **The net link works, egress does not.** The guest can reach the host end of
-  its tap and nothing further, because routing the subnet outward is host-global
-  state nesbox does not install. §9 has the rules; where they belong is open.
+- **Egress is installable but unproven.** `nesbox setup` writes the rules (§9),
+  but no guest has yet reached the internet through them — that needs a run as
+  root, which has not happened. The capability-lending in `netsetup::nft` is
+  likewise untested: without `CAP_NET_ADMIN` it correctly falls back to "could
+  not tell", but the path where it works has never run.
+- **passt versus tap is not settled.** The nessh side raised a risk worth more
+  than the CPU argument: iroh's hole punching is developed against conntrack,
+  and passt is a second NAT with its own mapping semantics. If direct
+  connections degrade, sessions fall back to relays and everything keeps working
+  slightly worse forever, which is the hardest kind of failure to notice. Test
+  hole punching against a real peer before switching.
 - **The GPU has never rendered.** §7.
 - No API socket, no jailer, no seccomp, no snapshots, no CPU pinning. All were
   in the Firecracker fork; none exist here.
@@ -306,18 +314,36 @@ ip addr add 172.30.0.2/24 dev eth0 && ip link set eth0 up && ping -c2 172.30.0.1
 ```
 
 That is the check that passes today, and it exercises the tap, vhost-net and
-both queues. It does **not** check egress: reaching the internet additionally
-needs, on the host,
+both queues. It does **not** cover egress, which additionally needs IP
+forwarding and a masquerade rule for the guest's subnet.
+
+Those rules are host-global state, so a running VM does not install them and
+neither does the launcher — nessh is network-facing and anonymous by design, and
+giving it `CAP_NET_ADMIN` would turn a compromise of it into a compromise of the
+host firewall. They live behind a separate privileged one-off instead:
 
 ```bash
-sudo sysctl -w net.ipv4.ip_forward=1
-sudo nft add table ip nesbox
-sudo nft 'add chain ip nesbox postrouting { type nat hook postrouting priority 100 ; }'
-sudo nft add rule ip nesbox postrouting ip saddr 172.30.0.0/24 oifname != "nesbox0" masquerade
+sudo ./target/debug/nesbox setup examples/vm.json      # idempotent
+sudo ./target/debug/nesbox teardown examples/vm.json   # removes the table
 ```
 
-That is host-global state, which is why nesbox does not install it. Where it
-should live — an install step, a systemd unit, or nessh — is still open.
+`setup` enables `ip_forward` and adds a masquerade rule for the guest's subnet
+in its own `ip nesbox` nftables table, so re-running it touches nothing else and
+an existing rule from libvirt or Docker is left alone. The rule matches on
+destination rather than the tap's name, because the name carries a
+kernel-assigned number no one knows until a VM starts. Neither change survives a
+reboot; persist them the way your distribution expects.
+
+Every VM start with a `network` section runs a preflight and says which piece is
+missing — "IP forwarding is disabled" and "no masquerade rule for 172.30.0.0/24"
+are reported separately, because otherwise both present as "the game never
+connects". It warns and continues rather than refusing to boot: a guest with no
+need for egress is a perfectly good guest.
+
+Reading the nftables ruleset needs `CAP_NET_ADMIN`, and file capabilities do not
+survive `exec`, so `netsetup::nft` lends the capability to the `nft` child
+through the ambient set. Without that the check degrades to "could not tell" —
+which still names a remedy, but is the answer the whole module exists to avoid.
 
 If traffic stops flowing after a change, `RUST_LOG=debug` prints the negotiated
 feature set, the vnet header size and the tap offload flags at the moment the

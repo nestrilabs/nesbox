@@ -20,6 +20,11 @@ use virtio_devices::{
 /// BAR index the GPU puts its shared memory window in.
 const GPU_SHM_BAR: usize = 2;
 
+const USAGE: &str = "Usage:
+  nesbox <config.json>            run a VM
+  nesbox setup <config.json>      install the host's egress rules (needs root)
+  nesbox teardown <config.json>   remove them again";
+
 /// Puts the terminal in raw mode so guest console input is unbuffered, and
 /// restores it on drop.
 ///
@@ -58,12 +63,35 @@ fn main() -> Result<()> {
     // Set terminal to raw mode so stdin is unbuffered and Ctrl-C passes through
     let _raw = RawMode::enter()?;
 
-    let config_path = std::env::args()
-        .nth(1)
-        .context("Usage: nesbox <config.json>")?;
+    let mut args = std::env::args().skip(1);
+    let first = args.next().context(USAGE)?;
+    let (command, config_path) = match first.as_str() {
+        "setup" | "teardown" => (first.clone(), args.next().context(USAGE)?),
+        "-h" | "--help" => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        _ => ("run".to_string(), first),
+    };
+
     let config_str = std::fs::read_to_string(&config_path).context("Failed to read config")?;
     let config: config::VmConfig =
         serde_json::from_str(&config_str).context("Invalid JSON config")?;
+
+    match command.as_str() {
+        // Installing the host's egress rules is a separate, privileged, one-off
+        // step: a long-running VM has no business rewriting the host firewall,
+        // and neither does whatever launched it.
+        "setup" => {
+            let network = config
+                .network
+                .as_ref()
+                .context("this config has no `network` section, so there is nothing to set up")?;
+            return nesbox_vmm::netsetup::install(network);
+        }
+        "teardown" => return nesbox_vmm::netsetup::uninstall(),
+        _ => {}
+    }
 
     info!("Starting VMM with config: {:#?}", config);
 
@@ -119,6 +147,10 @@ fn main() -> Result<()> {
 
     // ── Network device (optional) ─────────────────────────────────────────
     if let Some(net_cfg) = &config.network {
+        // Say plainly which host-side piece is missing, if any. A guest that
+        // cannot route out otherwise fails as "nothing ever connects", which
+        // looks nothing like its cause.
+        nesbox_vmm::netsetup::report(net_cfg);
         let net_device = NetDevice::new(
             &NetConfig {
                 tap_name: net_cfg.tap_name.clone(),
