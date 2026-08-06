@@ -151,8 +151,9 @@ scheduler.
 
 Roughly in priority order:
 
-- **Persisting host network setup** — `nesbox setup` configures the host, but
-  nothing it writes survives a reboot.
+- **Persisting host network setup without systemd** — `nesbox setup --persist`
+  installs a systemd unit; hosts using OpenRC or runit are told what to arrange
+  by hand instead.
 - **Asynchronous virtio-blk** — currently synchronous on the vCPU thread, which
   will stall a guest loading assets.
 - **Seccomp and a jailer** — confine the VMM process itself.

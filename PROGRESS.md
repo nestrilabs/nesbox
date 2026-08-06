@@ -349,7 +349,10 @@ reinstalled and recreates its chains. The unit is ordered `After=docker.service`
 for exactly that reason; running before Docker would have the rules removed
 again, and the failure would only show at the next boot.
 
-Without systemd, `--persist` says what to arrange instead rather than pretending.
+`--persist` checks for systemd first (`/run/systemd/system`) and, without it,
+prints what to arrange instead rather than writing a unit nothing will read.
+Supporting those hosts properly — OpenRC, runit, or writing the distribution's
+own firewall config — is unbuilt.
 It also warns when the binary or config sits somewhere a reboot will invalidate,
 such as a `target/` build directory.
 
