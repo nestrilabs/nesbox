@@ -1,0 +1,10 @@
+[package]
+name = "pci"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+log = "0.4"
+vm-memory.workspace = true
+vmm-sys-util = "0.15"

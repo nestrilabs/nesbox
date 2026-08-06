@@ -1,0 +1,44 @@
+{
+  "boot-source": {
+    "kernel_image_path": "/path/to/vmlinux",
+    "boot_args": "console=ttyS0,115200 console=hvc0 root=/dev/vda ro earlyprintk=serial,ttyS0,115200 loglevel=8"
+  },
+  "drives": [
+    {
+      "drive_id": "rootfs",
+      "path_on_host": "/path/to/rootfs.ext4",
+      "is_root_device": true,
+      "is_read_only": true
+    }
+  ],
+  "machine-config": {
+    "vcpu_count": 1,
+    "mem_size_mib": 1024
+  },
+  "vsock": {
+    "guest-cid": 42
+  },
+  "network": {
+    "tap-name": "nesbox%d",
+    "host-ip": "172.30.0.1",
+    "netmask": "255.255.255.0",
+    "mac": "02:00:00:00:00:01"
+  },
+  "gpu": {
+    "render-node": "/dev/dri/renderD128",
+    "width": 1920,
+    "height": 1080
+  },
+  "shared-directories": [
+    {
+      "tag": "prefix",
+      "path-on-host": "/path/to/compat/prefix",
+      "read-only": false
+    },
+    {
+      "tag": "install",
+      "path-on-host": "/path/to/game/install",
+      "read-only": true
+    }
+  ]
+}

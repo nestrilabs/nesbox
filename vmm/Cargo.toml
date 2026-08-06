@@ -1,0 +1,28 @@
+[package]
+name = "nesbox-vmm"
+version = "0.3.0"
+edition = "2024"
+
+[[bin]]
+name = "nesbox"
+
+[dependencies]
+kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+kvm-ioctls = "0.24"
+vmm-sys-util = "0.15"
+vm-memory.workspace = true
+linux-loader.workspace = true
+acpi_tables.workspace = true
+zerocopy = "0.8"
+event-manager = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+
+# internal crates
+virtio-devices = { path = "../virtio-devices" }
+pci = { path = "../pci" }
+termios = "0.3.3"
+libc = "0.2.189"
