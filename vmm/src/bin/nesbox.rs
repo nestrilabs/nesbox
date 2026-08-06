@@ -65,9 +65,6 @@ impl Drop for RawMode {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    // Set terminal to raw mode so stdin is unbuffered and Ctrl-C passes through
-    let _raw = RawMode::enter()?;
-
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `--yes` is for install scripts that have already explained themselves;
     // interactively, every change to the host is asked about first.
@@ -102,6 +99,12 @@ fn main() -> Result<()> {
         "teardown" => return nesbox_vmm::netsetup::uninstall(&consent),
         _ => {}
     }
+
+    // Raw mode belongs to the guest console and nothing else. Entering it
+    // before the subcommands ran left `setup` unable to be answered: no echo,
+    // no line buffering, and no Ctrl-C, because raw mode turns off the signal
+    // characters too.
+    let _raw = RawMode::enter()?;
 
     info!("Starting VMM with config: {:#?}", config);
 

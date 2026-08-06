@@ -38,6 +38,12 @@ means the last command succeeded.
 Without a tty (a launcher spawning us with pipes) everything still works; raw
 mode is skipped. Do not reintroduce a hard `tcgetattr` failure there.
 
+Raw mode is entered **only for the `run` path**, after the subcommands have had
+their turn. It belongs to the guest console: entering it earlier leaves `nesbox
+setup` impossible to answer, because raw mode turns off echo, line buffering and
+the signal characters all at once — the prompt appears, keystrokes vanish, and
+Ctrl-C cannot interrupt.
+
 **Stopping a VM.** `poweroff -f` in the guest, or SIGTERM to the VMM. Exit
 codes: 0 clean or signalled, 1 VMM error, 2 guest reset, 3 guest fault.
 
