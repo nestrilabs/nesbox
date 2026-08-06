@@ -348,11 +348,11 @@ fn install_signal_handlers(shutdown: Arc<Shutdown>) -> Result<()> {
     // SAFETY: both handlers are async-signal-safe.
     unsafe {
         for signal in [libc::SIGTERM, libc::SIGINT] {
-            if libc::signal(signal, stop_handler as libc::sighandler_t) == libc::SIG_ERR {
+            if libc::signal(signal, stop_handler as *const () as libc::sighandler_t) == libc::SIG_ERR {
                 anyhow::bail!("failed to install handler for signal {signal}");
             }
         }
-        if libc::signal(VCPU_WAKE_SIGNAL, wake_handler as libc::sighandler_t) == libc::SIG_ERR {
+        if libc::signal(VCPU_WAKE_SIGNAL, wake_handler as *const () as libc::sighandler_t) == libc::SIG_ERR {
             anyhow::bail!("failed to install the vCPU wake handler");
         }
     }

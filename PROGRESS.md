@@ -137,7 +137,7 @@ RUST_LOG=trace ./target/debug/nesbox cfg.json 2>&1 | grep -c 'INTx fallback'   #
 |---|---|---|
 | virtio-blk | in-process, worker thread | root filesystem mounts; 400 MiB read off `/dev/vda` is byte-identical to the host image at 516 MB/s |
 | virtio-console | in-process | typed commands execute in the guest |
-| virtio-vsock | kernel, `/dev/vhost-vsock` | host connect to the guest CID gets ECONNRESET from the guest's own stack; an unused CID gets ENODEV |
+| virtio-vsock | kernel, `/dev/vhost-vsock` | host connect to the guest CID gets ECONNRESET from the guest's own stack; an unused CID gets ENODEV. `/dev/vsock` is present in the guest. **No application-level exchange has been done** — the test rootfs has no vsock-capable tool |
 | virtio-fs | virtiofsd, vhost-user | `mount -t virtiofs`, reading a host file, EROFS on a read-only export |
 | virtio-net | kernel, `/dev/vhost-net` | guest reaches 1.1.1.1 through the host's NAT, 0% loss; no INTx fallback; tap gone after exit. Needs CAP_NET_ADMIN and the host rules in §9 |
 | 16550A serial | in-process, TX only | earlyprintk output |
@@ -305,8 +305,15 @@ Vulkan is what Proton uses, so this has not been chased.
 ## 8. Suggested order
 
 1. Verify `--persist` survives an actual reboot (§9).
-2. Reduce the dead code the GPU port brought with it — `cargo build` names
-   several unused fields and methods in `gpu/`.
+2. **Pass `ip=` on the kernel command line** so the guest configures itself from
+   whatever subnet the host chose. Today the guest's address is static, written
+   into the rootfs from `rootfs-builder/config/rootfs.conf`, and has to be kept
+   in step with the `network` section of the VM's JSON by hand — a mismatch
+   there is what made guest networking silently not work. nesbox knows both
+   halves and could generate `ip=<guest>::<gateway>:<netmask>::eth0:off`
+   itself; the guest kernel needs `CONFIG_IP_PNP`.
+3. `virtio-blk` serves requests serially; io_uring would let a deep queue
+   overlap.
 
 ## 9. Running virtio-net
 

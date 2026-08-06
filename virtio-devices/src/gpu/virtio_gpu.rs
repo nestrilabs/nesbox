@@ -97,6 +97,9 @@ impl AssociatedScanouts {
     const fn has_any_enabled(self) -> bool {
         self.0 != 0
     }
+    /// Which scanouts are enabled. Nothing in the device needs this — there is
+    /// no display path — but the tests use it to check the bitmap.
+    #[cfg(test)]
     fn iter_enabled(self) -> impl Iterator<Item = u32> {
         (0..VIRTIO_GPU_MAX_SCANOUTS).filter(move |i| ((self.0 >> i) & 1) == 1)
     }
@@ -104,24 +107,21 @@ impl AssociatedScanouts {
 
 #[derive(Copy, Clone, Debug)]
 struct VirtioGpuResource {
-    id: u32,
-    width: u32,
-    height: u32,
     scanouts: AssociatedScanouts,
-    format: Option<u32>,
-    size: u64, // blob resources only
+    /// Blob resources only; how much of the shared window this one occupies.
+    size: u64,
+    /// Where in the shared window it is mapped, once it is.
     shmem_offset: Option<u64>,
     rutabaga_external_mapping: bool,
 }
 
 impl VirtioGpuResource {
-    fn new(id: u32, width: u32, height: u32, format: Option<u32>, size: u64) -> Self {
+    /// The guest's id, dimensions and format are not kept: rutabaga owns the
+    /// resource and is asked whenever they are needed, so a second copy here
+    /// could only go stale.
+    fn new(size: u64) -> Self {
         VirtioGpuResource {
-            id,
-            width,
-            height,
             scanouts: Default::default(),
-            format,
             size,
             shmem_offset: None,
             rutabaga_external_mapping: false,
@@ -447,19 +447,8 @@ impl VirtioGpu {
         self.rutabaga
             .resource_create_3d(resource_id, resource_create_3d)?;
 
-        let format = if resource_create_3d.format != 0 {
-            Some(resource_create_3d.format)
-        } else {
-            None
-        };
-
-        let resource = VirtioGpuResource::new(
-            resource_id,
-            resource_create_3d.width,
-            resource_create_3d.height,
-            format,
-            0,
-        );
+        // Not a blob, so it occupies none of the shared window.
+        let resource = VirtioGpuResource::new(0);
         self.resources.insert(resource_id, resource);
         Ok(self.result_from_query(resource_id))
     }
@@ -689,7 +678,7 @@ impl VirtioGpu {
             None,
         )?;
 
-        let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
+        let resource = VirtioGpuResource::new(resource_create_blob.size);
         self.resources.insert(resource_id, resource);
         Ok(self.result_from_query(resource_id))
     }

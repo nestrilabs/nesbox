@@ -75,10 +75,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub struct Reader {
-    /// Eagerly-copied contents of all readable descriptors.
+    /// Eagerly-copied contents of all readable descriptors. Its length is the
+    /// total across the chain; the cursor tracks how much has been consumed.
     buf: std::io::Cursor<Vec<u8>>,
-    /// Total byte count across all readable descriptors.
-    total_len: usize,
 }
 
 impl Reader {
@@ -88,6 +87,8 @@ impl Reader {
     /// at the first writable descriptor as required by the virtio spec.
     pub fn new(mem: &GuestMemoryMmap, chain: &[Descriptor]) -> Result<Self> {
         let mut data: Vec<u8> = Vec::new();
+        // Accumulated only to catch a chain whose lengths overflow; the copied
+        // buffer is what everything downstream reads.
         let mut total_len: usize = 0;
 
         for desc in chain.iter().take_while(|d| !is_write_only(d)) {
@@ -103,10 +104,7 @@ impl Reader {
                 .map_err(Error::GuestMemory)?;
         }
 
-        Ok(Reader {
-            buf: std::io::Cursor::new(data),
-            total_len,
-        })
+        Ok(Reader { buf: std::io::Cursor::new(data) })
     }
 
     /// Read a `ByteValued` object directly from the descriptor stream.
