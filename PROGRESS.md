@@ -55,8 +55,28 @@ codes: 0 clean or signalled, 1 VMM error, 2 guest reset, 3 guest fault.
 |---|---|---|
 | Guest kernel | `/mnt/nekopool/PROJEKT/NestriWork/linux/vmlinux` | 7.1.5, ELF. Has PCI, `PCI_MMCONFIG`, virtio-pci/blk/console/net, `DRM_VIRTIO_GPU`, vsock, `VIRTIO_FS`, 8250, ext4, x2APIC. **No native GPU driver is needed in the guest** — native context means the guest only ever binds virtio-gpu |
 | Rootfs | `/mnt/nekopool/PROJEKT/NestriWork/rootfs-builder/output/rootfs.ext4` | 2 GiB Alpine + Nestri stack, built from `rootfs-builder/Containerfile`. Root-owned mode 644, so run it `"is_read_only": true`. Mesa needs `-Dvulkan-drivers=…,intel`, `-Dgallium-drivers=…,iris` and `-Dintel-virtio-experimental=true` for the GPU to work |
-| Kernel source | same `linux/` dir | Build with `./scripts/config --enable X && make olddefconfig && make -j12 vmlinux`, ~10 min |
+| Kernel source | same `linux/` dir | Build with `./scripts/config --enable X && make olddefconfig && make -j12 vmlinux`, ~2 min. Slimmed 2026-08-06: see below |
 | Reference clones | `cloudhypervisor-for-llm-ref/`, `linux-for-llm-ref/` | Read-only references, untracked, **do not build in them** |
+
+### Guest kernel configuration
+
+Slimmed on 2026-08-06, taking `.text` from 12.9 to 7.5 MiB and the whole
+`vmlinux` from 26 to 16 MiB. Removed: `DRM_AMDGPU` (with `DRM_AMD_DC`, by far
+the largest single item), `WLAN`, `ETHERNET` — the vendor NIC drivers, which
+`VIRTIO_NET` does not live under — `SCSI`, which had no disk drivers under it
+at all, and `ACPI_VIDEO`.
+
+Added, and worth keeping:
+
+- `INPUT_EVDEV`, `INPUT_MISC`, `INPUT_UINPUT` — **the guest previously had no
+  way to receive input of any kind.** Nothing could read a keyboard, mouse or
+  gamepad, and no agent could synthesise one. `/dev/uinput` now exists.
+  `INPUT_UINPUT` needs `INPUT_MISC`, which is not obvious from the name.
+- `VIRTIO_INPUT` — for when nesbox grows an input device; nothing provides one
+  yet.
+- `PARAVIRT_SPINLOCKS` — a guest vCPU spinning on a lock held by a vCPU the host
+  has descheduled wastes its whole slice. Matters now that SMP works.
+- `IP_PNP` — required before the `ip=` command-line plan in §8 can work.
 
 `/usr/lib/libkrunfw.so.5` may still be installed on this host. It is unused and
 unusable: its embedded kernel is **virtio-mmio only** — no `virtio_pci`, no
