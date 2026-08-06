@@ -203,12 +203,10 @@ Do not re-derive these.
 
 ## 6. Known gaps
 
-- **Egress works, but the host needs three privileged one-offs**, not one:
-  `nesbox setup`, plus a forward accept in each direction if Docker or ufw is
-  running (§9). Verified: guest to 1.1.1.1, 0% loss, 11.5ms.
-- **`nesbox setup` does not check for a blocking firewall.** It reports success
-  having written correct rules, while the preflight separately reports that
-  traffic cannot pass. Setup should run the same check and say so.
+- **Egress works**: guest to 1.1.1.1, 0% loss, 11.5ms, with `nesbox setup` as
+  the only privileged step. The firewall rules it writes into `DOCKER-USER` were
+  verified by hand first; `setup` writing them itself has not been run yet,
+  since that needs root.
 - **passt versus tap is not settled.** The nessh side raised a risk worth more
   than the CPU argument: iroh's hole punching is developed against conntrack,
   and passt is a second NAT with its own mapping semantics. If direct
@@ -335,22 +333,28 @@ destination rather than the tap's name, because the name carries a
 kernel-assigned number no one knows until a VM starts. Neither change survives a
 reboot; persist them the way your distribution expects.
 
-**A third-party firewall can block all of this and there is nothing nesbox can
-do about it.** Docker sets the forward chain's policy to drop the moment it
-starts, and ufw ships with the same; in nftables a drop is final, so an accept
-in our table cannot rescue a packet another chain already refused. Both
-directions have to be allowed, because conntrack has already reversed the
-masquerade by the time a reply reaches the forward chain, so replies arrive
-addressed *to* the guest's subnet:
+`setup` also clears a third-party firewall out of the way, because one will
+otherwise block everything above while everything above is correct. Docker sets
+the forward chain's policy to drop the moment it starts, and ufw ships with the
+same; in nftables a drop is final, so an accept in our own table cannot rescue a
+packet another chain has already refused. The rule has to go in a chain that
+firewall honours — `DOCKER-USER` if Docker is present, `FORWARD` otherwise —
+and in **both directions**, because conntrack has already reversed the
+masquerade by the time a reply arrives, so replies are addressed *to* the
+subnet, not from it:
 
 ```bash
-sudo iptables -I DOCKER-USER -s 172.30.0.0/24 -j ACCEPT
-sudo iptables -I DOCKER-USER -d 172.30.0.0/24 -j ACCEPT
+iptables -I DOCKER-USER -s 172.30.0.0/24 -j ACCEPT
+iptables -I DOCKER-USER -d 172.30.0.0/24 -j ACCEPT
 ```
 
-With only the first rule the guest's packets leave and every reply is dropped —
-that is measured on this host, not inferred, and it is what the preflight's
-two-direction check is built from.
+`setup` does both itself. With only the first the guest's packets leave and
+every reply is dropped — measured on this host, not inferred, and it is what the
+preflight's two-direction check is built from.
+
+`setup` finishes by re-running the preflight and fails loudly if the host still
+is not ready, rather than reporting success for having written correct rules
+that something else ignores.
 
 Every VM start with a `network` section runs a preflight and says which piece is
 missing — "IP forwarding is disabled" and "no masquerade rule for 172.30.0.0/24"

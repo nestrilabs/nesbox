@@ -129,7 +129,18 @@ fn forwarding_enabled() -> Result<bool> {
 /// The capability is raised into the ambient set for the child only. It is the
 /// same one we already have, and `nft` is doing read-only work with it.
 fn nft(args: &[&str]) -> Result<std::process::Output> {
-    let mut command = Command::new("nft");
+    privileged("nft", args)
+}
+
+/// As [`nft`], for the iptables side of the world. A host running Docker has
+/// its forward rules there, and Docker documents `DOCKER-USER` as the chain to
+/// put your own in, so that is where a fix has to go.
+fn iptables(args: &[&str]) -> Result<std::process::Output> {
+    privileged("iptables", args)
+}
+
+fn privileged(program: &str, args: &[&str]) -> Result<std::process::Output> {
+    let mut command = Command::new(program);
     command.args(args);
     // SAFETY: pre_exec runs between fork and exec, where only async-signal-safe
     // work is allowed. prctl is a bare syscall and allocates nothing.
@@ -141,7 +152,7 @@ fn nft(args: &[&str]) -> Result<std::process::Output> {
     }
     command
         .output()
-        .context("failed to run `nft` — is nftables installed?")
+        .with_context(|| format!("failed to run `{program}` — is it installed?"))
 }
 
 /// Move `CAP_NET_ADMIN` into the inheritable and ambient sets so it survives
@@ -253,6 +264,64 @@ fn forwarding_blocked(ruleset: &str, subnet: Subnet) -> bool {
     !(accepts("saddr") && accepts("daddr"))
 }
 
+/// Where a forward-accept rule can be put so the dropping chain sees it.
+enum ForwardChain {
+    /// Docker's chain for exactly this purpose. Preferred: it is documented,
+    /// evaluated first, and survives Docker restarting.
+    DockerUser,
+    /// A plain iptables forward chain. Inserting at the top is heavier-handed
+    /// but works where there is no better place.
+    Forward,
+    /// Something drops forwarded packets and we do not know where to put a
+    /// rule that it would honour.
+    Unknown,
+}
+
+fn forward_chain() -> ForwardChain {
+    if iptables(&["-S", "DOCKER-USER"]).is_ok_and(|o| o.status.success()) {
+        ForwardChain::DockerUser
+    } else if iptables(&["-S", "FORWARD"]).is_ok_and(|o| o.status.success()) {
+        ForwardChain::Forward
+    } else {
+        ForwardChain::Unknown
+    }
+}
+
+impl ForwardChain {
+    fn name(&self) -> Option<&'static str> {
+        match self {
+            Self::DockerUser => Some("DOCKER-USER"),
+            Self::Forward => Some("FORWARD"),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// Allow the subnet through an iptables chain, in one direction. Idempotent:
+/// `-C` asks whether the rule is already there before adding it.
+fn allow_through(chain: &str, direction: &str, subnet: &str) -> Result<bool> {
+    let rule = [direction, subnet, "-j", "ACCEPT"];
+    let check: Vec<&str> = std::iter::once("-C")
+        .chain(std::iter::once(chain))
+        .chain(rule.iter().copied())
+        .collect();
+    if iptables(&check)?.status.success() {
+        return Ok(false); // already allowed
+    }
+    let insert: Vec<&str> = std::iter::once("-I")
+        .chain(std::iter::once(chain))
+        .chain(rule.iter().copied())
+        .collect();
+    let out = iptables(&insert)?;
+    if !out.status.success() {
+        bail!(
+            "iptables -I {chain} {direction} {subnet} -j ACCEPT failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(true)
+}
+
 fn read_ruleset() -> Result<String> {
     let out = nft(&["list", "ruleset"])?;
     if !out.status.success() {
@@ -332,7 +401,7 @@ pub fn install(network: &Network) -> Result<()> {
 
     if masquerade_present(&read_ruleset()?, subnet) {
         log::info!("a masquerade rule for {subnet} is already present");
-        return Ok(());
+        return finish(network, subnet);
     }
 
     // `add table` and `add chain` are no-ops if they already exist, so the
@@ -349,17 +418,75 @@ pub fn install(network: &Network) -> Result<()> {
     // Matching on the destination rather than the tap's name keeps this
     // independent of which tap a given VM ends up with — the name contains a
     // kernel-assigned number that is not known until a VM starts.
-    let subnet = subnet.to_string();
+    let text = subnet.to_string();
     run_nft(&[
-        "add", "rule", "ip", TABLE, "postrouting", "ip", "saddr", &subnet, "ip", "daddr", "!=",
-        &subnet, "masquerade",
+        "add", "rule", "ip", TABLE, "postrouting", "ip", "saddr", &text, "ip", "daddr", "!=",
+        &text, "masquerade",
     ])?;
-    log::info!("added a masquerade rule for {subnet} in table ip {TABLE}");
+    log::info!("added a masquerade rule for {text} in table ip {TABLE}");
     log::warn!(
         "nftables rules do not survive a reboot either; persist them with \
          `nft list table ip {TABLE}` into your distribution's nftables config"
     );
-    Ok(())
+    finish(network, subnet)
+}
+
+/// Clear anything else standing between the guest and the network, then say
+/// whether it worked.
+///
+/// A self-hoster should not have to know that Docker quietly set the forward
+/// policy to drop, nor that replies need allowing separately from requests. If
+/// we have the privileges to fix it, fix it.
+fn finish(network: &Network, subnet: Subnet) -> Result<()> {
+    let ruleset = read_ruleset()?;
+    if !forwarding_blocked(&ruleset, subnet) {
+        log::info!("nothing else is blocking forwarded traffic");
+        return report_final(network);
+    }
+
+    let chain = forward_chain();
+    let Some(chain) = chain.name() else {
+        log::error!(
+            "something on this host drops forwarded packets and nesbox cannot tell \
+             where to add a rule it would honour. Allow {subnet} through it by hand, \
+             in both directions."
+        );
+        return report_final(network);
+    };
+
+    log::info!("a firewall drops forwarded packets; allowing {subnet} through {chain}");
+    let subnet = subnet.to_string();
+    // Both directions: requests leave with the subnet as source, and replies
+    // come back to it once conntrack has undone the masquerade.
+    for direction in ["-s", "-d"] {
+        if allow_through(chain, direction, &subnet)? {
+            log::info!("added {chain} {direction} {subnet} -j ACCEPT");
+        } else {
+            log::info!("{chain} {direction} {subnet} -j ACCEPT was already there");
+        }
+    }
+    log::warn!(
+        "iptables rules do not survive a reboot; persist them alongside the rest, \
+         and re-run `nesbox setup` if Docker is reinstalled"
+    );
+    report_final(network)
+}
+
+/// Say plainly whether the host is now ready, rather than leaving "setup
+/// finished" to imply it.
+fn report_final(network: &Network) -> Result<()> {
+    let problems = preflight(network);
+    if problems.is_empty() {
+        log::info!(
+            "host is ready: {} can reach the network",
+            Subnet::from_network(network)
+        );
+        return Ok(());
+    }
+    for problem in &problems {
+        log::error!("still not ready: {problem} — {}", problem.remedy());
+    }
+    bail!("setup could not make the guest's network work; see above")
 }
 
 fn run_nft(args: &[&str]) -> Result<()> {
