@@ -58,9 +58,10 @@ codes: 0 clean or signalled, 1 VMM error, 2 guest reset, 3 guest fault.
 | Kernel source | same `linux/` dir | Build with `./scripts/config --enable X && make olddefconfig && make -j12 vmlinux`, ~10 min |
 | Reference clones | `cloudhypervisor-for-llm-ref/`, `linux-for-llm-ref/` | Read-only references, untracked, **do not build in them** |
 
-`/usr/lib/libkrunfw.so.5` is installed and the README talks it up, but its
-kernel is **virtio-mmio only** — no `virtio_pci`, no MMCONFIG — so it cannot
-boot this branch. Nothing loads it. Ignore it or delete the README claim.
+`/usr/lib/libkrunfw.so.5` may still be installed on this host. It is unused and
+unusable: its embedded kernel is **virtio-mmio only** — no `virtio_pci`, no
+MMCONFIG — so it cannot boot this branch. nesbox builds its own kernel instead,
+which is also how it gets a recent one.
 
 virtiofsd 1.14 is installed at `/usr/bin/virtiofsd`. `/dev/vhost-vsock` and
 `/dev/vhost-net` both exist and are world-accessible.
@@ -69,7 +70,7 @@ virtiofsd 1.14 is installed at `/usr/bin/virtiofsd`. `/dev/vhost-vsock` and
 
 ## 3. Layout of the code
 
-4270 lines across four crates.
+About 5900 lines across three crates.
 
 ```
 pci/                 config space, CAM1 + ECAM decode, BAR allocation, MSI types
@@ -82,6 +83,9 @@ virtio-devices/      one file per device, all virtio 1.0 over PCI
   src/console.rs     virtio-console, hvc0, host stdin <-> guest
   src/vsock.rs       virtio-vsock, queues handed to /dev/vhost-vsock
   src/fs.rs          virtio-fs, queues handed to virtiofsd over vhost-user
+  src/net.rs         virtio-net, queues handed to /dev/vhost-net
+  src/tap.rs         the tap interface the net device owns
+  src/gpu/           virtio-gpu over rutabaga; see §7
 vmm/                 the VMM proper
   src/vm.rs          KVM setup, memory, vCPU loop
   src/layout.rs      the guest physical address map — read this first
@@ -93,12 +97,10 @@ vmm/                 the VMM proper
   src/power.rs       ACPI sleep/reset ports
   src/lifecycle.rs   ExitReason and the shared stop signal
   src/virtiofsd.rs   spawns and supervises virtiofsd
+  src/memslot.rs     registers host memory as guest RAM, for the GPU window
+  src/netsetup.rs    the host's egress rules, and checking they are there
   src/bin/nesbox.rs  wiring: devices, interrupts, signals, vCPU threads
-vm-core/             a vestigial event-manager vCPU subscriber, unused
 ```
-
-`vm-core` is dead code. Nothing depends on its behaviour; delete it when
-convenient.
 
 ### Guest physical address map (`vmm/src/layout.rs`)
 
@@ -231,7 +233,6 @@ Do not re-derive these.
 - `virtio-blk` is synchronous on the vCPU thread. Fine for boot, will need an
   io_uring worker under game load.
 - Only one root drive is honoured; extra `drives` entries are ignored.
-- `vm-core` is dead code.
 
 ---
 
@@ -305,7 +306,8 @@ Vulkan is what Proton uses, so this has not been chased.
 1. Decide where the host's NAT rules live (§9), so egress actually works.
 2. `virtio-blk` is synchronous on the vCPU thread; it will need a worker
    under game load.
-3. Delete `vm-core`; make the README describe what is actually true.
+3. Reduce the dead code the GPU port brought with it — `cargo build` names
+   several unused fields and methods in `gpu/`.
 
 ## 9. Running virtio-net
 

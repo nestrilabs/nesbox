@@ -309,7 +309,6 @@ dependencies = [
  "serde_json",
  "termios",
  "virtio-devices",
- "vm-core",
  "vm-memory 0.18.0",
  "vmm-sys-util",
  "zerocopy",
@@ -647,19 +646,6 @@ dependencies = [
  "log",
  "virtio-bindings",
  "vm-memory 0.17.2",
- "vmm-sys-util",
-]
-
-[[package]]
-name = "vm-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "event-manager",
- "kvm-ioctls",
- "log",
- "pci",
- "vm-memory 0.18.0",
  "vmm-sys-util",
 ]
 

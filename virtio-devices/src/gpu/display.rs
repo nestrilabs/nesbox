@@ -1,4 +1,4 @@
-// Copyright 2024 - Firecracker GPU port
+//! Scanout description: size, format and EDID.
 // Minimal display stubs. All krun_display / host-side rendering is intentionally
 // absent: this device runs GPU workloads entirely inside the VMM.
 

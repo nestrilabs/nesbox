@@ -7,7 +7,8 @@ use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMma
 
 use crate::gdt::{gdt_entry, kvm_segment_from_gdt};
 
-// Memory layout constants (adapted from Firecracker's layout module)
+// Where the boot-time structures go in low memory. Distinct from
+// `layout.rs`, which describes the guest's physical address map.
 const ZERO_PAGE_START: u64 = 0x7000;
 const BOOT_STACK_POINTER: u64 = 0x8ff0;
 const BOOT_GDT_OFFSET: u64 = 0x500;

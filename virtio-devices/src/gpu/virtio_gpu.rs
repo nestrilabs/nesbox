@@ -1,7 +1,8 @@
-// Copyright 2024 - Firecracker GPU port
-// Ported from libkrun's virtio_gpu.rs.  All krun_display / host-side scanout
-// code has been removed.  The rutabaga backend and fence / resource management
-// logic is kept as close to the original as possible.
+//! The rutabaga backend: resources, blob mappings and fences.
+//!
+//! Derived from libkrun's `virtio_gpu.rs`, with the host-side scanout code
+//! removed — nothing here draws to a host display. The resource and fence
+//! handling is kept close to the original.
 
 use std::collections::BTreeMap;
 use std::fmt;

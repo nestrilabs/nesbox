@@ -24,6 +24,5 @@ env_logger = "0.11"
 # internal crates
 virtio-devices = { path = "../virtio-devices" }
 pci = { path = "../pci" }
-vm-core = { path = "../vm-core" }
 termios = "0.3.3"
 libc = "0.2.189"

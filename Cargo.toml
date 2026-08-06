@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["vmm", "virtio-devices", "pci", "vm-core"]
+members = ["vmm", "virtio-devices", "pci"]
 
 [workspace.dependencies]
 vm-memory = { version = "0.18", features = ["backend-mmap"] }

@@ -1,4 +1,4 @@
-// Copyright 2024 - Firecracker GPU port
+//! The GPU command dispatcher, on its own thread.
 // Background worker thread for the virtio-gpu device.
 //
 // The worker owns the `VirtioGpu` state machine (rutabaga context, resource
