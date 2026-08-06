@@ -210,9 +210,15 @@ Do not re-derive these.
 ## 6. Known gaps
 
 - **Egress works**: guest to 1.1.1.1, 0% loss, 11.5ms, with `nesbox setup` as
-  the only privileged step. The firewall rules it writes into `DOCKER-USER` were
-  verified by hand first; `setup` writing them itself has not been run yet,
-  since that needs root.
+  the only privileged step. Verified from a blocked host: setup detected the
+  dropping forward chain, asked, added both `DOCKER-USER` rules itself and
+  reported the host ready. Declining leaves the host untouched and exits
+  non-zero.
+- **Nothing setup writes survives a reboot.** `ip_forward`, the nftables table
+  and the iptables rules all vanish, and the guest silently loses the network
+  until someone runs setup again. The preflight will say why, which is better
+  than nothing, but a `--persist` that writes `/etc/sysctl.d` and the
+  distribution's nftables config is the missing half.
 - **passt versus tap is not settled.** The nessh side raised a risk worth more
   than the CPU argument: iroh's hole punching is developed against conntrack,
   and passt is a second NAT with its own mapping semantics. If direct
