@@ -135,7 +135,7 @@ RUST_LOG=trace ./target/debug/nesbox cfg.json 2>&1 | grep -c 'INTx fallback'   #
 
 | Device | Backend | Verified by |
 |---|---|---|
-| virtio-blk | in-process, sync | root filesystem mounts |
+| virtio-blk | in-process, worker thread | root filesystem mounts; 400 MiB read off `/dev/vda` is byte-identical to the host image at 516 MB/s |
 | virtio-console | in-process | typed commands execute in the guest |
 | virtio-vsock | kernel, `/dev/vhost-vsock` | host connect to the guest CID gets ECONNRESET from the guest's own stack; an unused CID gets ENODEV |
 | virtio-fs | virtiofsd, vhost-user | `mount -t virtiofs`, reading a host file, EROFS on a read-only export |
@@ -228,8 +228,11 @@ Do not re-derive these.
 - **The GPU has never rendered.** §7.
 - No API socket, no jailer, no seccomp, no snapshots, no CPU pinning. All were
   in the Firecracker fork; none exist here.
-- `virtio-blk` is synchronous on the vCPU thread. Fine for boot, will need an
-  io_uring worker under game load.
+- `virtio-blk` serves requests on a worker thread, but serially and with
+  blocking reads. Requests do not overlap, so a deep queue is drained one at a
+  time; io_uring would let them run concurrently. Measured over a 400 MiB read:
+  242 batches, 275ms of I/O in total, 1.14ms mean, 8.5ms worst — that worst case
+  is half a frame at 60fps, and it used to happen on the vCPU thread.
 - Only one root drive is honoured; extra `drives` entries are ignored.
 
 ---
@@ -302,9 +305,7 @@ Vulkan is what Proton uses, so this has not been chased.
 ## 8. Suggested order
 
 1. Verify `--persist` survives an actual reboot (§9).
-2. `virtio-blk` is synchronous on the vCPU thread; it will need a worker
-   under game load.
-3. Reduce the dead code the GPU port brought with it — `cargo build` names
+2. Reduce the dead code the GPU port brought with it — `cargo build` names
    several unused fields and methods in `gpu/`.
 
 ## 9. Running virtio-net

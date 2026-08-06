@@ -1,4 +1,11 @@
 //! Virtio block device over PCI transport (virtio 1.0 / modern).
+//!
+//! Requests are served on a worker thread rather than on the vCPU that
+//! submitted them. The guest notifies by writing to the notify register, which
+//! traps to us; doing the read there means the vCPU sits in `KVM_RUN` until the
+//! disk answers, and a guest loading a few hundred megabytes of assets stalls
+//! one of its cores for the duration. Kicking a worker instead lets the vCPU
+//! return immediately and go on running guest code.
 
 use crate::common::*;
 use anyhow::{Context, Result};
@@ -6,6 +13,7 @@ use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
 use pci::{MsiRouter, MsiVector, PciDevice};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use vm_memory::{Bytes, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
@@ -46,14 +54,20 @@ impl BlkInner {
         VIRTIO_F_VERSION_1 | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 9)
     }
 
+    /// Serve everything the guest has made available, then interrupt it once.
     fn process(&mut self) {
         let mem = match self.mem.clone() { Some(m) => m, None => return };
         if !self.q.enabled || self.q.desc == 0 { return; }
+        let mut served = 0usize;
         loop {
             let Some((head, descs)) = pop_avail(&mem, &mut self.q) else { break };
             let n = self.do_request(&mem, head, &descs);
             push_used(&mem, &self.q, head, n);
+            served += 1;
         }
+        // An empty ring means the kick raced a batch we already drained.
+        // Interrupting anyway would be a spurious wakeup for the guest.
+        if served == 0 { return; }
         self.isr |= 1;
         let vec = self.q.vec;
         self.msix.trigger(vec);
@@ -107,7 +121,15 @@ impl BlkInner {
     }
 }
 
-pub struct BlkDevice { inner: Mutex<BlkInner> }
+pub struct BlkDevice {
+    inner: Arc<Mutex<BlkInner>>,
+    /// Written by the vCPU on notify, read by the worker. Deliberately not
+    /// behind the inner lock: the whole point is that a notify never waits on
+    /// a request already in flight.
+    kick: Arc<EventFd>,
+    stop: Arc<AtomicBool>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
 
 impl BlkDevice {
     pub fn new(path: &std::path::Path, read_only: bool) -> Result<Self> {
@@ -116,11 +138,32 @@ impl BlkDevice {
         let disk_sectors = file.metadata().context("Failed to stat disk image")?.len() / SECTOR_SIZE;
         log::info!("virtio-blk: {:?}  {} sectors  read_only={}", path, disk_sectors, read_only);
         let (cfg, msix_cap) = Self::build_pci_config();
-        Ok(Self { inner: Mutex::new(BlkInner {
+        let inner = Arc::new(Mutex::new(BlkInner {
             file, read_only, disk_sectors, com: ComCfg::default(), qs: 0,
             q: QState { size: QUEUE_SIZE, ..Default::default() }, isr: 0,
             cfg_vec: VIRTQ_MSI_NO_VECTOR, mem: None, msix: MsixTable::default(), cfg, msix_cap,
-        })})
+        }));
+        let kick = Arc::new(EventFd::new(0).context("failed to create the blk kick eventfd")?);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let worker = {
+            let inner = inner.clone();
+            let kick = kick.clone();
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name("virtio-blk".into())
+                .spawn(move || {
+                    // Blocks here until the guest kicks, so an idle disk costs
+                    // nothing.
+                    while kick.read().is_ok() {
+                        if stop.load(Ordering::Acquire) { break; }
+                        inner.lock().unwrap().process();
+                    }
+                })
+                .context("failed to start the virtio-blk worker")?
+        };
+
+        Ok(Self { inner, kick, stop, worker: Mutex::new(Some(worker)) })
     }
     pub fn set_mem(&self, m: Arc<GuestMemoryMmap>) { self.inner.lock().unwrap().mem = Some(m); }
 
@@ -192,12 +235,26 @@ impl BlkDevice {
         if o < OFF_ISR { self.com_write(o - OFF_COMMON, d); }
         else if o < OFF_DEVICE {}
         else if o < OFF_NOTIFY {}
-        else if o < OFF_MSIX_TABLE { self.inner.lock().unwrap().process(); }
+        else if o < OFF_MSIX_TABLE {
+            // Hand the work to the worker and return to the guest at once.
+            let _ = self.kick.write(1);
+        }
         else if o < OFF_MSIX_PBA {
             let mut i = self.inner.lock().unwrap();
             if i.msix.write(o - OFF_MSIX_TABLE, d) {
                 i.msix.trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
             }
+        }
+    }
+}
+
+impl Drop for BlkDevice {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        // Wake the worker so it notices; it is blocked reading the eventfd.
+        let _ = self.kick.write(1);
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            let _ = worker.join();
         }
     }
 }

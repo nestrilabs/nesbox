@@ -38,7 +38,7 @@ config access, so the guest sees a machine that looks like modern hardware.
 | virtio-net | the host kernel, through vhost-net and a tap |
 | virtio-vsock | the host kernel, through vhost-vsock |
 | virtio-fs | virtiofsd, over vhost-user |
-| virtio-blk | in-process |
+| virtio-blk | in-process, on a worker thread |
 | virtio-console | in-process |
 
 Where the kernel can do the work, it does: only the GPU has to live in the VMM
@@ -154,8 +154,8 @@ Roughly in priority order:
 - **Persisting host network setup without systemd** — `nesbox setup --persist`
   installs a systemd unit; hosts using OpenRC or runit are told what to arrange
   by hand instead.
-- **Asynchronous virtio-blk** — currently synchronous on the vCPU thread, which
-  will stall a guest loading assets.
+- **Overlapping block I/O** — requests are served off the vCPU thread but still
+  one at a time; io_uring would let a deep queue run concurrently.
 - **Seccomp and a jailer** — confine the VMM process itself.
 - **CPU pinning** — pin vCPU threads to host cores to cut scheduler jitter in
   latency-sensitive rendering.
