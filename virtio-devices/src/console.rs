@@ -37,6 +37,14 @@ impl Inner {
     fn process_tx(&mut self) {
         let mem = match self.mem.clone() { Some(m) => m, None => return };
         if !self.tx.enabled || self.tx.desc == 0 { return; }
+        // Held across the batch so interleaved output cannot tear, and flushed
+        // at the end: stdout is line-buffered on a terminal, which for a
+        // console means the guest's echo of a keystroke sits here until the
+        // guest happens to emit a newline. Typing looks dead, and anything
+        // without a trailing newline — a shell prompt, `clear` — appears only
+        // once the *next* command produces output.
+        let mut out = std::io::stdout().lock();
+        let mut wrote = false;
         loop {
             let Some((head, descs)) = pop_avail(&mem, &mut self.tx) else { break };
             let mut total = 0u32;
@@ -44,12 +52,16 @@ impl Inner {
                 if flags & VRING_DESC_F_WRITE == 0 {
                     let mut buf = vec![0u8; len as usize];
                     if mem.read_slice(&mut buf, vm_memory::GuestAddress(addr)).is_ok() {
-                        let _ = std::io::stdout().write_all(&buf);
+                        let _ = out.write_all(&buf);
+                        wrote = true;
                         total += len;
                     }
                 }
             }
             push_used(&mem, &self.tx, head, total);
+        }
+        if wrote {
+            let _ = out.flush();
         }
         self.isr |= 1;
         let vec = self.tx.vec;

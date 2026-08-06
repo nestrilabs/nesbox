@@ -200,6 +200,12 @@ Do not re-derive these.
   motherboard device.
 - **`\_S5` is required in the DSDT** or Linux will not power off, however
   correctly the FADT describes the sleep registers.
+- **The console must flush stdout after every batch.** Rust's stdout is
+  line-buffered on a terminal, so without it the guest's echo of a keystroke
+  waits in our buffer until the guest happens to emit a newline: typing appears
+  dead, and anything with no trailing newline — a shell prompt, `clear` — shows
+  up only when the *next* command produces output. `serial.rs` already got this
+  right; `console.rs` did not.
 - **The virtio ISR register is INTx-only.** An MSI-X driver never reads it, so
   anything gated on it stops working after the first interrupt.
 - **Capability offsets are not derivable from capability contents.** Only
