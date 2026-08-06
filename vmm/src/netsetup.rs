@@ -71,12 +71,12 @@ impl Problem {
             Self::ForwardingDisabled | Self::NoMasquerade(_) => {
                 "run `nesbox setup <config.json>` once, as root".to_string()
             }
-            // Both directions, because replies arrive addressed to the
-            // subnet once conntrack has undone the masquerade.
+            // Setup finds the right chain for whichever firewall this is and
+            // allows both directions, so naming one firewall's chain here would
+            // be wrong advice on any host running a different one.
             Self::ForwardingBlocked(subnet) => format!(
-                "allow the subnet through that firewall in both directions, e.g. for Docker \
-                 `sudo iptables -I DOCKER-USER -s {subnet} -j ACCEPT` and \
-                 `sudo iptables -I DOCKER-USER -d {subnet} -j ACCEPT`"
+                "run `nesbox setup <config.json>` as root — it will allow {subnet} \
+                 through that firewall, in both directions"
             ),
             Self::CannotTell(_) => {
                 "check by hand: `sysctl net.ipv4.ip_forward` and `nft list table ip nesbox`"
@@ -698,6 +698,13 @@ pub fn unpersist(consent: &Consent) -> Result<()> {
 ///
 /// Ordering matters more than it looks: Docker rewrites its own chains when it
 /// starts, so running before it would have the rules quietly removed again.
+///
+/// `After=docker.service` is unconditional on purpose, and is safe on a host
+/// with no Docker: systemd ignores ordering against a unit that does not exist,
+/// and `systemd-analyze verify` passes such a unit without complaint. Only
+/// `Requires=` or `BindsTo=` would turn a missing unit into a failure, and
+/// neither is used here. Making it conditional would be worse, not better —
+/// a host that installs Docker later would silently lose the ordering.
 fn unit_text(exe: &std::path::Path, config: &std::path::Path) -> String {
     format!(
         "[Unit]\n\
@@ -950,12 +957,26 @@ table ip nesbox {
     }
 
     #[test]
-    fn the_two_fixable_problems_point_at_setup() {
+    fn every_fixable_problem_points_at_setup() {
         // The distinction nessh asked for: these are actionable, and must not
-        // read like an ordinary connection failure.
+        // read like an ordinary connection failure. None of them should name a
+        // particular firewall's chain either — setup finds the right one, and
+        // hardcoding Docker's would misdirect anyone running something else.
         let subnet = Subnet::from_network(&network([172, 30, 0, 1], [255, 255, 255, 0]));
-        assert!(Problem::ForwardingDisabled.remedy().contains("nesbox setup"));
-        assert!(Problem::NoMasquerade(subnet).remedy().contains("nesbox setup"));
+        for problem in [
+            Problem::ForwardingDisabled,
+            Problem::NoMasquerade(subnet),
+            Problem::ForwardingBlocked(subnet),
+        ] {
+            assert!(
+                problem.remedy().contains("nesbox setup"),
+                "{problem:?} should send the reader to setup"
+            );
+            assert!(
+                !problem.remedy().contains("DOCKER"),
+                "{problem:?} should not assume Docker"
+            );
+        }
         assert!(
             Problem::NoMasquerade(subnet)
                 .to_string()
