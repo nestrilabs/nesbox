@@ -23,7 +23,12 @@ const GPU_SHM_BAR: usize = 2;
 const USAGE: &str = "Usage:
   nesbox <config.json>            run a VM
   nesbox setup <config.json>      install the host's egress rules (needs root)
-  nesbox teardown <config.json>   remove them again";
+  nesbox teardown <config.json>   remove them again
+
+Options:
+  -y, --yes    accept every change to the host without asking. Setup explains
+               each command and waits for confirmation otherwise, and refuses
+               to change anything when there is nobody to ask.";
 
 /// Puts the terminal in raw mode so guest console input is unbuffered, and
 /// restores it on drop.
@@ -63,16 +68,21 @@ fn main() -> Result<()> {
     // Set terminal to raw mode so stdin is unbuffered and Ctrl-C passes through
     let _raw = RawMode::enter()?;
 
-    let mut args = std::env::args().skip(1);
-    let first = args.next().context(USAGE)?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--yes` is for install scripts that have already explained themselves;
+    // interactively, every change to the host is asked about first.
+    let assume_yes = args.iter().any(|a| a == "--yes" || a == "-y");
+    let mut positional = args.iter().filter(|a| !a.starts_with('-'));
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let first = positional.next().context(USAGE)?.clone();
     let (command, config_path) = match first.as_str() {
-        "setup" | "teardown" => (first.clone(), args.next().context(USAGE)?),
-        "-h" | "--help" => {
-            println!("{USAGE}");
-            return Ok(());
-        }
+        "setup" | "teardown" => (first.clone(), positional.next().context(USAGE)?.clone()),
         _ => ("run".to_string(), first),
     };
+    let consent = nesbox_vmm::netsetup::Consent::new(assume_yes);
 
     let config_str = std::fs::read_to_string(&config_path).context("Failed to read config")?;
     let config: config::VmConfig =
@@ -87,9 +97,9 @@ fn main() -> Result<()> {
                 .network
                 .as_ref()
                 .context("this config has no `network` section, so there is nothing to set up")?;
-            return nesbox_vmm::netsetup::install(network);
+            return nesbox_vmm::netsetup::install(network, &consent);
         }
-        "teardown" => return nesbox_vmm::netsetup::uninstall(),
+        "teardown" => return nesbox_vmm::netsetup::uninstall(&consent),
         _ => {}
     }
 

@@ -110,6 +110,60 @@ impl std::fmt::Display for Problem {
     }
 }
 
+/// Whether the person running `setup` has agreed to each change to their host.
+///
+/// These commands rewrite firewall rules and kernel settings that everything
+/// else on the machine shares. Someone self-hosting a game server has every
+/// right to see what is about to happen to their network before it does.
+pub struct Consent {
+    assume_yes: bool,
+}
+
+impl Consent {
+    /// `assume_yes` comes from `--yes`, for install scripts that have already
+    /// asked in their own words.
+    pub fn new(assume_yes: bool) -> Self {
+        Self { assume_yes }
+    }
+
+    /// Describe a change and the command that makes it, and wait for an answer.
+    ///
+    /// Refuses rather than assumes when there is nobody to ask: a setup step
+    /// running unattended without `--yes` should stop, not quietly reconfigure
+    /// the host.
+    fn allow(&self, why: &str, command: &str) -> Result<bool> {
+        if self.assume_yes {
+            log::info!("{why}\n  {command}");
+            return Ok(true);
+        }
+        // SAFETY: isatty only inspects the descriptor.
+        if unsafe { libc::isatty(0) } != 1 {
+            bail!(
+                "{why}\n  {command}\n\
+                 Refusing to change the host with nobody to ask — \
+                 re-run with --yes to accept these changes non-interactively"
+            );
+        }
+
+        eprintln!("\n{why}");
+        eprintln!("  {command}");
+        eprint!("Proceed? [Y/n] ");
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("failed to read your answer")?;
+        let answer = answer.trim().to_lowercase();
+        let agreed = answer.is_empty() || answer == "y" || answer == "yes";
+        if !agreed {
+            eprintln!("Skipped.");
+        }
+        Ok(agreed)
+    }
+}
+
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 
 fn forwarding_enabled() -> Result<bool> {
@@ -299,13 +353,14 @@ impl ForwardChain {
 
 /// Allow the subnet through an iptables chain, in one direction. Idempotent:
 /// `-C` asks whether the rule is already there before adding it.
+fn rule_present(chain: &str, direction: &str, subnet: &str) -> Result<bool> {
+    let check = ["-C", chain, direction, subnet, "-j", "ACCEPT"];
+    Ok(iptables(&check)?.status.success())
+}
+
 fn allow_through(chain: &str, direction: &str, subnet: &str) -> Result<bool> {
     let rule = [direction, subnet, "-j", "ACCEPT"];
-    let check: Vec<&str> = std::iter::once("-C")
-        .chain(std::iter::once(chain))
-        .chain(rule.iter().copied())
-        .collect();
-    if iptables(&check)?.status.success() {
+    if rule_present(chain, direction, subnet)? {
         return Ok(false); // already allowed
     }
     let insert: Vec<&str> = std::iter::once("-I")
@@ -383,12 +438,16 @@ pub fn report(network: &Network) {
 }
 
 /// Install the host-side rules. Idempotent: running it again changes nothing.
-pub fn install(network: &Network) -> Result<()> {
+pub fn install(network: &Network, consent: &Consent) -> Result<()> {
     let subnet = Subnet::from_network(network);
 
     if forwarding_enabled()? {
         log::info!("IP forwarding already enabled");
-    } else {
+    } else if consent.allow(
+        "Packets have to be forwarded between interfaces before anything can leave \n\
+         the guest's subnet. This affects the whole host, not just nesbox.",
+        "sysctl -w net.ipv4.ip_forward=1",
+    )? {
         std::fs::write(IP_FORWARD, "1\n").with_context(|| {
             format!("failed to enable IP forwarding — {IP_FORWARD} needs root")
         })?;
@@ -401,7 +460,22 @@ pub fn install(network: &Network) -> Result<()> {
 
     if masquerade_present(&read_ruleset()?, subnet) {
         log::info!("a masquerade rule for {subnet} is already present");
-        return finish(network, subnet);
+        return finish(network, subnet, consent);
+    }
+
+    if !consent.allow(
+        &format!(
+            "The guest's addresses mean nothing outside this host, so its traffic has to\n\
+             leave wearing the host's address instead. This adds an nftables table of\n\
+             nesbox's own and touches no existing rules."
+        ),
+        &format!(
+            "nft add table ip {TABLE} && \\\n  \
+             nft add chain ip {TABLE} postrouting '{{ type nat hook postrouting priority 100 ; }}' && \\\n  \
+             nft add rule ip {TABLE} postrouting ip saddr {subnet} ip daddr != {subnet} masquerade"
+        ),
+    )? {
+        return finish(network, subnet, consent);
     }
 
     // `add table` and `add chain` are no-ops if they already exist, so the
@@ -428,7 +502,7 @@ pub fn install(network: &Network) -> Result<()> {
         "nftables rules do not survive a reboot either; persist them with \
          `nft list table ip {TABLE}` into your distribution's nftables config"
     );
-    finish(network, subnet)
+    finish(network, subnet, consent)
 }
 
 /// Clear anything else standing between the guest and the network, then say
@@ -437,7 +511,7 @@ pub fn install(network: &Network) -> Result<()> {
 /// A self-hoster should not have to know that Docker quietly set the forward
 /// policy to drop, nor that replies need allowing separately from requests. If
 /// we have the privileges to fix it, fix it.
-fn finish(network: &Network, subnet: Subnet) -> Result<()> {
+fn finish(network: &Network, subnet: Subnet, consent: &Consent) -> Result<()> {
     let ruleset = read_ruleset()?;
     if !forwarding_blocked(&ruleset, subnet) {
         log::info!("nothing else is blocking forwarded traffic");
@@ -458,11 +532,40 @@ fn finish(network: &Network, subnet: Subnet) -> Result<()> {
     let subnet = subnet.to_string();
     // Both directions: requests leave with the subnet as source, and replies
     // come back to it once conntrack has undone the masquerade.
+    let already: Vec<&str> = ["-s", "-d"]
+        .into_iter()
+        .filter(|d| rule_present(chain, d, &subnet).unwrap_or(false))
+        .collect();
     for direction in ["-s", "-d"] {
+        if already.contains(&direction) {
+            log::info!("{chain} {direction} {subnet} -j ACCEPT was already there");
+        }
+    }
+    let missing: Vec<&str> = ["-s", "-d"]
+        .into_iter()
+        .filter(|d| !already.contains(d))
+        .collect();
+    if missing.is_empty() {
+        return report_final(network);
+    }
+    let commands = missing
+        .iter()
+        .map(|d| format!("iptables -I {chain} {d} {subnet} -j ACCEPT"))
+        .collect::<Vec<_>>()
+        .join(" && \\\n  ");
+    if !consent.allow(
+        &format!(
+            "A firewall on this host drops forwarded packets by default, which would\n\
+             stop the guest reaching anything. This allows just {subnet} through it.\n\
+             Both directions are needed: replies arrive addressed to the subnet, not from it."
+        ),
+        &commands,
+    )? {
+        return report_final(network);
+    }
+    for direction in missing {
         if allow_through(chain, direction, &subnet)? {
             log::info!("added {chain} {direction} {subnet} -j ACCEPT");
-        } else {
-            log::info!("{chain} {direction} {subnet} -j ACCEPT was already there");
         }
     }
     log::warn!(
@@ -500,7 +603,14 @@ fn run_nft(args: &[&str]) -> Result<()> {
 
 /// Undo what [`install`] added. Leaves IP forwarding alone, since we cannot
 /// know whether anything else on the host now depends on it.
-pub fn uninstall() -> Result<()> {
+pub fn uninstall(consent: &Consent) -> Result<()> {
+    if !consent.allow(
+        "This removes the nftables table nesbox added. Guests will no longer reach\n\
+         the network. Forwarding and any firewall rules are left alone.",
+        &format!("nft delete table ip {TABLE}"),
+    )? {
+        return Ok(());
+    }
     let out = nft(&["delete", "table", "ip", TABLE])?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -526,6 +636,29 @@ mod tests {
             netmask: Ipv4Addr::from(netmask),
             mac: None,
         }
+    }
+
+    #[test]
+    fn yes_mode_agrees_without_asking() {
+        // What an install script gets: the change is logged, not prompted.
+        assert!(
+            Consent::new(true)
+                .allow("because", "some --command")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn without_a_terminal_and_without_yes_it_refuses() {
+        // The test harness has no tty, which is the case being checked: a
+        // setup step running unattended must stop rather than quietly
+        // reconfigure someone's firewall.
+        let err = Consent::new(false)
+            .allow("because", "some --command")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--yes"), "the refusal must say how to proceed");
+        assert!(err.contains("some --command"), "and what it wanted to run");
     }
 
     #[test]

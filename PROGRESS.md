@@ -323,8 +323,15 @@ host firewall. They live behind a separate privileged one-off instead:
 
 ```bash
 sudo ./target/debug/nesbox setup examples/vm.json      # idempotent
+sudo ./target/debug/nesbox setup --yes examples/vm.json  # for install scripts
 sudo ./target/debug/nesbox teardown examples/vm.json   # removes the table
 ```
+
+Every change to the host is explained and confirmed before it happens — these
+are firewall rules and kernel settings the whole machine shares, and somebody
+self-hosting a game server should see what is about to change. `--yes` skips the
+prompts for an install script that has already asked in its own words. With
+neither a terminal nor `--yes`, setup refuses rather than assuming consent.
 
 `setup` enables `ip_forward` and adds a masquerade rule for the guest's subnet
 in its own `ip nesbox` nftables table, so re-running it touches nothing else and
