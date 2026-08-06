@@ -601,6 +601,138 @@ fn run_nft(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Where the boot-time unit goes, if this host uses systemd.
+const UNIT_PATH: &str = "/etc/systemd/system/nesbox-network.service";
+
+fn systemd_available() -> bool {
+    std::path::Path::new("/run/systemd/system").is_dir()
+}
+
+/// Make the host's setup survive a reboot.
+///
+/// Nothing [`install`] does is persistent: `ip_forward` resets, the nftables
+/// table is gone and the iptables rules with it, so a rebooted host silently
+/// loses the guest's network until somebody runs setup again.
+///
+/// Rather than write rules into whichever of three firewall config formats this
+/// distribution happens to use, this installs a unit that re-runs setup at
+/// boot. Setup already checks before it changes anything, so running it again
+/// is safe; and unlike saved rules it repairs itself when Docker is reinstalled
+/// and recreates its chains from scratch.
+pub fn persist(config_path: &std::path::Path, consent: &Consent) -> Result<()> {
+    if !systemd_available() {
+        log::warn!(
+            "this host does not appear to use systemd, so nesbox cannot install a \
+             boot-time unit. Arrange for `nesbox setup --yes {}` to run after the \
+             network and Docker come up.",
+            config_path.display()
+        );
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("cannot find my own path")?;
+    let config = config_path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", config_path.display()))?;
+
+    // The unit refers to both by absolute path, so a config under /tmp or a
+    // binary in a build directory will stop working without warning.
+    for (what, path) in [("binary", &exe), ("config", &config)] {
+        if path.starts_with("/tmp") || path.starts_with("/var/tmp") {
+            log::warn!(
+                "the {what} lives at {} — that will not survive a reboot, and the \
+                 unit will fail on the next boot",
+                path.display()
+            );
+        }
+    }
+    if exe.components().any(|c| c.as_os_str() == "target") {
+        log::warn!(
+            "the unit will point at {}, a build directory. Install nesbox somewhere \
+             stable and re-run with --persist before relying on this.",
+            exe.display()
+        );
+    }
+
+    let unit = unit_text(&exe, &config);
+
+    if !consent.allow(
+        "None of the above survives a reboot. This installs a systemd unit that\n\
+         re-runs setup at boot, after the network and Docker are up, so the guest\n\
+         keeps working across restarts and repairs itself if Docker is reinstalled.",
+        &format!("write {UNIT_PATH} and systemctl enable nesbox-network.service"),
+    )? {
+        return Ok(());
+    }
+
+    std::fs::write(UNIT_PATH, unit)
+        .with_context(|| format!("failed to write {UNIT_PATH} — needs root"))?;
+    log::info!("wrote {UNIT_PATH}");
+
+    run_systemctl(&["daemon-reload"])?;
+    run_systemctl(&["enable", "nesbox-network.service"])?;
+    log::info!("nesbox-network.service is enabled; the host will set itself up at boot");
+    Ok(())
+}
+
+/// Remove the boot-time unit, if it is there.
+pub fn unpersist(consent: &Consent) -> Result<()> {
+    if !std::path::Path::new(UNIT_PATH).exists() {
+        return Ok(());
+    }
+    if !consent.allow(
+        "This removes the unit that reconfigures the host's network at boot.",
+        &format!("systemctl disable nesbox-network.service and remove {UNIT_PATH}"),
+    )? {
+        return Ok(());
+    }
+    let _ = run_systemctl(&["disable", "nesbox-network.service"]);
+    std::fs::remove_file(UNIT_PATH)
+        .with_context(|| format!("failed to remove {UNIT_PATH}"))?;
+    let _ = run_systemctl(&["daemon-reload"]);
+    log::info!("removed {UNIT_PATH}");
+    Ok(())
+}
+
+/// The unit that re-runs setup at boot.
+///
+/// Ordering matters more than it looks: Docker rewrites its own chains when it
+/// starts, so running before it would have the rules quietly removed again.
+fn unit_text(exe: &std::path::Path, config: &std::path::Path) -> String {
+    format!(
+        "[Unit]\n\
+         Description=nesbox guest network prerequisites\n\
+         Wants=network-online.target\n\
+         After=network-online.target\n\
+         After=docker.service\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         ExecStart={} setup --yes {}\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        exe.display(),
+        config.display()
+    )
+}
+
+fn run_systemctl(args: &[&str]) -> Result<()> {
+    let out = Command::new("systemctl")
+        .args(args)
+        .output()
+        .context("failed to run `systemctl`")?;
+    if !out.status.success() {
+        bail!(
+            "systemctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Undo what [`install`] added. Leaves IP forwarding alone, since we cannot
 /// know whether anything else on the host now depends on it.
 pub fn uninstall(consent: &Consent) -> Result<()> {
@@ -636,6 +768,33 @@ mod tests {
             netmask: Ipv4Addr::from(netmask),
             mac: None,
         }
+    }
+
+    #[test]
+    fn the_boot_unit_runs_after_docker() {
+        // Docker rewrites its chains on start. A unit ordered before it would
+        // have its rules removed again, and the failure would only appear on
+        // the next reboot.
+        let unit = unit_text(
+            std::path::Path::new("/usr/bin/nesbox"),
+            std::path::Path::new("/etc/nesbox/vm.json"),
+        );
+        assert!(unit.contains("After=docker.service"));
+        assert!(unit.contains("After=network-online.target"));
+    }
+
+    #[test]
+    fn the_boot_unit_is_non_interactive_and_absolute() {
+        let unit = unit_text(
+            std::path::Path::new("/usr/bin/nesbox"),
+            std::path::Path::new("/etc/nesbox/vm.json"),
+        );
+        // Nothing can answer a prompt at boot.
+        assert!(unit.contains("ExecStart=/usr/bin/nesbox setup --yes /etc/nesbox/vm.json"));
+        // oneshot without RemainAfterExit would show as failed once it exits.
+        assert!(unit.contains("Type=oneshot"));
+        assert!(unit.contains("RemainAfterExit=yes"));
+        assert!(unit.contains("WantedBy=multi-user.target"));
     }
 
     #[test]

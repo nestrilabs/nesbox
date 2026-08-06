@@ -28,7 +28,9 @@ const USAGE: &str = "Usage:
 Options:
   -y, --yes    accept every change to the host without asking. Setup explains
                each command and waits for confirmation otherwise, and refuses
-               to change anything when there is nobody to ask.";
+               to change anything when there is nobody to ask.
+      --persist  also install a systemd unit so the host sets itself up at
+               boot. Without it, nothing setup does survives a reboot.";
 
 /// Puts the terminal in raw mode so guest console input is unbuffered, and
 /// restores it on drop.
@@ -69,6 +71,7 @@ fn main() -> Result<()> {
     // `--yes` is for install scripts that have already explained themselves;
     // interactively, every change to the host is asked about first.
     let assume_yes = args.iter().any(|a| a == "--yes" || a == "-y");
+    let persist = args.iter().any(|a| a == "--persist");
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}");
@@ -94,9 +97,24 @@ fn main() -> Result<()> {
                 .network
                 .as_ref()
                 .context("this config has no `network` section, so there is nothing to set up")?;
-            return nesbox_vmm::netsetup::install(network, &consent);
+            nesbox_vmm::netsetup::install(network, &consent)?;
+            if persist {
+                nesbox_vmm::netsetup::persist(
+                    std::path::Path::new(&config_path),
+                    &consent,
+                )?;
+            } else {
+                log::warn!(
+                    "none of this survives a reboot — re-run with --persist to have \
+                     the host set itself up at boot"
+                );
+            }
+            return Ok(());
         }
-        "teardown" => return nesbox_vmm::netsetup::uninstall(&consent),
+        "teardown" => {
+            nesbox_vmm::netsetup::unpersist(&consent)?;
+            return nesbox_vmm::netsetup::uninstall(&consent);
+        }
         _ => {}
     }
 

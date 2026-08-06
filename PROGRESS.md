@@ -216,11 +216,9 @@ Do not re-derive these.
   dropping forward chain, asked, added both `DOCKER-USER` rules itself and
   reported the host ready. Declining leaves the host untouched and exits
   non-zero.
-- **Nothing setup writes survives a reboot.** `ip_forward`, the nftables table
-  and the iptables rules all vanish, and the guest silently loses the network
-  until someone runs setup again. The preflight will say why, which is better
-  than nothing, but a `--persist` that writes `/etc/sysctl.d` and the
-  distribution's nftables config is the missing half.
+- **`--persist` has never been run.** The unit it writes is unit-tested for
+  content and ordering, but installing it needs root and no host has rebooted
+  with it in place.
 - **passt versus tap is not settled.** The nessh side raised a risk worth more
   than the CPU argument: iroh's hole punching is developed against conntrack,
   and passt is a second NAT with its own mapping semantics. If direct
@@ -303,7 +301,7 @@ Vulkan is what Proton uses, so this has not been chased.
 
 ## 8. Suggested order
 
-1. Decide where the host's NAT rules live (§9), so egress actually works.
+1. Verify `--persist` survives an actual reboot (§9).
 2. `virtio-blk` is synchronous on the vCPU thread; it will need a worker
    under game load.
 3. Reduce the dead code the GPU port brought with it — `cargo build` names
@@ -336,10 +334,24 @@ giving it `CAP_NET_ADMIN` would turn a compromise of it into a compromise of the
 host firewall. They live behind a separate privileged one-off instead:
 
 ```bash
-sudo ./target/debug/nesbox setup examples/vm.json      # idempotent
-sudo ./target/debug/nesbox setup --yes examples/vm.json  # for install scripts
-sudo ./target/debug/nesbox teardown examples/vm.json   # removes the table
+sudo ./target/debug/nesbox setup examples/vm.json            # idempotent
+sudo ./target/debug/nesbox setup --persist examples/vm.json  # ...and at boot
+sudo ./target/debug/nesbox setup --yes examples/vm.json      # for install scripts
+sudo ./target/debug/nesbox teardown examples/vm.json         # undoes both
 ```
+
+**Nothing setup changes survives a reboot** — `ip_forward` resets, the nftables
+table goes, the iptables rules with it. `--persist` installs a systemd unit that
+re-runs `setup --yes` at boot instead of writing rules into whichever of three
+firewall config formats the distribution uses. Setup is already idempotent, so
+re-running it is safe, and unlike saved rules it repairs itself when Docker is
+reinstalled and recreates its chains. The unit is ordered `After=docker.service`
+for exactly that reason; running before Docker would have the rules removed
+again, and the failure would only show at the next boot.
+
+Without systemd, `--persist` says what to arrange instead rather than pretending.
+It also warns when the binary or config sits somewhere a reboot will invalidate,
+such as a `target/` build directory.
 
 Every change to the host is explained and confirmed before it happens — these
 are firewall rules and kernel settings the whole machine shares, and somebody
