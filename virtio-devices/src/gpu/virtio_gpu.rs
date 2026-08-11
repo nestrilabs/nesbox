@@ -11,8 +11,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
-    RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW,
-    RUTABAGA_MAP_ACCESS_WRITE, RUTABAGA_PATH_TYPE_GPU, RutabagaComponentType, RutabagaPath,
+    RUTABAGA_PATH_TYPE_GPU, RutabagaComponentType, RutabagaPath,
 };
 use rutabaga_gfx::{
     RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder,
@@ -29,7 +28,7 @@ use super::protocol::{
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_MAX_SCANOUTS,
     VirtioGpuResult,
 };
-use super::{GpuError, GpuQueues, Result, VirtioShmRegion};
+use super::{GpuError, GpuQueues, HostMemoryMapper, Result, VirtioShmRegion};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -140,6 +139,9 @@ struct VirtioGpuScanout {
 
 pub struct VirtioGpu {
     rutabaga: Rutabaga,
+    /// Gives the guest direct access to memory we hold, used to publish mapped
+    /// blob resources into the host-visible window.
+    mapper: Arc<dyn HostMemoryMapper>,
     resources: BTreeMap<u32, VirtioGpuResource>,
     fence_state: Arc<Mutex<FenceState>>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
@@ -303,6 +305,7 @@ impl VirtioGpu {
         signal: Arc<dyn GpuQueues>,
         displays: Box<[DisplayInfo]>,
         gpu_device_path: PathBuf,
+        mapper: Arc<dyn HostMemoryMapper>,
     ) -> Option<Self> {
         let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(FenceState::default()));
 
@@ -323,6 +326,7 @@ impl VirtioGpu {
 
         Some(Self {
             rutabaga,
+            mapper,
             resources: Default::default(),
             fence_state,
             scanouts: Default::default(),
@@ -703,107 +707,67 @@ impl VirtioGpu {
             .resources
             .get(&resource_id)
             .ok_or_else(|| {
-                log::error!("NESBOX_GPU: map_blob: resource {} not found", resource_id);
+                log::error!("NESBOX_GPU: map_blob: resource {resource_id} not found");
                 ErrInvalidResourceId
             })?
             .size;
 
         let map_info = self.rutabaga.map_info(resource_id).map_err(|e| {
-            log::error!("NESBOX_GPU: map_blob: map_info failed: {:?}", e);
+            log::error!("NESBOX_GPU: map_blob: map_info failed: {e:?}");
             ErrUnspec
         })?;
 
-        if offset + res_size > shm_region.size as u64 {
+        if offset.saturating_add(res_size) > shm_region.size as u64 {
             log::error!(
-                "NESBOX_GPU: map_blob: overflow offset={} + size={} > shm={}",
-                offset,
-                res_size,
+                "NESBOX_GPU: map_blob: {res_size:#x} bytes at offset {offset:#x} does not \
+                 fit the {:#x}-byte window",
                 shm_region.size
             );
             return Err(ErrUnspec);
         }
 
-        let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
-            RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
-            RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
-            RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
-            _ => {
-                log::error!(
-                    "NESBOX_GPU: map_blob: unexpected access mode 0x{:x}",
-                    map_info
-                );
-                return Err(ErrUnspec);
-            }
-        };
+        // Ask virglrenderer to map the resource into our address space, then
+        // hand that mapping to the guest as memory it can address directly.
+        //
+        // The obvious alternative — export the resource as a dmabuf and map the
+        // fd — cannot work on amdgpu. RADV creates buffers with
+        // AMDGPU_GEM_CREATE_VM_ALWAYS_VALID, and `amdgpu_gem_prime_export`
+        // refuses those with EPERM unconditionally. No capability changes that,
+        // so it is not a fallback worth keeping.
+        let mapping = self.rutabaga.map(resource_id).map_err(|e| {
+            log::error!("NESBOX_GPU: map_blob: resource {resource_id} would not map: {e:?}");
+            ErrUnspec
+        })?;
 
-        let addr = shm_region.host_addr + offset;
-
-        // `map_placed` asks virglrenderer to map the resource straight at our
-        // address, but it is compiled out of rutabaga unless the unstable
-        // `virgl_renderer_resource_map_fixed` API is enabled, so in practice it
-        // always reports Unsupported. Exporting the blob and mapping it
-        // ourselves is the supported route and costs about 10us per resource,
-        // once — measured, not assumed. Try the direct path anyway in case a
-        // future rutabaga offers it.
-        if self.rutabaga.map_placed(resource_id, addr).is_err() {
-            self.map_blob_via_export(resource_id, addr, res_size, prot)?;
+        if mapping.size < res_size {
+            log::error!(
+                "NESBOX_GPU: map_blob: resource {resource_id} mapped {:#x} bytes, \
+                 short of the {res_size:#x} the guest expects",
+                mapping.size
+            );
+            let _ = self.rutabaga.unmap(resource_id);
+            return Err(ErrUnspec);
         }
 
-        // Re-borrow after all &mut self calls are done
+        let guest_addr = shm_region.guest_addr + offset;
+        if let Err(err) = self.mapper.map(guest_addr, mapping.ptr, mapping.size) {
+            log::error!(
+                "NESBOX_GPU: map_blob: could not publish {:#x} bytes at guest {guest_addr:#x}: {err:#}",
+                mapping.size
+            );
+            let _ = self.rutabaga.unmap(resource_id);
+            return Err(ErrUnspec);
+        }
+
         let resource = self
             .resources
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
         resource.shmem_offset = Some(offset);
+        resource.rutabaga_external_mapping = true;
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
         })
-    }
-
-    #[cfg(target_os = "linux")]
-    fn map_blob_via_export(
-        &mut self,
-        resource_id: u32,
-        addr: u64,
-        size: u64,
-        prot: i32,
-    ) -> VirtioGpuResult {
-        use std::os::fd::AsRawFd;
-
-        let export = self.rutabaga.export_blob(resource_id).map_err(|e| {
-            log::error!("NESBOX_GPU: map_blob: export_blob also failed: {:?}", e);
-            ErrUnspec
-        })?;
-
-        let handle = export.as_mesa_handle().ok_or_else(|| {
-            log::error!(
-                "NESBOX_GPU: map_blob: resource {resource_id} exported a handle we cannot mmap"
-            );
-            ErrUnspec
-        })?;
-
-        // SAFETY: mapping the exported buffer over our own PROT_NONE
-        // reservation, which we own and which is at least `size` bytes here —
-        // resource_map_blob checked that before calling.
-        let ret = unsafe {
-            use std::os::fd::AsFd;
-
-            libc::mmap(
-                addr as *mut libc::c_void,
-                size as usize,
-                prot,
-                libc::MAP_SHARED | libc::MAP_FIXED,
-                handle.os_handle.as_fd().as_raw_fd(),
-                0,
-            )
-        };
-        if ret == libc::MAP_FAILED {
-            let errno = std::io::Error::last_os_error();
-            log::error!("NESBOX_GPU: map_blob: fallback mmap failed: {}", errno);
-            return Err(ErrUnspec);
-        }
-
-        Ok(OkNoData)
     }
 
     #[cfg(target_os = "linux")]
@@ -816,32 +780,32 @@ impl VirtioGpu {
             .resources
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
-
         let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
-        let addr = shm_region.host_addr + shmem_offset;
+        let size = resource.size;
+        let external = resource.rutabaga_external_mapping;
+        let guest_addr = shm_region.guest_addr + shmem_offset;
 
-        // SAFETY: Replacing the mapping with PROT_NONE / MAP_ANONYMOUS.
-        let ret = unsafe {
-            libc::mmap(
-                addr as *mut libc::c_void,
-                resource.size as usize,
-                libc::PROT_NONE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
-                -1,
-                0,
-            )
-        };
-        if ret == libc::MAP_FAILED {
-            // Nothing here justifies taking the VM down: the guest asked to
-            // unmap one resource and we could not, so tell it so and carry on.
+        // Take it away from the guest first: virglrenderer's mapping must not
+        // be released while the guest can still reach it.
+        if let Err(err) = self.mapper.unmap(guest_addr, size) {
+            // Not worth ending the VM over one resource.
             log::error!(
-                "virtio-gpu: failed to unmap resource {resource_id} at {addr:#x}: {}",
-                std::io::Error::last_os_error()
+                "NESBOX_GPU: unmap_blob: resource {resource_id} at {guest_addr:#x}: {err:#}"
             );
             return Err(ErrUnspec);
         }
+        if external {
+            if let Err(e) = self.rutabaga.unmap(resource_id) {
+                log::warn!("NESBOX_GPU: unmap_blob: virglrenderer kept resource {resource_id} mapped: {e:?}");
+            }
+        }
 
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
         resource.shmem_offset = None;
+        resource.rutabaga_external_mapping = false;
         Ok(OkNoData)
     }
 }

@@ -43,8 +43,11 @@ const SHM_BAR: usize = 2;
 /// the capability under that id discards it without a word.
 const VIRTIO_GPU_SHM_ID_HOST_VISIBLE: u8 = 1;
 
-/// Size of the host-visible window. Large enough for the blob resources a game
-/// will map, and cheap until touched: the backing mapping is demand-paged.
+/// Size of the host-visible window, as advertised to the guest through BAR2.
+///
+/// Nothing on the host is reserved for it. The guest allocates offsets within
+/// the window itself, and each mapped resource becomes its own memory slot
+/// pointing at virglrenderer's mapping of that resource.
 const SHM_SIZE: u64 = 8 << 30; // 8 GiB
 
 /// Features we offer. `VIRTIO_GPU_F_VIRGL` is what makes this a 3D device;
@@ -63,44 +66,6 @@ pub struct GpuConfig {
     pub render_node: PathBuf,
     /// Virtual displays to advertise.
     pub displays: Vec<DisplayInfo>,
-}
-
-/// A host mapping big enough for every blob the guest asks us to share.
-///
-/// Reserved with `PROT_NONE` so nothing is committed until rutabaga maps a
-/// resource over part of it; unmapped when the device goes away.
-struct ShmWindow {
-    host_addr: u64,
-    size: u64,
-}
-
-impl ShmWindow {
-    fn reserve(size: u64) -> Result<Self> {
-        // SAFETY: a fresh anonymous reservation; the kernel picks the address
-        // and the return value is checked.
-        let addr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size as usize,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if addr == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to reserve the GPU shared memory window");
-        }
-        Ok(Self { host_addr: addr as u64, size })
-    }
-}
-
-impl Drop for ShmWindow {
-    fn drop(&mut self) {
-        // SAFETY: we own this reservation and nothing refers to it after this.
-        unsafe { libc::munmap(self.host_addr as *mut libc::c_void, self.size as usize) };
-    }
 }
 
 /// The queue state and interrupt plumbing the worker and the fence handler
@@ -151,7 +116,6 @@ struct Inner {
     num_capsets: Arc<AtomicU32>,
     displays: Box<[DisplayInfo]>,
     render_node: PathBuf,
-    shm: Arc<ShmWindow>,
     shm_guest_addr: u64,
     mapper: Option<Arc<dyn HostMemoryMapper>>,
     queues: Arc<Queues>,
@@ -178,12 +142,12 @@ impl Inner {
             "the shared window has no guest address; BAR2 was never reported"
         );
 
-        // Publish the shared window to the guest before any blob is mapped
-        // into it, so the addresses rutabaga hands out are already live.
-        mapper
-            .map(self.shm_guest_addr, self.shm.host_addr, self.shm.size)
-            .context("failed to register the GPU shared memory window")?;
-
+        // Deliberately *not* registering the whole window here. Each blob is
+        // published as its own memory slot when the guest asks for it to be
+        // mapped, backed by virglrenderer's own mapping of that resource; a
+        // slot covering the whole window would overlap those and KVM refuses
+        // overlapping slots. Guest reads of unmapped parts of the window come
+        // back to us as ordinary MMIO and read as zero.
         // Hand the control queue to the worker's view of the world.
         *self.queues.ctl.lock().unwrap() = self.pending[CTL_INDEX].clone();
 
@@ -193,20 +157,19 @@ impl Inner {
             (*self.queues.mem).clone(),
             self.queues.clone(),
             VirtioShmRegion {
-                host_addr: self.shm.host_addr,
                 guest_addr: self.shm_guest_addr,
-                size: self.shm.size as usize,
+                size: SHM_SIZE as usize,
             },
             self.displays.clone(),
             self.num_capsets.clone(),
             self.render_node.clone(),
+            mapper,
         );
         worker.run();
         self.notify = Some(tx);
         self.running = true;
         log::info!(
-            "virtio-gpu: worker started, shared window {:#x} bytes at guest {:#x}",
-            self.shm.size,
+            "virtio-gpu: worker started, shared window {SHM_SIZE:#x} bytes at guest {:#x}",
             self.shm_guest_addr
         );
         Ok(())
@@ -214,13 +177,9 @@ impl Inner {
 
     fn reset(&mut self) {
         if self.running {
-            // Dropping the sender ends the worker's loop.
+            // Dropping the sender ends the worker's loop, which drops rutabaga
+            // and with it every resource mapping it published.
             self.notify = None;
-            if let Some(mapper) = &self.mapper {
-                if let Err(err) = mapper.unmap(self.shm_guest_addr, self.shm.size) {
-                    log::warn!("failed to unmap the GPU shared window: {err:#}");
-                }
-            }
             self.running = false;
         }
         self.pending = new_queues();
@@ -278,7 +237,6 @@ impl GpuDevice {
         let displays: Box<[DisplayInfo]> = config.displays.clone().into_boxed_slice();
         anyhow::ensure!(!displays.is_empty(), "the GPU needs at least one display");
 
-        let shm = Arc::new(ShmWindow::reserve(SHM_SIZE)?);
         let queues = Arc::new(Queues {
             mem: mem.clone(),
             ctl: Mutex::new(QState { size: QUEUE_SIZE, ..Default::default() }),
@@ -301,7 +259,6 @@ impl GpuDevice {
                 num_capsets: Arc::new(AtomicU32::new(1)),
                 displays,
                 render_node: config.render_node.clone(),
-                shm,
                 // Filled in by `set_shm_guest_addr` once the bus has placed
                 // BAR2; the device cannot be activated before that.
                 shm_guest_addr: 0,

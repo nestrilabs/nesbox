@@ -24,7 +24,7 @@ use vm_memory::GuestAddress;
 
 use vm_memory::GuestMemoryMmap;
 
-use super::{CTL_INDEX, GpuQueues};
+use super::{CTL_INDEX, GpuQueues, HostMemoryMapper};
 use super::descriptor_utils::{Reader, Writer};
 use super::display::DisplayInfo;
 use super::display::Rect;
@@ -50,6 +50,7 @@ pub struct Worker {
     displays: Box<[DisplayInfo]>,
     pub num_capsets: Arc<AtomicU32>,
     gpu_device_path: PathBuf,
+    mapper: Arc<dyn HostMemoryMapper>,
 }
 
 impl Worker {
@@ -62,6 +63,7 @@ impl Worker {
         displays: Box<[DisplayInfo]>,
         num_capsets: Arc<std::sync::atomic::AtomicU32>,
         gpu_device_path: PathBuf,
+        mapper: Arc<dyn HostMemoryMapper>,
     ) -> Self {
         Worker {
             receiver,
@@ -71,6 +73,7 @@ impl Worker {
             displays,
             num_capsets,
             gpu_device_path,
+            mapper,
         }
     }
 
@@ -92,6 +95,7 @@ impl Worker {
             self.queues.clone(),
             self.displays.clone(),
             self.gpu_device_path.clone(),
+            self.mapper.clone(),
         ) else {
             log::error!(
                 "virtio-gpu: backend failed to initialise; the device will accept \

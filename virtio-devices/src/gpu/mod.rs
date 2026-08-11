@@ -61,11 +61,9 @@ pub mod uapi {
 /// through a virtio shared-memory capability pointing at a BAR.
 #[derive(Clone, Debug)]
 pub struct VirtioShmRegion {
-    /// Host virtual address of the beginning of the SHM window.
-    pub host_addr: u64,
-    /// Guest physical address of the beginning of the SHM window.
+    /// Guest physical address of the beginning of the window.
     pub guest_addr: u64,
-    /// Byte length of the SHM window.
+    /// Byte length of the window.
     pub size: usize,
 }
 

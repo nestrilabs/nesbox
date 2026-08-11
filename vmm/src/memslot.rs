@@ -18,6 +18,14 @@ pub struct MemorySlots {
     next_slot: AtomicU32,
     /// Slot number for each guest address we have mapped, so it can be undone.
     mapped: Mutex<HashMap<u64, u32>>,
+    /// Slot numbers freed by an unmap, waiting to be used again.
+    ///
+    /// KVM allows a few hundred slots per VM and numbers them, so handing out a
+    /// fresh number for every mapping runs out. The GPU maps and unmaps a blob
+    /// per resource — Vulkan initialisation alone does this dozens of times —
+    /// so without recycling a long session would stop being able to map
+    /// anything at all.
+    free: Mutex<Vec<u32>>,
 }
 
 impl MemorySlots {
@@ -27,6 +35,7 @@ impl MemorySlots {
             vm_fd,
             next_slot: AtomicU32::new(first_free_slot),
             mapped: Mutex::new(HashMap::new()),
+            free: Mutex::new(Vec::new()),
         })
     }
 
@@ -55,8 +64,15 @@ impl virtio_devices::gpu::HostMemoryMapper for MemorySlots {
             !mapped.contains_key(&guest_addr),
             "guest address {guest_addr:#x} is already mapped"
         );
-        let slot = self.next_slot.fetch_add(1, Ordering::SeqCst);
-        self.set_region(slot, guest_addr, host_addr, size)?;
+        let slot = match self.free.lock().unwrap().pop() {
+            Some(recycled) => recycled,
+            None => self.next_slot.fetch_add(1, Ordering::SeqCst),
+        };
+        self.set_region(slot, guest_addr, host_addr, size).map_err(|err| {
+            // Give the number back; nothing was registered under it.
+            self.free.lock().unwrap().push(slot);
+            err
+        })?;
         mapped.insert(guest_addr, slot);
         log::debug!(
             "memory slot {slot}: guest {guest_addr:#x} <- host {host_addr:#x}, {size:#x} bytes"
@@ -73,6 +89,8 @@ impl virtio_devices::gpu::HostMemoryMapper for MemorySlots {
             .with_context(|| format!("guest address {guest_addr:#x} was not mapped"))?;
         // A zero-sized region deletes the slot. The host mapping itself stays
         // ours to free.
-        self.set_region(slot, guest_addr, 0, 0)
+        self.set_region(slot, guest_addr, 0, 0)?;
+        self.free.lock().unwrap().push(slot);
+        Ok(())
     }
 }

@@ -218,6 +218,17 @@ Do not re-derive these.
   the BAR, saying nothing about why. This machine reports 39 bits, so a window
   at 1 TiB vanished; `vm.rs` reads the width from CPUID and places it at the top
   of what is addressable.
+- **amdgpu cannot export RADV's buffers as dmabufs, ever.**
+  `amdgpu_gem_prime_export` returns `EPERM` for any BO carrying
+  `AMDGPU_GEM_CREATE_VM_ALWAYS_VALID`, which is how RADV allocates most of them,
+  and no capability or privilege changes that. The first version of `map_blob`
+  exported a dmabuf and mapped the fd; it worked on Intel and could never have
+  worked on AMD. Resources are now published through
+  `virgl_renderer_resource_map` and a per-resource memory slot instead.
+- **KVM numbers memory slots and the numbers must be recycled.** Deleting a slot
+  frees the region but not the number. The GPU maps and unmaps a blob per
+  resource — Vulkan initialisation alone did 27 — so handing out a fresh number
+  each time climbs until the VM can map nothing more.
 - **`VIRTIO_GPU_SHM_ID_HOST_VISIBLE` is 1, not 0.** Zero is
   `VIRTIO_GPU_SHM_ID_UNDEFINED`. A guest that finds the shared-memory
   capability under id 0 rejects it silently, and the only symptom is
@@ -251,7 +262,11 @@ Do not re-derive these.
   connections degrade, sessions fall back to relays and everything keeps working
   slightly worse forever, which is the hardest kind of failure to notice. Test
   hole punching against a real peer before switching.
-- **The GPU has never rendered.** §7.
+- **The GPU has never rendered, and the AMD path is unverified.** Nothing has
+  drawn a frame: there is no compositor in the test rootfs. The blob mapping
+  rewrite that makes AMD possible was developed on an Intel host and only
+  verified there — 27 mappings, no failures, GPU still enumerated. Whether
+  `vkcube` now runs on the AMD box is untested.
 - No API socket, no jailer, no seccomp, no snapshots, no CPU pinning. All were
   in the Firecracker fork; none exist here.
 - `virtio-blk` serves requests on a worker thread, but serially and with
@@ -313,15 +328,9 @@ Vulkan is what Proton uses, so this has not been chased.
 
 ### Still rough
 
-- `map_blob` always takes the `export_blob` route, and that is correct rather
-  than a fault: rutabaga's `map_placed` is compiled out unless the unstable
-  `virgl_renderer_resource_map_fixed` API is enabled, so it returns
-  `Unsupported` unconditionally. Exporting the blob and mapping it ourselves is
-  the supported path and what crosvm does. Measured at **~10.7us per mapping**
-  across 26 of 27 mappings during Vulkan init, plus one 9.4ms first-touch
-  outlier on a 4 KiB buffer. It is a per-resource setup cost, not per frame —
-  once mapped, the guest reaches the memory through the KVM slot without
-  trapping. Not worth optimising.
+- `map_blob` publishes each resource as **its own KVM memory slot**, backed by
+  the pointer `virgl_renderer_resource_map` returns. There is no host-side
+  reservation and no `MAP_FIXED` any more.
 - The guest logs `*ERROR* response 0x1200 (command 0x200)` once at startup.
   That is Mesa probing for a context with no capset before retrying with capset
   6, which succeeds. Harmless, and expected given only `RUTABAGA_CAPSET_DRM` is
