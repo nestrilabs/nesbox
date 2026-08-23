@@ -173,8 +173,9 @@ mod machine_config_tests {
     use super::*;
 
     /// Every config written before `cpu_affinity` existed must still parse, and
-    /// must mean "no affinity" rather than "no CPUs". nessh emits this exact
-    /// shape today.
+    /// must mean "no affinity" rather than "no CPUs" — a hand-written config
+    /// used to debug a box is the common case. nessh itself now always emits
+    /// the field, empty where the host's cache topology could not be read.
     #[test]
     fn a_config_without_cpu_affinity_still_parses() {
         let json = r#"{ "vcpu_count": 4, "mem_size_mib": 8192 }"#;
