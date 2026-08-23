@@ -141,10 +141,16 @@ impl Vm {
                 .create_vcpu(cpu_id.into())
                 .with_context(|| format!("Failed to create vCPU {}", cpu_id))?;
 
-            // Set CPUID (use KVM supported cpuid)
-            let cpuid = kvm
+            // KVM's supported CPUID describes the *host* processor, so the
+            // topology leaves in it are the host's: a 7-vCPU guest on a
+            // 16-core box would read a package of 16 cores and 32 threads and
+            // build its scheduling domains from sibling relationships that do
+            // not exist. Rewritten per vCPU -- the x2APIC id differs.
+            let mut cpuid = kvm
                 .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
                 .context("Failed to get supported CPUID")?;
+            let vendor = crate::cpuid::vendor_of(&cpuid);
+            crate::cpuid::patch_topology(&mut cpuid, u32::from(cpu_id), vcpu_count, vendor);
             vcpu_fd.set_cpuid2(&cpuid).context("Failed to set CPUID")?;
 
             // Only the bootstrap processor starts executing the kernel. The
