@@ -87,6 +87,27 @@ impl Tap {
     /// `name` must be exact. `%d` is gone with creation: letting the kernel
     /// pick a name is only possible when creating the device, and creating is
     /// what needed the privilege.
+    /// # A persistent tap can have more than one opener
+    ///
+    /// `TUNSETIFF` on a name that already exists attaches to it; it does not
+    /// fail because somebody else is attached. So a VM relaunched before the
+    /// previous process has exited can end up as the *second* opener of the
+    /// same tap, and the kernel steers frames between the queues rather than to
+    /// the one that wants them.
+    ///
+    /// **Observed once and not reproduced since**: a guest relaunched
+    /// immediately after being stopped came up with working configuration and
+    /// no traffic, and the same launch worked when it was not rushed. The
+    /// explanation above fits and is unconfirmed — nothing here has been
+    /// changed on the strength of it.
+    ///
+    /// If it recurs, the check that settles it is `lsof /dev/net/tun` between
+    /// the stop and the start: a nesbox process still listed there is the
+    /// stale opener. The fix would be to close the tap explicitly on teardown
+    /// rather than leaving it to process exit, and for the caller to wait for
+    /// the previous process to be reaped before reusing its slot. Until then,
+    /// leaving 5-10 seconds between stopping a VM and starting it again avoids
+    /// the window entirely.
     pub fn open(name: &str) -> Result<Self> {
         if !std::path::Path::new(&format!("/sys/class/net/{name}")).exists() {
             bail!(
