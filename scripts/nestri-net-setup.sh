@@ -43,7 +43,19 @@ confirm() {
 # somebody sharing their gaming machine has a right to see what is about to
 # happen to their network.
 run() {
-    printf '  %s%s%s\n' "$DIM" "$*" "$RESET"
+    # Quoted when it needs to be, because what this prints is meant to be
+    # pasteable. `$*` turned `nmcli con modify "Wired connection 1" ...` into
+    # four bare words -- a line that ran correctly here and fails for anyone who
+    # copies it, which is the worst of both.
+    local shown="" arg
+    for arg in "$@"; do
+        if [[ "$arg" =~ ^[A-Za-z0-9_./:=@%^+-]+$ ]]; then
+            shown+="${arg} "
+        else
+            shown+="'${arg//\'/\'\\\'\'}' "
+        fi
+    done
+    printf '  %s%s%s\n' "$DIM" "${shown% }" "$RESET"
     if [[ "${DRY_RUN:-}" == 1 ]]; then return 0; fi
     "$@"
 }
