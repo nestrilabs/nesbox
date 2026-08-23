@@ -1,6 +1,5 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -54,28 +53,12 @@ pub struct Network {
     /// Tap interface to create. `%d` is filled in by the kernel with the
     /// lowest free number, which is what you want when several VMs run at
     /// once.
-    #[serde(default = "default_tap_name")]
+    /// Tap to open. Exact: the host created it, so nesbox is not choosing.
     pub tap_name: String,
-    /// Address for the host end of the tap. The guest is expected to take
-    /// another address on the same subnet and route through this one.
-    #[serde(default = "default_host_ip")]
-    pub host_ip: Ipv4Addr,
-    #[serde(default = "default_netmask")]
-    pub netmask: Ipv4Addr,
-    /// Guest MAC, as `aa:bb:cc:dd:ee:ff`. Generated if absent.
-    #[serde(default)]
+    /// Guest MAC. Generated if absent, though nessh always supplies one.
     pub mac: Option<String>,
 }
 
-fn default_tap_name() -> String {
-    "nesbox%d".to_string()
-}
-fn default_host_ip() -> Ipv4Addr {
-    Ipv4Addr::new(172, 30, 0, 1)
-}
-fn default_netmask() -> Ipv4Addr {
-    Ipv4Addr::new(255, 255, 255, 0)
-}
 
 impl Network {
     /// Parse the configured MAC, if there is one.
@@ -215,5 +198,62 @@ mod machine_config_tests {
         let back: MachineConfig =
             serde_json::from_str(&serde_json::to_string(&mc).expect("serialises")).expect("parses");
         assert_eq!(back.cpu_affinity, mc.cpu_affinity);
+    }
+}
+
+#[cfg(test)]
+mod whole_config_tests {
+    use super::*;
+
+    /// A complete config of the shape used to test a box by hand.
+    ///
+    /// Here because the fields are spread across several structs with mixed
+    /// casing, and "does my config still parse" is otherwise only answerable
+    /// by starting a VM.
+    const HAND_WRITTEN: &str = r#"{
+      "boot-source": {
+        "kernel_image_path": "/mnt/INSTANCES/DEV/vmlinux",
+        "boot_args": "console=hvc0 root=/dev/vda ro nestri.ip=192.168.128.11/24 nestri.gw=192.168.128.1"
+      },
+      "drives": [
+        { "drive_id": "rootfs", "path_on_host": "/mnt/INSTANCES/DEV/testrootfs.ext4",
+          "is_root_device": true, "is_read_only": true }
+      ],
+      "machine-config": {
+        "vcpu_count": 8, "mem_size_mib": 8192, "cpu_affinity": [0,1,2,3]
+      },
+      "gpu": { "render-node": "/dev/dri/renderD128", "width": 1920, "height": 1080 },
+      "network": { "tap-name": "nesbox0", "mac": "02:00:00:00:00:01" },
+      "shared-directories": [
+        { "tag": "install", "path-on-host": "/mnt/GAMEDRIVE/nes/632360", "read-only": true },
+        { "tag": "user", "path-on-host": "/mnt/INSTANCES/users/usr_x", "read-only": false }
+      ]
+    }"#;
+
+    #[test]
+    fn a_hand_written_config_parses() {
+        let config: VmConfig = serde_json::from_str(HAND_WRITTEN).expect("parses");
+        let net = config.network.as_ref().expect("has a network");
+        assert_eq!(net.tap_name, "nesbox0");
+        assert_eq!(config.machine_config.cpu_affinity, vec![0, 1, 2, 3]);
+        assert_eq!(config.machine_config.vcpu_count, 8);
+    }
+
+    /// The network section is down to what nesbox can act on by itself.
+    /// Addresses, netmasks and bridges were host administration wearing a VM
+    /// config's clothes, and they are the setup script's now.
+    #[test]
+    fn the_network_section_is_only_a_tap_and_a_mac() {
+        let net: Network =
+            serde_json::from_str(r#"{ "tap-name": "nesbox1" }"#).expect("parses");
+        assert_eq!(net.tap_name, "nesbox1");
+        assert!(net.mac.is_none());
+    }
+
+    /// An exact name, because the host made the device. `%d` only ever worked
+    /// when nesbox was the one creating it.
+    #[test]
+    fn a_tap_name_is_required() {
+        assert!(serde_json::from_str::<Network>(r#"{ "mac": "02:00:00:00:00:01" }"#).is_err());
     }
 }

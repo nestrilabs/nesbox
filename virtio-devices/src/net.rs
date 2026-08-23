@@ -13,7 +13,6 @@ use crate::tap::{TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, TUN_F_TSO_ECN, TUN_F_UFO, T
 use anyhow::{Context, Result};
 use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
 use pci::{MsiRouter, MsiVector, PciDevice};
-use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use vhost::net::VhostNet;
 use vhost::vhost_kern::net::Net as VhostNetBackend;
@@ -57,11 +56,9 @@ const CONFIG_SIZE: u32 = 6;
 /// How to set up the guest's network link.
 #[derive(Clone, Debug)]
 pub struct NetConfig {
-    /// Tap interface name. May contain `%d` for the kernel to fill in.
+    /// Tap interface to open. Exact -- the host created it, so nesbox is not
+    /// choosing the name.
     pub tap_name: String,
-    /// Address given to the host end of the tap.
-    pub host_ip: Ipv4Addr,
-    pub netmask: Ipv4Addr,
     /// Guest MAC. Generated if absent.
     pub mac: Option<[u8; 6]>,
 }
@@ -295,8 +292,9 @@ impl NetDevice {
     /// Create the tap, open vhost-net, and prepare the device. Nothing flows
     /// until the guest driver reaches DRIVER_OK.
     pub fn new(config: &NetConfig, mem: Arc<GuestMemoryMmap>) -> Result<Self> {
-        let tap = Tap::create(&config.tap_name)?;
-        tap.configure(config.host_ip, config.netmask)?;
+        // Addressing and bridging belong to whoever set the host up; by the
+        // time we get here the tap is already wherever it should be.
+        let tap = Tap::open(&config.tap_name)?;
 
         let backend = VhostNetBackend::new(mem.clone())
             .context("failed to open /dev/vhost-net — is the vhost_net module loaded?")?;

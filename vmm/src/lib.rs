@@ -7,7 +7,6 @@ pub mod interrupt;
 pub mod layout;
 pub mod lifecycle;
 pub mod memslot;
-pub mod netsetup;
 pub mod power;
 pub mod regs;
 pub mod serial;

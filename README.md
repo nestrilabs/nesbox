@@ -73,8 +73,10 @@ and nothing it does not.
 - An **Intel or AMD GPU** with a DRM render node (`/dev/dri/renderD128`)
 - `libvirglrenderer` built with the DRM native context for your GPU
 - `virtiofsd`, for shared directories
-- `CAP_NET_ADMIN` on the nesbox binary, for networking:
-  `sudo setcap cap_net_admin+ep /path/to/nesbox`
+- Host networking prepared once, by `scripts/nestri-net-setup.sh`. It makes the
+  bridge and the persistent taps guests attach to. **nesbox itself needs no
+  capabilities**: a tap that already exists and is owned by the user nesbox runs
+  as can be opened unprivileged, so there is no `setcap` on the binary.
 
 > [!IMPORTANT]
 >
@@ -97,11 +99,10 @@ and nothing it does not.
 
 ```bash
 cargo build --release
-sudo setcap cap_net_admin+ep ./target/release/nesbox
+sudo ./scripts/nestri-net-setup.sh
 
 # once per host: IP forwarding and NAT so guests can reach the network.
 # Explains each change and asks before making it.
-sudo ./target/release/nesbox setup my-vm.json
 
 ./target/release/nesbox my-vm.json
 ```
@@ -151,9 +152,7 @@ scheduler.
 
 Roughly in priority order:
 
-- **Persisting host network setup without systemd** — `nesbox setup --persist`
-  installs a systemd unit; hosts using OpenRC or runit are told what to arrange
-  by hand instead.
+
 - **Overlapping block I/O** — requests are served off the vCPU thread but still
   one at a time; io_uring would let a deep queue run concurrently.
 - **Seccomp and a jailer** — confine the VMM process itself.

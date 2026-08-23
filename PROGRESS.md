@@ -118,7 +118,6 @@ vmm/                 the VMM proper
   src/lifecycle.rs   ExitReason and the shared stop signal
   src/virtiofsd.rs   spawns and supervises virtiofsd
   src/memslot.rs     registers host memory as guest RAM, for the GPU window
-  src/netsetup.rs    the host's egress rules, and checking they are there
   src/bin/nesbox.rs  wiring: devices, interrupts, signals, vCPU threads
 ```
 
@@ -248,7 +247,7 @@ Do not re-derive these.
 
 ## 6. Known gaps
 
-- **Egress works**: guest to 1.1.1.1, 0% loss, 11.5ms, with `nesbox setup` as
+- **Egress works**: guest to 1.1.1.1, 0% loss, 11.5ms, with the host set up as
   the only privileged step. Verified from a blocked host: setup detected the
   dropping forward chain, asked, added both `DOCKER-USER` rules itself and
   reported the host ready. Declining leaves the host untouched and exits
@@ -352,106 +351,60 @@ Vulkan is what Proton uses, so this has not been chased.
 
 ## 9. Running virtio-net
 
-Creating a tap needs `CAP_NET_ADMIN`. Grant it:
+nesbox **opens** a tap; it never creates one. That is why it needs no
+capabilities: `tun_not_capable()` in `drivers/net/tun.c` consults
+`CAP_NET_ADMIN` only when creating a device, or when the opener is not that
+device's owner. A tap made in advance and handed to the right user is openable
+by that user unprivileged.
+
+So the host is prepared once:
 
 ```bash
-sudo setcap cap_net_admin+ep ./target/debug/nesbox
+sudo ./scripts/nestri-net-setup.sh
 ```
 
-`cargo build` replaces the binary and drops the capability, so **this has to be
-redone after every rebuild** — a VM that suddenly cannot start a tap has
-usually just been recompiled. Then boot with a `network` section; the tap is
-created and addressed automatically. Inside the guest:
+It makes the bridge, optionally puts a tagged VLAN uplink on it, and creates
+persistent taps (`nesbox0`, `nesbox1`, …) owned by the user nesbox runs as.
+A config then names one:
 
-```bash
-ip addr add 172.30.0.2/24 dev eth0 && ip link set eth0 up && ping -c2 172.30.0.1
+```json
+"network": { "tap-name": "nesbox0", "mac": "02:00:00:00:00:01" }
 ```
 
-That is the check that passes today, and it exercises the tap, vhost-net and
-both queues. It does **not** cover egress, which additionally needs IP
-forwarding and a masquerade rule for the guest's subnet.
+### What this replaced, and why
 
-Those rules are host-global state, so a running VM does not install them and
-neither does the launcher — nessh is network-facing and anonymous by design, and
-giving it `CAP_NET_ADMIN` would turn a compromise of it into a compromise of the
-host firewall. They live behind a separate privileged one-off instead:
+nesbox used to carry `CAP_NET_ADMIN` to create taps, and had `setup`/`teardown`
+subcommands that installed the host's forwarding and masquerade rules behind a
+consent prompt.
 
-```bash
-sudo ./target/debug/nesbox setup examples/vm.json            # idempotent
-sudo ./target/debug/nesbox setup --persist examples/vm.json  # ...and at boot
-sudo ./target/debug/nesbox setup --yes examples/vm.json      # for install scripts
-sudo ./target/debug/nesbox teardown examples/vm.json         # undoes both
-```
+The reasoning behind that split was sound and still is: host-global state is not
+a running VM's business, and nessh is network-facing and anonymous by design, so
+giving *it* the capability would turn a compromise of it into a compromise of
+the host firewall. What changed is the conclusion. A VMM that wants net-admin on
+its binary is a thing to ask of everyone who self-hosts, and pre-created taps
+make the question unnecessary rather than answering it. Host administration
+moved to a shell script, which is what it always was.
 
-**Nothing setup changes survives a reboot** — `ip_forward` resets, the nftables
-table goes, the iptables rules with it. `--persist` installs a systemd unit that
-re-runs `setup --yes` at boot instead of writing rules into whichever of three
-firewall config formats the distribution uses. Setup is already idempotent, so
-re-running it is safe, and unlike saved rules it repairs itself when Docker is
-reinstalled and recreates its chains. The unit is ordered `After=docker.service`
-for exactly that reason; running before Docker would have the rules removed
-again, and the failure would only show at the next boot.
+It also removed a papercut: `cargo build` replaced the binary and dropped the
+capability, so it had to be re-granted after every rebuild — a VM that suddenly
+could not start a tap had usually just been recompiled.
 
-`--persist` checks for systemd first (`/run/systemd/system`) and, without it,
-prints what to arrange instead rather than writing a unit nothing will read.
-Supporting those hosts properly — OpenRC, runit, or writing the distribution's
-own firewall config — is unbuilt.
-It also warns when the binary or config sits somewhere a reboot will invalidate,
-such as a `target/` build directory.
+### When it does not work
 
-Every change to the host is explained and confirmed before it happens — these
-are firewall rules and kernel settings the whole machine shares, and somebody
-self-hosting a game server should see what is about to change. `--yes` skips the
-prompts for an install script that has already asked in its own words. With
-neither a terminal nor `--yes`, setup refuses rather than assuming consent.
+`Tap::open` reports a missing tap, or one owned by somebody else, and names the
+remedy. That replaced a preflight which read the nftables ruleset — a check that
+needed the very capability this change removes.
 
-`setup` enables `ip_forward` and adds a masquerade rule for the guest's subnet
-in its own `ip nesbox` nftables table, so re-running it touches nothing else and
-an existing rule from libvirt or Docker is left alone. The rule matches on
-destination rather than the tap's name, because the name carries a
-kernel-assigned number no one knows until a VM starts. Neither change survives a
-reboot; persist them the way your distribution expects.
+The guest's own address arrives on the kernel command line (`nestri.ip=`,
+`nestri.gw=`, read by `guest-net` in the rootfs), so two guests on one host no
+longer collide on one baked-in address.
 
-`setup` also clears a third-party firewall out of the way, because one will
-otherwise block everything above while everything above is correct. Docker sets
-the forward chain's policy to drop the moment it starts, and ufw ships with the
-same; in nftables a drop is final, so an accept in our own table cannot rescue a
-packet another chain has already refused. The rule has to go in a chain that
-firewall honours — `DOCKER-USER` if Docker is present, `FORWARD` otherwise —
-and in **both directions**, because conntrack has already reversed the
-masquerade by the time a reply arrives, so replies are addressed *to* the
-subnet, not from it:
-
-```bash
-iptables -I DOCKER-USER -s 172.30.0.0/24 -j ACCEPT
-iptables -I DOCKER-USER -d 172.30.0.0/24 -j ACCEPT
-```
-
-`setup` does both itself. With only the first the guest's packets leave and
-every reply is dropped — measured on this host, not inferred, and it is what the
-preflight's two-direction check is built from.
-
-`setup` finishes by re-running the preflight and fails loudly if the host still
-is not ready, rather than reporting success for having written correct rules
-that something else ignores.
-
-Every VM start with a `network` section runs a preflight and says which piece is
-missing — "IP forwarding is disabled" and "no masquerade rule for 172.30.0.0/24"
-are reported separately, because otherwise both present as "the game never
-connects". It warns and continues rather than refusing to boot: a guest with no
-need for egress is a perfectly good guest.
-
-Reading the nftables ruleset needs `CAP_NET_ADMIN`, and file capabilities do not
-survive `exec`, so `netsetup::nft` lends the capability to the `nft` child
-through the ambient set. Without that the check degrades to "could not tell" —
-which still names a remedy, but is the answer the whole module exists to avoid.
-
-If traffic stops flowing after a change, `RUST_LOG=debug` prints the negotiated
-feature set, the vnet header size and the tap offload flags at the moment the
-device starts. Those three are what usually disagree: a header size the guest
-did not expect misparses every frame silently, and a feature bit vhost-net does
-not know makes `VHOST_SET_FEATURES` fail outright (it is masked with
-`get_features` to prevent exactly that).
+If traffic will not flow, `RUST_LOG=debug` prints the negotiated feature set, the
+vnet header size and the tap offload flags at the moment the device starts.
+Those three are what usually disagree: a header size the guest did not expect
+misparses every frame silently, and a feature bit vhost-net does not know makes
+`VHOST_SET_FEATURES` fail outright (it is masked with `get_features` to prevent
+exactly that).
 
 Note that the guest names the interface `eth0` even though nothing here sets a
 name — that is the guest kernel's own naming, not something nesbox controls.

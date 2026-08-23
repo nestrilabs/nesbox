@@ -22,15 +22,11 @@ const GPU_SHM_BAR: usize = 2;
 
 const USAGE: &str = "Usage:
   nesbox <config.json>            run a VM
-  nesbox setup <config.json>      install the host's egress rules (needs root)
-  nesbox teardown <config.json>   remove them again
 
-Options:
-  -y, --yes    accept every change to the host without asking. Setup explains
-               each command and waits for confirmation otherwise, and refuses
-               to change anything when there is nobody to ask.
-      --persist  also install a systemd unit so the host sets itself up at
-               boot. Without it, nothing setup does survives a reboot.";
+Host networking -- bridge, VLAN uplink, and the taps guests attach to -- is set
+up separately by scripts/nestri-net-setup.sh. nesbox opens a tap that already
+exists, which needs no capabilities: the kernel only demands CAP_NET_ADMIN to
+create a device, or from someone who is not its owner.";
 
 /// Puts the terminal in raw mode so guest console input is unbuffered, and
 /// restores it on drop.
@@ -68,60 +64,24 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // `--yes` is for install scripts that have already explained themselves;
-    // interactively, every change to the host is asked about first.
-    let assume_yes = args.iter().any(|a| a == "--yes" || a == "-y");
-    let persist = args.iter().any(|a| a == "--persist");
-    let mut positional = args.iter().filter(|a| !a.starts_with('-'));
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}");
         return Ok(());
     }
-    let first = positional.next().context(USAGE)?.clone();
-    let (command, config_path) = match first.as_str() {
-        "setup" | "teardown" => (first.clone(), positional.next().context(USAGE)?.clone()),
-        _ => ("run".to_string(), first),
-    };
-    let consent = nesbox_vmm::netsetup::Consent::new(assume_yes);
+    let config_path = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .context(USAGE)?
+        .clone();
 
     let config_str = std::fs::read_to_string(&config_path).context("Failed to read config")?;
     let config: config::VmConfig =
         serde_json::from_str(&config_str).context("Invalid JSON config")?;
 
-    match command.as_str() {
-        // Installing the host's egress rules is a separate, privileged, one-off
-        // step: a long-running VM has no business rewriting the host firewall,
-        // and neither does whatever launched it.
-        "setup" => {
-            let network = config
-                .network
-                .as_ref()
-                .context("this config has no `network` section, so there is nothing to set up")?;
-            nesbox_vmm::netsetup::install(network, &consent)?;
-            if persist {
-                nesbox_vmm::netsetup::persist(
-                    std::path::Path::new(&config_path),
-                    &consent,
-                )?;
-            } else {
-                log::warn!(
-                    "none of this survives a reboot — re-run with --persist to have \
-                     the host set itself up at boot"
-                );
-            }
-            return Ok(());
-        }
-        "teardown" => {
-            nesbox_vmm::netsetup::unpersist(&consent)?;
-            return nesbox_vmm::netsetup::uninstall(&consent);
-        }
-        _ => {}
-    }
-
-    // Raw mode belongs to the guest console and nothing else. Entering it
-    // before the subcommands ran left `setup` unable to be answered: no echo,
-    // no line buffering, and no Ctrl-C, because raw mode turns off the signal
-    // characters too.
+    // Raw mode belongs to the guest console and nothing else, and is entered
+    // only once the config has parsed: raw mode turns off echo, line buffering
+    // and the signal characters, so anything that still wants to report a
+    // problem has to do it first.
     let _raw = RawMode::enter()?;
 
     info!("Starting VMM with config: {:#?}", config);
@@ -178,15 +138,9 @@ fn main() -> Result<()> {
 
     // ── Network device (optional) ─────────────────────────────────────────
     if let Some(net_cfg) = &config.network {
-        // Say plainly which host-side piece is missing, if any. A guest that
-        // cannot route out otherwise fails as "nothing ever connects", which
-        // looks nothing like its cause.
-        nesbox_vmm::netsetup::report(net_cfg);
         let net_device = NetDevice::new(
             &NetConfig {
                 tap_name: net_cfg.tap_name.clone(),
-                host_ip: net_cfg.host_ip,
-                netmask: net_cfg.netmask,
                 mac: net_cfg.parsed_mac()?,
             },
             vm.mem.clone(),
