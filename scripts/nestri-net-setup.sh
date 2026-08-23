@@ -80,29 +80,89 @@ id "$TAP_USER" >/dev/null 2>&1 || die "no such user: $TAP_USER"
 #            router, which is why it is the fallback rather than the goal.
 say ""
 say "How should guests reach the network?"
-say "  ${BOLD}1${RESET}) bridged onto a VLAN — guests get real addresses (needs a trunked port)"
-say "  ${BOLD}2${RESET}) routed behind NAT   — private subnet, works on any network"
+say "  ${BOLD}1${RESET}) bridged onto a network — guests get real addresses on it"
+say "  ${BOLD}2${RESET}) routed behind NAT     — private subnet, works on any network"
 MODE="$(ask 'Choice?' '2')"
 
 case "$MODE" in
   1)
-    if ! confirm 'Do you have VLAN(s) configured on the switch port for this host?'; then
-        say ""
-        warn "Bridged mode needs the switch port to carry the guests' VLAN tagged."
-        warn "An access port hands this host one untagged network, and no VLAN"
-        warn "sub-interface can be made from it. Configure the port as a trunk"
-        warn "first, or choose routed instead."
-        exit 1
-    fi
     UPLINK="$(ask 'Which interface faces the switch?' "$(ip -o route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || echo eth0)")"
-    VLAN_ID="$(ask 'Which VLAN id should the guests use?' '128')"
-    VLAN_IF="${UPLINK}.${VLAN_ID}"
+    # Checked here rather than discovered three questions later. Every lookup
+    # below reads this device, and under `set -euo pipefail` a missing one ends
+    # the script with no message at all.
+    [[ -e "/sys/class/net/${UPLINK}" ]] || die "no interface named ${UPLINK} on this host"
+    # The one question that decides the whole shape, and the one people get
+    # wrong, because both halves are individually correct and incompatible.
+    #
+    # A switch port presents each VLAN either tagged or untagged, not both. If
+    # the guests' VLAN is the port's native/untagged network, frames from a
+    # tagged sub-interface are dropped at the switch with no trace on the host,
+    # and the guest reports "Destination Host Unreachable" about its own
+    # address -- an ARP failure for its gateway. If the VLAN is tagged, a
+    # sub-interface is the only thing that reaches it.
+    #
+    # Which one a port uses is somebody's deliberate choice, usually about
+    # where the *host* lives: making the guests' VLAN native is what keeps the
+    # host off the default LAN, because a port's untagged traffic falls back to
+    # VLAN 1 the moment nothing else claims it.
+    say ""
+    say "How does the switch port present the guests' network?"
+    say "  ${BOLD}1${RESET}) tagged   — the host is on some other untagged network"
+    say "  ${BOLD}2${RESET}) untagged — it is this port's native network (the host is on it too)"
+    TAGGING="$(ask 'Choice?' '1')"
+    case "$TAGGING" in
+      1)
+        VLAN_ID="$(ask 'Which VLAN id should the guests use?' '128')"
+        VLAN_IF="${UPLINK}.${VLAN_ID}"
+        ;;
+      2)
+        # No sub-interface: the physical interface itself joins the bridge. That
+        # moves the host's own address onto the bridge, which ends any session
+        # running over it -- see the warnings below, which are not decoration.
+        VLAN_IF=""
+        UPLINK_SLAVE="${BRIDGE}-uplink"
+        ;;
+      *) die "pick 1 or 2" ;;
+    esac
     ;;
   2)
     HOST_ADDR="$(ask "Address for the host end of ${BRIDGE}?" '172.30.0.1/24')"
     ;;
   *) die "pick 1 or 2" ;;
 esac
+
+# ── The host's own addressing, in the untagged case ───────
+# Read before anything changes, because it is about to move to the bridge and
+# there is no second chance to look it up once the interface is enslaved. A box
+# that comes back up without a default route is a box somebody drives to.
+if [[ -n "${UPLINK_SLAVE:-}" ]]; then
+    HOST_PROFILE="$(nmcli -g GENERAL.CONNECTION device show "$UPLINK" 2>/dev/null || true)"
+    HOST_METHOD="$(nmcli -g ipv4.method con show "$HOST_PROFILE" 2>/dev/null || echo auto)"
+    # `|| true` on each: an interface with no address, no default route or no
+    # DNS is a fact to report, not a reason to abort. pipefail would otherwise
+    # turn each empty answer into an exit.
+    HOST_ADDR="$(ip -4 -o addr show dev "$UPLINK" 2>/dev/null | awk '{print $4; exit}' || true)"
+    HOST_GW="$(ip -4 route show default dev "$UPLINK" 2>/dev/null | awk '{print $3; exit}' || true)"
+    HOST_DNS="$(nmcli -g IP4.DNS device show "$UPLINK" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"
+    say ""
+    step "What ${UPLINK} holds today, and what ${BRIDGE} takes over"
+    say "  profile:  ${HOST_PROFILE:-none}"
+    say "  method:   ${HOST_METHOD:-auto}"
+    say "  address:  ${HOST_ADDR:-none}"
+    say "  gateway:  ${HOST_GW:-none}"
+    say "  dns:      ${HOST_DNS:-none}"
+    if [[ "$HOST_METHOD" == manual && -z "$HOST_ADDR" ]]; then
+        die "${UPLINK} is configured static but has no address; fix that first"
+    fi
+    say ""
+    warn "This moves the host's address off ${UPLINK} and onto ${BRIDGE}."
+    warn "Any session running over ${UPLINK} -- including this SSH one -- drops"
+    warn "while that happens. Run it from a console, or over a path that does"
+    warn "not use ${UPLINK}: Tailscale, IPMI, a second NIC."
+    if ! confirm "Understood, and you have another way in?"; then
+        die "stopped before touching anything"
+    fi
+fi
 
 # ── Bridge ───────────────────────────────────────────────
 # Created with whatever manages this host, not with `ip link`.
@@ -134,10 +194,23 @@ if nm_active; then
         # and buys nothing here: the only things on this bridge are taps and one
         # uplink, so there is no loop to detect.
         run nmcli con modify "$BRIDGE" bridge.stp no
-        if [[ "$MODE" == 1 ]]; then
-            # Bridged: the host keeps its address on the untagged interface and
-            # the bridge carries only guest traffic. Left at NM's default of
-            # `auto` it would DHCP an address of its own on the guests' VLAN.
+        if [[ -n "${UPLINK_SLAVE:-}" ]]; then
+            # The untagged case: the bridge inherits the host's own address,
+            # because the interface holding it is about to become a bridge port
+            # and a bridge port cannot hold an address. The same method the host
+            # uses today, so the box keeps the address it already had.
+            if [[ "$HOST_METHOD" == manual ]]; then
+                run nmcli con modify "$BRIDGE" ipv4.method manual \
+                    ipv4.addresses "$HOST_ADDR" ipv4.gateway "$HOST_GW" \
+                    ipv4.dns "$HOST_DNS"
+            else
+                run nmcli con modify "$BRIDGE" ipv4.method auto
+            fi
+            run nmcli con modify "$BRIDGE" ipv6.method ignore
+        elif [[ "$MODE" == 1 ]]; then
+            # Bridged and tagged: the host keeps its address on the untagged
+            # interface and the bridge carries only guest traffic. Left at NM's
+            # default of `auto` it would DHCP an address on the guests' VLAN.
             run nmcli con modify "$BRIDGE" ipv4.method disabled ipv6.method ignore
         else
             run nmcli con modify "$BRIDGE" ipv4.method manual ipv4.addresses "$HOST_ADDR"
@@ -156,7 +229,54 @@ else
 fi
 
 # ── Uplink or address ────────────────────────────────────
-if [[ "$MODE" == 1 ]]; then
+if [[ -n "${UPLINK_SLAVE:-}" ]]; then
+    step "${UPLINK} itself into ${BRIDGE}"
+    # No sub-interface. The guests' network is this port's untagged one, so
+    # guests must speak untagged too, which means the physical interface joins
+    # the bridge and the host's address moves with it.
+    #
+    # Ordering matters and is not obvious: the old profile has to go down
+    # before the slave comes up, or NM has two profiles claiming one device and
+    # resolves it by flapping. Autoconnect is turned off rather than the
+    # profile deleted, so there is something to put back by hand from a console
+    # if this goes wrong.
+    if nm_active; then
+        say "  NetworkManager is managing this host, so it has to do this:"
+        say ""
+        say "    nmcli con add type ethernet con-name ${UPLINK_SLAVE} ifname ${UPLINK} \\"
+        say "        master ${BRIDGE} slave-type bridge"
+        say "    nmcli con modify '${HOST_PROFILE}' connection.autoconnect no"
+        say "    nmcli con down '${HOST_PROFILE}'"
+        say "    nmcli con up ${UPLINK_SLAVE}"
+        say "    nmcli con up ${BRIDGE}"
+        say ""
+        say "  ${BOLD}The session running over ${UPLINK} drops at the third line.${RESET}"
+        say "  To undo from a console: nmcli con modify '${HOST_PROFILE}' \\"
+        say "      connection.autoconnect yes && nmcli con up '${HOST_PROFILE}'"
+        if confirm "Run those now?"; then
+            run nmcli con add type ethernet con-name "$UPLINK_SLAVE" ifname "$UPLINK" \
+                master "$BRIDGE" slave-type bridge
+            if [[ -n "$HOST_PROFILE" ]]; then
+                run nmcli con modify "$HOST_PROFILE" connection.autoconnect no
+                run nmcli con down "$HOST_PROFILE"
+            fi
+            run nmcli con up "$UPLINK_SLAVE"
+            run nmcli con up "$BRIDGE"
+        else
+            warn "skipped — guests reach each other and nothing else until it is done"
+        fi
+    else
+        run ip link set "$UPLINK" master "$BRIDGE"
+        run ip link set "$UPLINK" up
+        if [[ -n "$HOST_ADDR" ]]; then
+            run ip addr del "$HOST_ADDR" dev "$UPLINK"
+            run ip addr add "$HOST_ADDR" dev "$BRIDGE"
+            [[ -n "$HOST_GW" ]] && run ip route add default via "$HOST_GW" dev "$BRIDGE"
+        fi
+        warn "not persistent — put ${UPLINK} and the address into whatever"
+        warn "configures this host's interfaces, or the next boot undoes it"
+    fi
+elif [[ "$MODE" == 1 ]]; then
     step "VLAN ${VLAN_ID} on ${UPLINK} into ${BRIDGE}"
     # A tagged sub-interface, never the physical interface. Bridging the
     # interface that carries the host's own address moves that address onto the
@@ -279,7 +399,13 @@ done
 DISPATCHER
         chmod 755 "$DISPATCH"
     fi
-    say "  installed ${DISPATCH}"
+    # Says what actually happened. A dry run that reports "installed" is a dry
+    # run somebody stops trusting.
+    if [[ "${DRY_RUN:-}" == 1 ]]; then
+        say "  would install ${DISPATCH}"
+    else
+        say "  installed ${DISPATCH}"
+    fi
 else
     warn "skipped — the taps are gone after a reboot and nesbox will not start"
 fi
@@ -287,7 +413,18 @@ fi
 step "Done"
 say "  bridge:  ${BRIDGE}"
 say "  taps:    nesbox0..nesbox$((TAP_COUNT - 1)), owned by ${TAP_USER}"
-if [[ "$MODE" == 1 ]]; then
+if [[ -n "${UPLINK_SLAVE:-}" ]]; then
+    say "  uplink:  ${UPLINK} (untagged, the port's native network)"
+    say "  host:    ${HOST_ADDR:-from DHCP} on ${BRIDGE}"
+    say ""
+    say "The host and the guests are on the same untagged network now. Check that"
+    say "the switch port carries nothing else: every VLAN trunked to it tagged is"
+    say "one an escaped guest can reach by creating a sub-interface for the tag."
+    say ""
+    say "Give each guest an address on that network. nessh does this; a"
+    say "hand-written config needs it on the kernel command line:"
+    say "  ${DIM}nestri.ip=<addr>/<prefix> nestri.gw=<gateway>${RESET}"
+elif [[ "$MODE" == 1 ]]; then
     say "  uplink:  ${VLAN_IF} (VLAN ${VLAN_ID} on ${UPLINK})"
     say ""
     say "Give each guest an address on that VLAN. nessh does this; a hand-written"
