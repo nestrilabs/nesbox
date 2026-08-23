@@ -105,13 +105,53 @@ case "$MODE" in
 esac
 
 # ── Bridge ───────────────────────────────────────────────
+# Created with whatever manages this host, not with `ip link`.
+#
+# On a NetworkManager host the two are not interchangeable: a bridge made with
+# `ip link` is a device NM does not own, and asking it to enslave anything to
+# that device fails with "controller doesn't refer to any existing profile of
+# type 'bridge'". It would also be undone the next time NM reconciles.
 step "Bridge ${BRIDGE}"
-if [[ -d "/sys/class/net/${BRIDGE}/bridge" ]]; then
+
+nm_profile_exists() { nmcli -t -f NAME con show 2>/dev/null | grep -qx "$1"; }
+
+if nm_active; then
+    if [[ -e "/sys/class/net/${BRIDGE}" ]] && ! nm_profile_exists "$BRIDGE"; then
+        warn "${BRIDGE} exists but NetworkManager does not manage it — probably"
+        warn "made with \`ip link\`. NM cannot enslave anything to it in that state."
+        if confirm "Remove it and recreate it through NetworkManager?" y; then
+            run ip link del "$BRIDGE"
+        else
+            die "cannot continue: ${BRIDGE} is unmanaged"
+        fi
+    fi
+
+    if nm_profile_exists "$BRIDGE"; then
+        say "  profile already exists"
+    else
+        run nmcli con add type bridge con-name "$BRIDGE" ifname "$BRIDGE"
+        # STP costs ~15s of forwarding delay before a guest can pass traffic,
+        # and buys nothing here: the only things on this bridge are taps and one
+        # uplink, so there is no loop to detect.
+        run nmcli con modify "$BRIDGE" bridge.stp no
+        if [[ "$MODE" == 1 ]]; then
+            # Bridged: the host keeps its address on the untagged interface and
+            # the bridge carries only guest traffic. Left at NM's default of
+            # `auto` it would DHCP an address of its own on the guests' VLAN.
+            run nmcli con modify "$BRIDGE" ipv4.method disabled ipv6.method ignore
+        else
+            run nmcli con modify "$BRIDGE" ipv4.method manual ipv4.addresses "$HOST_ADDR"
+            run nmcli con modify "$BRIDGE" ipv6.method ignore
+        fi
+        run nmcli con up "$BRIDGE"
+    fi
+elif [[ -d "/sys/class/net/${BRIDGE}/bridge" ]]; then
     say "  already exists"
 elif [[ -e "/sys/class/net/${BRIDGE}" ]]; then
     die "${BRIDGE} exists but is not a bridge"
 else
     run ip link add "$BRIDGE" type bridge
+    run ip link set "$BRIDGE" type bridge stp_state 0
     run ip link set "$BRIDGE" up
 fi
 
@@ -150,7 +190,9 @@ if [[ "$MODE" == 1 ]]; then
     fi
 else
     step "Address and NAT for ${BRIDGE}"
-    if ip -4 addr show dev "$BRIDGE" 2>/dev/null | grep -q "${HOST_ADDR%%/*}"; then
+    if nm_active; then
+        say "  ${HOST_ADDR} set on the bridge profile above"
+    elif ip -4 addr show dev "$BRIDGE" 2>/dev/null | grep -q "${HOST_ADDR%%/*}"; then
         say "  ${HOST_ADDR} already set"
     else
         run ip addr add "$HOST_ADDR" dev "$BRIDGE"
@@ -195,6 +237,52 @@ for ((i = 0; i < TAP_COUNT; i++)); do
     run ip link set "$tap" master "$BRIDGE"
     run ip link set "$tap" up
 done
+
+# ── Persistence ──────────────────────────────────────────
+# Taps are not persistent state anywhere: `ip tuntap` makes a device that lives
+# until the next reboot, and no network manager has a concept of one to
+# describe. So something has to remake them at boot.
+#
+# A NetworkManager dispatcher script, rather than a systemd unit. It fires when
+# the bridge comes up, which is exactly the right moment and the right ordering
+# for free -- and it is init-agnostic, so it keeps working on a host that is not
+# running systemd at all.
+step "Persisting the taps"
+DISPATCH="/etc/NetworkManager/dispatcher.d/50-nesbox-taps"
+if ! nm_active; then
+    warn "no NetworkManager: recreate the taps at boot yourself, with"
+    warn "  ip tuntap add dev nesboxN mode tap user ${TAP_USER}"
+    warn "  ip link set nesboxN master ${BRIDGE}"
+elif [[ -x "$DISPATCH" ]]; then
+    say "  ${DISPATCH} already installed"
+    say "  ${DIM}(delete it to stop the taps being recreated at boot)${RESET}"
+elif confirm "Install a dispatcher script so the taps come back after a reboot?" y; then
+    if [[ "${DRY_RUN:-}" != 1 ]]; then
+        mkdir -p "$(dirname "$DISPATCH")"
+        cat > "$DISPATCH" <<DISPATCHER
+#!/bin/sh
+# Recreate nesbox's taps when ${BRIDGE} comes up. Written by
+# nestri-net-setup.sh; delete this file to stop it.
+#
+# Taps are not persistent devices and no network manager describes them, so they
+# have to be remade. Hooked to the bridge coming up rather than to boot, because
+# enslaving a tap to a bridge that does not exist yet fails.
+[ "\$1" = "${BRIDGE}" ] || exit 0
+[ "\$2" = "up" ] || exit 0
+
+for i in \$(seq 0 $((TAP_COUNT - 1))); do
+    tap="nesbox\$i"
+    [ -e "/sys/class/net/\$tap" ] || ip tuntap add dev "\$tap" mode tap user ${TAP_USER}
+    ip link set "\$tap" master ${BRIDGE}
+    ip link set "\$tap" up
+done
+DISPATCHER
+        chmod 755 "$DISPATCH"
+    fi
+    say "  installed ${DISPATCH}"
+else
+    warn "skipped — the taps are gone after a reboot and nesbox will not start"
+fi
 
 step "Done"
 say "  bridge:  ${BRIDGE}"
