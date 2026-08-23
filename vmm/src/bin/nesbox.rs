@@ -274,20 +274,37 @@ fn main() -> Result<()> {
     install_signal_handlers(shutdown.clone())?;
 
     // ── Run vCPUs ─────────────────────────────────────────────────────────
+    // The CPU set every vCPU thread is confined to, if the config named one.
+    // Built once here rather than per thread: it is the same set for all of
+    // them, and cpu_set_t is Copy.
+    let cpuset = build_cpuset(&config.machine_config.cpu_affinity);
+
     let handles: Vec<_> = vm
         .vcpus
         .into_iter()
-        .map(|vcpu_fd| {
+        .enumerate()
+        .map(|(vcpu_id, vcpu_fd)| {
             let mem = vm.mem.clone();
             let pci_bus = pci_bus.clone();
             let serial = serial.clone();
             let power = power.clone();
             let shutdown = shutdown.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = vm::run_vcpu_loop(mem, vcpu_fd, pci_bus, serial, power, shutdown) {
-                    eprintln!("vCPU thread error: {}", e);
-                }
-            })
+            std::thread::Builder::new()
+                // Named so the threads are identifiable from the host. Without
+                // this they are anonymous, and anything done to place them --
+                // by us or by an operator with taskset -- cannot be checked.
+                .name(format!("vcpu{vcpu_id}"))
+                .spawn(move || {
+                    if let Some(set) = cpuset {
+                        set_affinity_or_warn(vcpu_id, &set);
+                    }
+                    if let Err(e) =
+                        vm::run_vcpu_loop(mem, vcpu_fd, pci_bus, serial, power, shutdown)
+                    {
+                        eprintln!("vCPU thread error: {}", e);
+                    }
+                })
+                .expect("failed to spawn vCPU thread")
         })
         .collect();
 
@@ -343,6 +360,55 @@ extern "C" fn stop_handler(_: libc::c_int) {
 static SHUTDOWN: std::sync::OnceLock<Arc<Shutdown>> = std::sync::OnceLock::new();
 
 /// SIGTERM and SIGINT ask the VM to stop; SIGUSR1 just interrupts KVM_RUN.
+/// Build the CPU set the vCPU threads are confined to, or `None` for "wherever
+/// the host likes".
+///
+/// Returns `None` for an empty list rather than an empty `cpu_set_t`: an empty
+/// set is not "no restriction", it is "no CPU at all", and `sched_setaffinity`
+/// rejects it. Reading an absent config field as that would be a hang, not a
+/// default.
+fn build_cpuset(cpus: &[usize]) -> Option<libc::cpu_set_t> {
+    if cpus.is_empty() {
+        return None;
+    }
+    // SAFETY: all-zeros is a valid cpu_set_t, and CPU_ZERO makes that explicit.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_ZERO(&mut set) };
+    for cpu in cpus {
+        // CPU_SET is out-of-bounds for anything past CPU_SETSIZE, so a config
+        // naming a CPU this host does not have is dropped rather than
+        // corrupting the set beside it. sched_setaffinity would reject the
+        // whole call for an unknown CPU anyway; skipping keeps the CPUs that
+        // do exist usable.
+        if *cpu < libc::CPU_SETSIZE as usize {
+            // SAFETY: FFI call, index bounds checked above.
+            unsafe { libc::CPU_SET(*cpu, &mut set) };
+        } else {
+            eprintln!("cpu_affinity: ignoring CPU {cpu}, past CPU_SETSIZE");
+        }
+    }
+    Some(set)
+}
+
+/// Confine the calling thread to `set`.
+///
+/// A warning rather than a failure: placement is an optimisation, and a guest
+/// that runs on the wrong cores is better than one that does not boot. The
+/// usual cause is a config naming CPUs this host does not have, which is worth
+/// seeing but not worth dying over.
+fn set_affinity_or_warn(vcpu_id: usize, set: &libc::cpu_set_t) {
+    // SAFETY: FFI call; pid 0 is the calling thread, and the size matches.
+    let ret = unsafe {
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set)
+    };
+    if ret != 0 {
+        eprintln!(
+            "vcpu{vcpu_id}: could not set CPU affinity: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 fn install_signal_handlers(shutdown: Arc<Shutdown>) -> Result<()> {
     let _ = SHUTDOWN.set(shutdown);
     // SAFETY: both handlers are async-signal-safe.

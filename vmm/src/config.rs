@@ -151,6 +151,21 @@ pub struct MachineConfig {
     pub vcpu_count: u8,
     #[serde(default = "default_mem_size")]
     pub mem_size_mib: usize,
+    /// Host CPUs the vCPU threads may run on. Empty or absent means no
+    /// affinity is set and the host scheduler places them freely.
+    ///
+    /// One set shared by every vCPU thread, rather than a pin per vCPU. On a
+    /// chiplet CPU the win is keeping a guest inside one L3 domain, and a set
+    /// gets that while still letting the host balance within it. Pinning
+    /// one-to-one would also mean deciding which vCPUs land on SMT siblings,
+    /// and the guest cannot currently be told which of its CPUs are siblings
+    /// -- nesbox's ACPI tables do not describe CPU topology -- so it would
+    /// schedule against a layout it cannot see.
+    ///
+    /// Applied verbatim. Which CPUs belong to a guest is nessh's decision;
+    /// this end only carries it out, the same way `vcpu_count` works.
+    #[serde(default)]
+    pub cpu_affinity: Vec<usize>,
 }
 
 fn default_vcpus() -> u8 {
@@ -165,6 +180,40 @@ impl Default for MachineConfig {
         Self {
             vcpu_count: default_vcpus(),
             mem_size_mib: default_mem_size(),
+            cpu_affinity: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod machine_config_tests {
+    use super::*;
+
+    /// Every config written before `cpu_affinity` existed must still parse, and
+    /// must mean "no affinity" rather than "no CPUs". nessh emits this exact
+    /// shape today.
+    #[test]
+    fn a_config_without_cpu_affinity_still_parses() {
+        let json = r#"{ "vcpu_count": 4, "mem_size_mib": 8192 }"#;
+        let mc: MachineConfig = serde_json::from_str(json).expect("parses");
+        assert_eq!(mc.vcpu_count, 4);
+        assert!(
+            mc.cpu_affinity.is_empty(),
+            "an absent field must not imply a CPU set"
+        );
+    }
+
+    #[test]
+    fn a_cpu_set_round_trips() {
+        let json = r#"{ "vcpu_count": 14, "mem_size_mib": 28672,
+                        "cpu_affinity": [1,2,3,4,5,6,7,17,18,19,20,21,22,23] }"#;
+        let mc: MachineConfig = serde_json::from_str(json).expect("parses");
+        assert_eq!(mc.cpu_affinity.len(), 14);
+        assert_eq!(mc.cpu_affinity.first(), Some(&1));
+        assert_eq!(mc.cpu_affinity.last(), Some(&23));
+
+        let back: MachineConfig =
+            serde_json::from_str(&serde_json::to_string(&mc).expect("serialises")).expect("parses");
+        assert_eq!(back.cpu_affinity, mc.cpu_affinity);
     }
 }
