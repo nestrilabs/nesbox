@@ -65,6 +65,12 @@ else
     need_root
 fi
 
+# Where interface state is read from. A variable so the checks that read it can
+# be exercised against a fabricated tree -- the loop check below is the kind of
+# thing that must be right the first time, and testing it for real means
+# building a loop on a live network.
+SYSFS_NET="${SYSFS_NET:-/sys/class/net}"
+
 BRIDGE="$(ask 'Bridge name to put guests on?' 'br-nestri')"
 TAP_COUNT="$(ask 'How many guests should this box be able to run at once?' '2')"
 TAP_USER="$(ask 'Which user does nesbox run as?' "${SUDO_USER:-$USER}")"
@@ -90,7 +96,7 @@ case "$MODE" in
     # Checked here rather than discovered three questions later. Every lookup
     # below reads this device, and under `set -euo pipefail` a missing one ends
     # the script with no message at all.
-    [[ -e "/sys/class/net/${UPLINK}" ]] || die "no interface named ${UPLINK} on this host"
+    [[ -e "${SYSFS_NET}/${UPLINK}" ]] || die "no interface named ${UPLINK} on this host"
     # The one question that decides the whole shape, and the one people get
     # wrong, because both halves are individually correct and incompatible.
     #
@@ -154,6 +160,46 @@ if [[ -n "${UPLINK_SLAVE:-}" ]]; then
     if [[ "$HOST_METHOD" == manual && -z "$HOST_ADDR" ]]; then
         die "${UPLINK} is configured static but has no address; fix that first"
     fi
+    # ── The loop this script created once ────────────────
+    # A bridge holding both an interface and a VLAN sub-interface *of that same
+    # interface* is a loop, and a real one: a frame arriving on ${UPLINK} is
+    # flooded out ${UPLINK}.<vlan>, which re-injects it onto ${UPLINK} tagged,
+    # and back to the switch. STP is off on this bridge -- deliberately, for
+    # the forwarding delay -- so nothing on the host catches it. The switch
+    # does, by blocking the port, which takes the host off the network
+    # entirely.
+    #
+    # This is exactly what a box switching from the tagged topology to this one
+    # walks into, because the sub-interface from the old arrangement is still
+    # enslaved. Checked rather than warned about: the failure costs a trip to
+    # the machine.
+    LOOPS=""
+    if [[ -d "${SYSFS_NET}/${BRIDGE}/brif" ]]; then
+        for port in "${SYSFS_NET}/${BRIDGE}/brif/"*; do
+            [[ -e "$port" ]] || continue
+            port="$(basename "$port")"
+            # A VLAN sub-interface of this uplink, by the kernel's own record
+            # of what it was made from -- not by the name, which is only a
+            # convention.
+            if [[ -e "${SYSFS_NET}/${port}/lower_${UPLINK}" ]]; then
+                LOOPS="${LOOPS} ${port}"
+            fi
+        done
+    fi
+    if [[ -n "$LOOPS" ]]; then
+        say ""
+        warn "${BRIDGE} already carries${LOOPS} — a VLAN on ${UPLINK} itself."
+        warn "Adding ${UPLINK} to the same bridge makes a loop: frames flooded"
+        warn "out${LOOPS} come back in on ${UPLINK} tagged. STP is off here, so"
+        warn "the switch is what notices, by blocking the port."
+        say ""
+        say "Remove the tagged uplink first, then run this again:"
+        for loop in $LOOPS; do
+            say "  ${DIM}nmcli con down ${loop} && nmcli con modify ${loop} connection.autoconnect no${RESET}"
+        done
+        die "stopped before making a loop"
+    fi
+
     say ""
     warn "This moves the host's address off ${UPLINK} and onto ${BRIDGE}."
     warn "Any session running over ${UPLINK} -- including this SSH one -- drops"
@@ -176,7 +222,7 @@ step "Bridge ${BRIDGE}"
 nm_profile_exists() { nmcli -t -f NAME con show 2>/dev/null | grep -qx "$1"; }
 
 if nm_active; then
-    if [[ -e "/sys/class/net/${BRIDGE}" ]] && ! nm_profile_exists "$BRIDGE"; then
+    if [[ -e "${SYSFS_NET}/${BRIDGE}" ]] && ! nm_profile_exists "$BRIDGE"; then
         warn "${BRIDGE} exists but NetworkManager does not manage it — probably"
         warn "made with \`ip link\`. NM cannot enslave anything to it in that state."
         if confirm "Remove it and recreate it through NetworkManager?" y; then
@@ -218,9 +264,9 @@ if nm_active; then
         fi
         run nmcli con up "$BRIDGE"
     fi
-elif [[ -d "/sys/class/net/${BRIDGE}/bridge" ]]; then
+elif [[ -d "${SYSFS_NET}/${BRIDGE}/bridge" ]]; then
     say "  already exists"
-elif [[ -e "/sys/class/net/${BRIDGE}" ]]; then
+elif [[ -e "${SYSFS_NET}/${BRIDGE}" ]]; then
     die "${BRIDGE} exists but is not a bridge"
 else
     run ip link add "$BRIDGE" type bridge
@@ -299,7 +345,7 @@ elif [[ "$MODE" == 1 ]]; then
             warn "skipped — guests will reach each other and nothing else until it is done"
         fi
     else
-        if [[ -e "/sys/class/net/${VLAN_IF}" ]]; then
+        if [[ -e "${SYSFS_NET}/${VLAN_IF}" ]]; then
             say "  ${VLAN_IF} already exists"
         else
             run ip link add link "$UPLINK" name "$VLAN_IF" type vlan id "$VLAN_ID"
@@ -348,7 +394,7 @@ fi
 step "Persistent taps owned by ${TAP_USER}"
 for ((i = 0; i < TAP_COUNT; i++)); do
     tap="nesbox${i}"
-    if [[ -e "/sys/class/net/${tap}" ]]; then
+    if [[ -e "${SYSFS_NET}/${tap}" ]]; then
         say "  ${tap} already exists"
     else
         run ip tuntap add dev "$tap" mode tap user "$TAP_USER"
@@ -392,6 +438,8 @@ elif confirm "Install a dispatcher script so the taps come back after a reboot?"
 
 for i in \$(seq 0 $((TAP_COUNT - 1))); do
     tap="nesbox\$i"
+    # The real path, not \${SYSFS_NET}: this runs at boot from NetworkManager,
+    # where nothing sets that variable.
     [ -e "/sys/class/net/\$tap" ] || ip tuntap add dev "\$tap" mode tap user ${TAP_USER}
     ip link set "\$tap" master ${BRIDGE}
     ip link set "\$tap" up
