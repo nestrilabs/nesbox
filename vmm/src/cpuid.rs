@@ -13,8 +13,8 @@
 //! what this guest wants.
 //!
 //! What is published instead: one package, one die, `vcpu_count` cores, one
-//! thread each. That is honest for how nessh places a sandbox -- a set of
-//! whole cores inside a single L3 domain, with the host free to move vCPUs
+//! thread each. That is honest for the placement nesbox is built for -- a set
+//! of whole cores inside a single L3 domain, with the host free to move vCPUs
 //! within it -- and it means the guest never believes two of its CPUs are
 //! hyperthread siblings.
 //!
@@ -308,7 +308,7 @@ mod tests {
     }
 
     /// The whole point: the guest must never believe two of its CPUs share a
-    /// physical core, because nessh hands it whole cores.
+    /// physical core, because the caller hands it whole cores.
     #[test]
     fn no_two_vcpus_are_hyperthread_siblings() {
         let mut c = host_like_cpuid();
@@ -403,8 +403,8 @@ mod tests {
 /// EAX[25:14] is the count of logical processors sharing the cache, minus one.
 ///
 /// L1 and L2 become private to their core. The last level stays shared by
-/// every vCPU, which is true by construction -- nessh places a sandbox inside
-/// a single L3 domain, so all of its CPUs really do share one.
+/// every vCPU, which is true by construction when a guest is placed inside a
+/// single L3 domain, so all of its CPUs really do share one.
 fn patch_cache_sharing(cpuid: &mut CpuId, cores: u32, vendor: Vendor) {
     let leaf = match vendor {
         Vendor::Amd => 0x8000_001d,
@@ -470,9 +470,9 @@ mod cache_tests {
         assert_eq!(sharing(&c, 2), 1, "L2 must be private");
     }
 
-    /// The last level really is shared by every vCPU -- nessh places a sandbox
-    /// inside one L3 domain -- so it should say so, for this guest's size and
-    /// not the host's.
+    /// The last level really is shared by every vCPU -- a guest is placed inside
+    /// one L3 domain -- so it should say so, for this guest's size and not the
+    /// host's.
     #[test]
     fn the_last_level_is_shared_by_every_vcpu() {
         let mut c = host_like_cpuid();

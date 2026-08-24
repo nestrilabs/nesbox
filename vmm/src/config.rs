@@ -65,7 +65,8 @@ pub struct Network {
     /// once.
     /// Tap to open. Exact: the host created it, so nesbox is not choosing.
     pub tap_name: String,
-    /// Guest MAC. Generated if absent, though nessh always supplies one.
+    /// Guest MAC. Generated if absent; a supervising agent would normally
+    /// supply one so the address is stable across restarts.
     pub mac: Option<String>,
 }
 
@@ -155,7 +156,7 @@ pub struct MachineConfig {
     /// -- nesbox's ACPI tables do not describe CPU topology -- so it would
     /// schedule against a layout it cannot see.
     ///
-    /// Applied verbatim. Which CPUs belong to a guest is nessh's decision;
+    /// Applied verbatim. Which CPUs belong to a guest is the caller's decision;
     /// this end only carries it out, the same way `vcpu_count` works.
     #[serde(default)]
     pub cpu_affinity: Vec<usize>,
@@ -184,8 +185,8 @@ mod machine_config_tests {
 
     /// Every config written before `cpu_affinity` existed must still parse, and
     /// must mean "no affinity" rather than "no CPUs" — a hand-written config
-    /// used to debug a box is the common case. nessh itself now always emits
-    /// the field, empty where the host's cache topology could not be read.
+    /// used to debug a box is the common case. A supervising agent should always
+    /// emit the field, empty where the host's cache topology could not be read.
     #[test]
     fn a_config_without_cpu_affinity_still_parses() {
         let json = r#"{ "vcpu_count": 4, "mem_size_mib": 8192 }"#;

@@ -507,14 +507,14 @@ if [[ -n "${UPLINK_SLAVE:-}" ]]; then
     say "the switch port carries nothing else: every VLAN trunked to it tagged is"
     say "one an escaped guest can reach by creating a sub-interface for the tag."
     say ""
-    say "Give each guest an address on that network. nessh does this; a"
-    say "hand-written config needs it on the kernel command line:"
+    say "Give each guest an address on that network. An orchestrator would do"
+    say "this; a hand-written config needs it on the kernel command line:"
     say "  ${DIM}nestri.ip=<addr>/<prefix> nestri.gw=<gateway>${RESET}"
 elif [[ "$MODE" == 1 ]]; then
     say "  uplink:  ${VLAN_IF} (VLAN ${VLAN_ID} on ${UPLINK})"
     say ""
-    say "Give each guest an address on that VLAN. nessh does this; a hand-written"
-    say "config needs it on the kernel command line:"
+    say "Give each guest an address on that VLAN. An orchestrator would do this;"
+    say "a hand-written config needs it on the kernel command line:"
     say "  ${DIM}nestri.ip=<addr>/<prefix> nestri.gw=<gateway>${RESET}"
 else
     say "  host:    ${HOST_ADDR} on ${BRIDGE}, masquerading"

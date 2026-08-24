@@ -107,7 +107,27 @@ impl BlkInner {
                 }
                 BLK_S_OK
             }
-            BLK_T_FLUSH => { let _ = self.file.flush(); BLK_S_OK }
+            BLK_T_FLUSH => {
+                // fdatasync, NOT Write::flush. `File`'s flush is a documented
+                // no-op -- std does no userspace buffering -- so calling it
+                // while advertising VIRTIO_BLK_F_FLUSH tells the guest its
+                // barrier landed when nothing was forced to the platter. A
+                // guest that writes, flushes, and is told OK will treat the
+                // data as durable, and a host crash loses it.
+                //
+                // The error is reported rather than swallowed for the same
+                // reason: a flush that failed is not a flush.
+                if self.read_only {
+                    return BLK_S_OK;
+                }
+                match self.file.sync_data() {
+                    Ok(()) => BLK_S_OK,
+                    Err(e) => {
+                        log::error!("virtio-blk: fdatasync failed: {e}");
+                        BLK_S_IOERR
+                    }
+                }
+            }
             BLK_T_GET_ID => {
                 let id = b"nesbox-vda\0\0\0\0\0\0\0\0\0\0";
                 for &(addr, len, _) in dd {

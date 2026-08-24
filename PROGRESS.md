@@ -270,6 +270,39 @@ Do not re-derive these.
 
 ## 6. Known gaps
 
+- **Storage is the weakest device in the VMM, and one part of it was a
+  correctness bug.** `virtio-blk` advertised `VIRTIO_BLK_F_FLUSH` (feature bit 9)
+  and implemented `BLK_T_FLUSH` as `File::flush()`, which is a **documented no-op**
+  — `std` does no userspace buffering, so nothing was forced to the platter. A
+  guest that wrote, flushed, and was told OK treated the data as durable and a
+  host crash lost it. Now `sync_data()`, with the error reported rather than
+  swallowed, because a flush that failed is not a flush.
+
+  The rest is performance, and it is structural rather than a missing flag:
+
+  - **Request depth is effectively 1.** `io()` uses `seek` + `read_exact` /
+    `write_all`, so the file offset is shared state and requests *must* be
+    serialised. One worker thread drains the ring one entry at a time. A guest
+    that submits 128 deep gets them executed in single file.
+  - **A `vec![0u8; len]` per descriptor, per request.** Every read allocates a
+    host buffer, reads into it, copies into guest memory, and frees it. Guest
+    memory is already mapped in this process; the copy and the allocator traffic
+    both exist only because of the `seek`-based API.
+  - **One queue.** No per-vCPU submission, so all guest CPUs contend on one ring
+    and one lock.
+  - **No `DISCARD` / `WRITE_ZEROES`.** Nothing ever punches holes back, so a
+    thin-provisioned image only grows.
+
+  `pread`/`pwrite` into guest memory would remove the shared offset, the copy and
+  the allocation together, and make a small worker pool possible — most of the
+  win, without `io_uring`. `io_uring` is the right end state for depth and for
+  `O_DIRECT`, which matters more than it looks: without it, every byte a guest
+  reads is cached twice, once in the host page cache and once in the guest's, so
+  N guests streaming large files cost N times the host RAM for the same bytes.
+
+  §6's 8.5 ms worst case over a 400 MiB read is the visible symptom of all of the
+  above, and it has still never been measured with GPU work in flight.
+
 - **Egress works**: guest to 1.1.1.1, 0% loss, 11.5ms, with the host set up as
   the only privileged step. Verified from a blocked host: setup detected the
   dropping forward chain, asked, added both `DOCKER-USER` rules itself and
@@ -278,8 +311,7 @@ Do not re-derive these.
 - **`--persist` has never been run.** The unit it writes is unit-tested for
   content and ordering, but installing it needs root and no host has rebooted
   with it in place.
-- **passt versus tap is not settled.** The nessh side raised a risk worth more
-  than the CPU argument: iroh's hole punching is developed against conntrack,
+- **passt versus tap is not settled.** A risk worth more than the CPU argument: iroh's hole punching is developed against conntrack,
   and passt is a second NAT with its own mapping semantics. If direct
   connections degrade, sessions fall back to relays and everything keeps working
   slightly worse forever, which is the hardest kind of failure to notice. Test
@@ -346,11 +378,12 @@ Do not re-derive these.
   `renderD128`. RADV cannot enumerate another driver's connectors. A compositor is
   the only route to a surface, which is what `nescope` is for.
 
-- **The full guest stack powers the box off if it has no session, and it looks like
-  a crash.** With `nestri-guest-hub` running and no vsock and no network, the box
-  reaches a login prompt and powers off a few seconds later — reproducibly, with
-  stdin held open and nothing typed, so it is not a console bug. The hub is an iroh
-  agent with `respawn_max="2"` and an idle timeout; it cannot dial anything, so it
+- **A guest whose init supervises a session agent powers the box off when that
+  agent cannot reach anything, and it looks like a crash.** With such an agent
+  running and no vsock and no network, the box reaches a login prompt and powers
+  off a few seconds later — reproducibly, with stdin held open and nothing typed,
+  so it is not a console bug. The agent had a bounded respawn count and an idle
+  timeout; it cannot dial anything, so it
   gives up. For GPU work that needs none of that, boot
   `init=/bin/bash` and mount by hand — `examples/` has the pattern, and
   `test-gpu-bare.json` is a working config. Expect the documented
@@ -490,9 +523,9 @@ subcommands that installed the host's forwarding and masquerade rules behind a
 consent prompt.
 
 The reasoning behind that split was sound and still is: host-global state is not
-a running VM's business, and nessh is network-facing and anonymous by design, so
-giving *it* the capability would turn a compromise of it into a compromise of
-the host firewall. What changed is the conclusion. A VMM that wants net-admin on
+a running VM's business, and the agent that would hold it is network-facing, so
+giving *it* the capability would turn a compromise of that agent into a
+compromise of the host firewall. What changed is the conclusion. A VMM that wants net-admin on
 its binary is a thing to ask of everyone who self-hosts, and pre-created taps
 make the question unnecessary rather than answering it. Host administration
 moved to a shell script, which is what it always was.
