@@ -309,6 +309,24 @@ Expect the documented `Attempted to kill init!` panic when the shell exits;
 
 ---
 
+### Does a VRAM limit bind, and does it stay contained?
+
+```sh
+# The probe's whole device-memory footprint is one 8 MiB render target, so a
+# limit either side of that is a decisive test.
+#   "vram-limit-mib": 16   -> runs, 8/16 MiB held
+#   "vram-limit-mib": 4    -> refused at GEM_NEW, guest wedges
+# Occupancy and refusals appear in the VMM log:
+grep -E "VRAM|budget exceeded" run.log
+```
+
+Then the test that matters: run an over-budget guest beside a workable one and
+compare the workable one against its **solo** baseline, not against itself. A
+containment failure shows up as the neighbour slowing down, which is invisible
+unless there is a solo number to compare with.
+
+---
+
 ## 10. What these numbers do and do not support
 
 **Do:**
@@ -334,7 +352,105 @@ Expect the documented `Attempted to kill init!` panic when the shell exits;
 
 ---
 
-## 11. Open, in the order that matters
+## 11. Per-guest VRAM: what a limit can and cannot do
+
+A guest on this path carries no vendor GPU driver. It asks for device memory with
+`AMDGPU_CCMD_GEM_NEW`, the renderer calls `amdgpu_bo_alloc` for it, and nothing in
+between bounds how much it may ask for. One guest can exhaust a card that its
+neighbours are sharing. `vram-limit-mib` in the GPU config bounds it.
+
+### 11.1 The enforcement point is not where it looks
+
+The obvious place is `RESOURCE_CREATE_BLOB`, which carries a plain `size`. It is
+the wrong place, and so is the next candidate. The guest reaches device memory in
+two steps:
+
+1. `SUBMIT_3D` carrying `AMDGPU_CCMD_GEM_NEW` — **this is where host memory is
+   committed.**
+2. `RESOURCE_CREATE_BLOB` naming the same `blob_id` — the renderer looks the
+   already-allocated buffer up and wraps it.
+
+So refusing step 2 leaves the memory allocated with no resource id to free it by.
+Refusing step 1 does prevent the allocation — but **neither step can report a
+refusal to the guest**, because both are asynchronous. Measured: the guest kernel
+logs `*ERROR* response 0x1200 (command 0x10c)` and returns success from the ioctl
+anyway, so Mesa's `alloc_host_blob()` never sees the zero handle it checks for,
+proceeds with an unbacked buffer, and the first submit referencing it waits on a
+fence that never signals. **The guest hangs instead of failing.**
+
+`shmem->async_error` is the only channel that can carry the news, and Mesa reads
+it in exactly one place (`amdvgpu_cs_query_reset_state2`), so it surfaces only if
+something asks.
+
+### 11.2 So the report does the work, and the refusal is a backstop
+
+Two parts, in `patches/0002`:
+
+- **Report the budget, not the card.** All three paths that tell a guest how much
+  VRAM exists — the shmem heap block, `AMDGPU_INFO_MEMORY`, `AMDGPU_INFO_VRAM_GTT`
+  — report the limit, and report the guest's own usage rather than the card's. A
+  guest that reads the memory budget then sizes itself to what it was given,
+  through the ordinary Vulkan path, with no error at all. This is the part that
+  does useful work, and it only works for guests that ask. Most engines do;
+  `nesprobe` does not, which is why the measurement below hits the backstop.
+- **Refuse in `GEM_NEW`.** Contains a guest that ignores the report, at the cost of
+  that guest wedging.
+
+Only the VRAM heap is bounded. GTT is host system memory, capped for the whole VMM
+process by cgroups; counting it twice would refuse guests for memory they never
+took from the card.
+
+### 11.3 Measured
+
+Reference host, `nesprobe` at 1080p, whose entire device-memory footprint is **one
+8 MiB render target** — so the limit can be placed either side of a known number.
+
+| `vram-limit-mib` | outcome |
+|---|---|
+| 4096 | runs; occupancy reported as 8 MiB, released to 0 at teardown |
+| 16 | runs; 8/16 MiB held, peak 8 MiB |
+| 4 | refused at `GEM_NEW`, 8 MiB against a 4 MiB budget; guest wedges |
+
+Both layers agree independently on the refusal — the VMM's accounting and the
+renderer's budget each computed 8 MiB against 4 MiB — which is the point of
+keeping the VMM-side counting after moving enforcement out of it.
+
+**The result that matters is the neighbour.** One guest given a 4 MiB budget it
+cannot satisfy, alongside one given a workable 512 MiB running the probe at
+`cost=400`:
+
+| | frames | fps | p50 | p99 |
+|---|---|---|---|---|
+| over-budget guest | 0 | — | — | — |
+| its neighbour | 1688 | 99.26 | 10.022 | 10.976 |
+| **solo baseline** | — | 98.8 | 10.06 | 11.03 |
+
+The neighbour performed as though it were alone on the card. **A guest that
+exhausts its VRAM limit is fully contained**, which is the property "many
+sandboxes, one GPU" actually needs.
+
+### 11.4 What this does not achieve
+
+**A clean, guest-visible out-of-memory error is not available on this path.** The
+best outcomes are: a cooperative guest sizes itself down and never fails, or an
+uncooperative one wedges itself without touching its neighbours. There is no third
+option today without a guest-side change — Mesa checking `async_error` after
+`vdrm_bo_create`, or the blob create becoming synchronous — and the guest is
+deliberately not a place we hold boundaries.
+
+Two smaller findings worth keeping:
+
+- **`deny_unknown_fields` on the GPU config.** `vram-limit-mib` is kebab-case like
+  its siblings, and serde silently ignored the underscored spelling — leaving the
+  guest unbounded while the config looked correct. A safety limit must not fail
+  open on a typo.
+- **The `-Wmaybe-uninitialized` warning was a real bug.** Two validation paths at
+  the top of `GEM_NEW` `goto` past the budget bookkeeping, so the credit-back read
+  uninitialised memory. Declared before the first jump.
+
+---
+
+## 12. Open, in the order that matters
 
 1. **RDNA 4.** Untested. Everything above is Vega.
 2. **Frame counts from a real application.** `nesprobe` counts its own; an
@@ -344,3 +460,11 @@ Expect the documented `Attempted to kill init!` panic when the shell exits;
 4. **Block I/O under GPU load.** `PROGRESS.md` §6 records an 8.5 ms worst case over a
    400 MiB read — over half a 60 Hz frame budget — and it has never been measured
    *with* GPU work in flight.
+5. **Whether a real engine honours the clamped heap.** §11.2 rests on guests reading
+   `VkPhysicalDeviceMemoryBudgetPropertiesEXT` and sizing themselves accordingly.
+   `nesprobe` does not, so nothing here demonstrates it. Until something that does
+   is measured, the clamp is reasoning and only the containment in §11.3 is
+   evidence.
+6. **What a VRAM limit costs when it is not exceeded.** §11.3 shows the limit binds
+   and contains, not what the accounting costs a guest that stays inside it. The
+   per-submit ccmd parse is on the hot path.

@@ -51,6 +51,8 @@ pub struct Worker {
     pub num_capsets: Arc<AtomicU32>,
     gpu_device_path: PathBuf,
     mapper: Arc<dyn HostMemoryMapper>,
+    /// Per-guest device-memory limit in bytes, or `None` for unbounded.
+    vram_limit_bytes: Option<u64>,
 }
 
 impl Worker {
@@ -64,6 +66,7 @@ impl Worker {
         num_capsets: Arc<std::sync::atomic::AtomicU32>,
         gpu_device_path: PathBuf,
         mapper: Arc<dyn HostMemoryMapper>,
+        vram_limit_bytes: Option<u64>,
     ) -> Self {
         Worker {
             receiver,
@@ -74,6 +77,7 @@ impl Worker {
             num_capsets,
             gpu_device_path,
             mapper,
+            vram_limit_bytes,
         }
     }
 
@@ -96,6 +100,7 @@ impl Worker {
             self.displays.clone(),
             self.gpu_device_path.clone(),
             self.mapper.clone(),
+            self.vram_limit_bytes,
         ) else {
             log::error!(
                 "virtio-gpu: backend failed to initialise; the device will accept \

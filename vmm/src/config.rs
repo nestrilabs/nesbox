@@ -26,7 +26,10 @@ pub struct VmConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
+// `deny_unknown_fields` because `vram-limit-mib` is a safety limit: misspell it
+// and serde would silently leave the guest unbounded. A config error must be an
+// error, not a default.
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Gpu {
     /// Host render node to give the guest, e.g. `/dev/dri/renderD128`.
     #[serde(default = "default_render_node")]
@@ -35,6 +38,13 @@ pub struct Gpu {
     pub width: u32,
     #[serde(default = "default_height")]
     pub height: u32,
+    /// Device memory this guest may hold, in MiB.
+    ///
+    /// Omitted, the guest may allocate until the card is exhausted -- fine when
+    /// it is the only guest, unsafe when it is not, since VRAM cannot be
+    /// reclaimed from a guest that has taken it.
+    #[serde(default)]
+    pub vram_limit_mib: Option<u64>,
 }
 
 fn default_render_node() -> PathBuf {

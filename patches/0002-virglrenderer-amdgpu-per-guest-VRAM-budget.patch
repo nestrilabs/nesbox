@@ -1,0 +1,270 @@
+virglrenderer/amdgpu: per-guest VRAM budget
+
+Applies on top of 0001, against virglrenderer 7fcfce4.
+
+A guest on the DRM native-context path carries no vendor GPU driver: it asks for
+device memory with AMDGPU_CCMD_GEM_NEW and the renderer calls amdgpu_bo_alloc on
+its behalf. Nothing between the guest and the card bounds how much it may ask
+for, so one guest can exhaust a card its neighbours are sharing.
+
+This adds a per-context budget from NESTRI_VRAM_LIMIT_MIB, in two parts:
+
+  * The three paths that tell a guest how much VRAM exists -- the shmem heap
+    block, AMDGPU_INFO_MEMORY and AMDGPU_INFO_VRAM_GTT -- report the budget
+    rather than the card, and report the guest's own usage rather than the
+    card's. This is the part that does useful work: a guest that reads the
+    memory budget sizes itself to what it was given, through the ordinary
+    Vulkan path, with no error at all.
+
+  * GEM_NEW refuses an allocation past the budget. This is a backstop, not the
+    mechanism, and it is worth being precise about what it does and does not
+    achieve.
+
+Why the refusal cannot be reported to the guest, measured rather than assumed:
+the guest kernel's RESOURCE_CREATE_BLOB ioctl carries the GEM_NEW as its cmd
+payload but does not wait for it, so the ioctl returns success whatever the host
+decided. Mesa's alloc_host_blob() only detects failure through a zero handle
+from that ioctl, so it never learns, proceeds with a buffer that has no backing,
+and the first submit referencing it waits on a fence that never signals. The
+guest hangs instead of failing. shmem->async_error is the only channel that can
+carry the news, and Mesa reads it just once, in amdvgpu_cs_query_reset_state2,
+so it surfaces only if something asks.
+
+So a refused guest wedges itself. What matters is that it wedges only itself:
+with one guest given a budget it cannot satisfy and a second given a workable
+one, the second measured p50 10.022 ms / p99 10.976 ms / 99.26 fps against a
+solo baseline of 10.06 / 11.03 / 98.8 -- unaffected.
+
+Only the VRAM heap is bounded. GTT lives in host system memory, which is capped
+for the whole VMM process by cgroups; counting it here as well would refuse
+guests for memory they never took from the card.
+
+--- a/src/drm/amdgpu/amdgpu_renderer.c	2026-08-24 23:17:01.080945070 +0300
++++ b/src/drm/amdgpu/amdgpu_renderer.c	2026-08-24 23:17:01.083060960 +0300
+@@ -88,6 +88,27 @@
+ 
+    struct hash_table_u64 *id_to_ctx;
+ 
++   /* NESTRI: per-guest VRAM budget, from NESTRI_VRAM_LIMIT_MIB.
++    *
++    * Nothing between a native-context guest and the card bounds how much
++    * device memory it may ask for, so one guest can exhaust a card its
++    * neighbours are sharing. The VMM knows the guest's entitlement and could
++    * refuse the allocation itself, but it cannot tell the guest it did:
++    * RESOURCE_CREATE_BLOB is asynchronous, so a refusal there leaves the guest
++    * holding an unbacked buffer and waiting on a fence that never signals.
++    *
++    * Refusing here is the difference, because this is where a genuine
++    * amdgpu_bo_alloc failure is already handled -- the alloc_failed path bumps
++    * shmem->async_error, which Mesa reports through
++    * amdvgpu_cs_query_reset_state2 as a lost context. So a guest over its
++    * budget fails exactly as a guest on a genuinely full card does, and no new
++    * failure mode is introduced into the guest driver.
++    *
++    * 0 means unbounded.
++    */
++   uint64_t vram_limit;
++   uint64_t vram_charged;
++
+    uint32_t timeline_count;
+    struct drm_timeline timelines[];
+ };
+@@ -136,6 +157,8 @@
+    bool has_metadata    :1;
+    bool exported        :1;
+    bool enable_cache_wc :1;
++   /* NESTRI: this object's size is charged against ctx->vram_charged. */
++   bool holds_vram_budget :1;
+ };
+ DEFINE_CAST(drm_object, amdgpu_object)
+ 
+@@ -277,6 +300,15 @@
+ 
+    print(2, "free obj res_id: %d", dobj->res_id);
+ 
++   /* NESTRI: return the budget. drm_context_deinit() frees every object a
++    * context created, so this runs whether the guest unreffed the resource or
++    * simply died.
++    */
++   if (obj->holds_vram_budget) {
++      assert(ctx->vram_charged >= dobj->size);
++      ctx->vram_charged -= dobj->size;
++   }
++
+    amdgpu_bo_free(obj->bo);
+    free(obj);
+ }
+@@ -354,6 +386,38 @@
+                amdgpu_device_get_fd(ctx->dev), args.out.addr_ptr);
+ }
+ 
++/* NESTRI: present the guest's budget as if it were the card's VRAM.
++ *
++ * Refusing an over-budget allocation contains the damage but cannot report it:
++ * the guest kernel's blob-create ioctl succeeds whatever the host did with the
++ * GEM_NEW inside it, so Mesa never sees an allocation fail and the guest hangs
++ * on a fence instead of returning an error. Measured.
++ *
++ * A guest that is told a small heap, on the other hand, refuses its own
++ * allocations through the ordinary Vulkan budget path, with the ordinary error.
++ * So the report is the mechanism that makes a cooperative guest behave, and the
++ * budget check in GEM_NEW is only the backstop for a guest that ignores it.
++ *
++ * Every path that tells the guest how much VRAM exists has to agree, or the
++ * guest fails somewhere other than where it was told it would: the shmem heap
++ * block below, and AMDGPU_INFO_MEMORY and AMDGPU_INFO_VRAM_GTT in
++ * amdgpu_ccmd_query_info().
++ */
++/* A macro rather than a function because the two families of struct that report
++ * VRAM use different 64-bit typedefs -- libdrm's uint64_t and the uapi's __u64 --
++ * which are distinct types to the compiler even where they are the same width.
++ */
++#define NESTRI_CAP(field, cap)                                                   \
++   do {                                                                          \
++      if ((field) > (cap))                                                       \
++         (field) = (cap);                                                        \
++   } while (0)
++
++/* This guest's VRAM window: how much it may hold, and how much it holds now. */
++#define NESTRI_VRAM_WINDOW(ctx, lim, used)                                       \
++   uint64_t lim = (ctx)->vram_limit;                                             \
++   uint64_t used = (ctx)->vram_charged < lim ? (ctx)->vram_charged : lim
++
+ static void
+ update_heap_info_in_shmem(struct amdgpu_context *ctx)
+ {
+@@ -366,6 +430,21 @@
+    amdgpu_query_heap_info(ctx->dev, AMDGPU_GEM_DOMAIN_GTT,
+                           0,
+                           &ctx->shmem->gtt);
++
++   if (ctx->vram_limit) {
++      NESTRI_VRAM_WINDOW(ctx, lim, used);
++      /* struct amdgpu_heap_info has no total/usable split. Usage is set to this
++       * guest's own, not the card's: a guest told a heap it has barely touched
++       * is nearly full will degrade itself for no reason.
++       */
++      NESTRI_CAP(ctx->shmem->vram.heap_size, lim);
++      ctx->shmem->vram.heap_usage = used;
++      NESTRI_CAP(ctx->shmem->vram.max_allocation, lim - used);
++
++      NESTRI_CAP(ctx->shmem->vis_vram.heap_size, lim);
++      ctx->shmem->vis_vram.heap_usage = used;
++      NESTRI_CAP(ctx->shmem->vis_vram.max_allocation, lim - used);
++   }
+ }
+ 
+ static int
+@@ -501,6 +580,32 @@
+             "ioctl error: fd: %d request.query: 0x%x r: %d|%d %s",
+             amdgpu_device_get_fd(ctx->dev), request.query, rsp->hdr.ret, r, strerror(errno));
+ 
++   /* NESTRI: clamp the two queries that tell the guest how much VRAM it has.
++    * Short reads are the guest's business, but a partial struct must not be
++    * rewritten as though it were whole.
++    */
++   if (r == 0 && ctx->vram_limit) {
++      NESTRI_VRAM_WINDOW(ctx, lim, used);
++      if (request.query == AMDGPU_INFO_MEMORY &&
++          return_size >= sizeof(struct drm_amdgpu_memory_info)) {
++         struct drm_amdgpu_memory_info *mi = value;
++         NESTRI_CAP(mi->vram.total_heap_size, lim);
++         NESTRI_CAP(mi->vram.usable_heap_size, lim);
++         mi->vram.heap_usage = used;
++         NESTRI_CAP(mi->vram.max_allocation, lim - used);
++
++         NESTRI_CAP(mi->cpu_accessible_vram.total_heap_size, lim);
++         NESTRI_CAP(mi->cpu_accessible_vram.usable_heap_size, lim);
++         mi->cpu_accessible_vram.heap_usage = used;
++         NESTRI_CAP(mi->cpu_accessible_vram.max_allocation, lim - used);
++      } else if (request.query == AMDGPU_INFO_VRAM_GTT &&
++                 return_size >= sizeof(struct drm_amdgpu_info_vram_gtt)) {
++         struct drm_amdgpu_info_vram_gtt *vg = value;
++         NESTRI_CAP(vg->vram_size, lim);
++         NESTRI_CAP(vg->vram_cpu_accessible_size, lim);
++      }
++   }
++
+    memcpy(rsp->payload, value, req->info.return_size);
+    free(value);
+ 
+@@ -513,6 +618,10 @@
+    const struct amdgpu_ccmd_gem_new_req *req = to_amdgpu_ccmd_gem_new_req(hdr);
+    struct amdgpu_context *ctx = to_amdgpu_context(dctx);
+    int ret = 0;
++   /* NESTRI: declared before the first goto so the credit-back below cannot
++    * read it uninitialised on the validation failure paths.
++    */
++   bool charged_vram = false;
+ 
+    if (req->r.__pad) {
+       print(0, "Invalid value for struct %s_req::r::__pad: "
+@@ -543,6 +652,25 @@
+     */
+    uint64_t alloc_flags = req->r.flags & ~AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
+ 
++   /* NESTRI: refuse allocations past this guest's VRAM budget. Only the VRAM
++    * heap is bounded here; GTT lives in host system memory, which is capped for
++    * the whole VMM process by cgroups, and counting it twice would refuse
++    * guests for memory they never took from the card.
++    */
++   if (ctx->vram_limit && (req->r.preferred_heap & AMDGPU_GEM_DOMAIN_VRAM)) {
++      if (ctx->vram_charged + req->r.alloc_size > ctx->vram_limit ||
++          ctx->vram_charged + req->r.alloc_size < ctx->vram_charged /* overflow */) {
++         print(0, "VRAM budget exceeded: %" PRIu64 " KiB requested, %" PRIu64
++                  "/%" PRIu64 " KiB held -- refusing",
++               req->r.alloc_size / 1024, ctx->vram_charged / 1024,
++               ctx->vram_limit / 1024);
++         ret = -ENOMEM;
++         goto alloc_failed;
++      }
++      ctx->vram_charged += req->r.alloc_size;
++      charged_vram = true;
++   }
++
+    struct amdgpu_bo_alloc_request r = {
+       .alloc_size = req->r.alloc_size,
+       .phys_alignment = req->r.phys_alignment,
+@@ -569,6 +697,7 @@
+       goto va_map_failed;
+ 
+    obj->base.handle = gem_handle;
++   obj->holds_vram_budget = charged_vram;
+    /* Enable Write-Combine except for GTT buffers with WC disabled. */
+    obj->enable_cache_wc =
+       (req->r.preferred_heap != AMDGPU_GEM_DOMAIN_GTT) ||
+@@ -585,6 +714,10 @@
+    amdgpu_bo_free(bo_handle);
+ 
+ alloc_failed:
++   /* NESTRI: an allocation that did not survive holds no budget. */
++   if (charged_vram)
++      ctx->vram_charged -= req->r.alloc_size;
++
+    print(2, "ERROR blob_id: %" PRIu64 " heap: %08x flags: %" PRIx64,
+          req->blob_id, req->r.preferred_heap, req->r.flags);
+    if (ctx->shmem)
+@@ -1261,6 +1394,23 @@
+    if (d)
+       ctx->debug = atoi(d);
+ 
++   /* NESTRI: per-guest VRAM budget. One VMM process serves one guest, so the
++    * environment is the right scope for it. Absent or 0 means unbounded.
++    */
++   ctx->vram_limit = 0;
++   ctx->vram_charged = 0;
++   const char *vram_mib = getenv("NESTRI_VRAM_LIMIT_MIB");
++   if (vram_mib) {
++      char *end = NULL;
++      unsigned long long mib = strtoull(vram_mib, &end, 10);
++      if (end && *end == '\0' && mib > 0) {
++         ctx->vram_limit = (uint64_t)mib << 20;
++         print(0, "VRAM budget %llu MiB", mib);
++      } else {
++         print(0, "ignoring malformed NESTRI_VRAM_LIMIT_MIB=\"%s\"", vram_mib);
++      }
++   }
++
+    print(1, "amdgpu_renderer_create name=%s fd=%d (from %d) -> dev=%p", ctx->debug_name, fd,
+          amdgpu_device_get_fd(ctx->dev), (void*)ctx->dev);
+ 

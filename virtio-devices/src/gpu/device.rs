@@ -66,6 +66,9 @@ pub struct GpuConfig {
     pub render_node: PathBuf,
     /// Virtual displays to advertise.
     pub displays: Vec<DisplayInfo>,
+    /// Device memory this guest may hold, in bytes. `None` lets it allocate
+    /// until the card is exhausted, which is only safe for a sole tenant.
+    pub vram_limit_bytes: Option<u64>,
 }
 
 /// The queue state and interrupt plumbing the worker and the fence handler
@@ -116,6 +119,7 @@ struct Inner {
     num_capsets: Arc<AtomicU32>,
     displays: Box<[DisplayInfo]>,
     render_node: PathBuf,
+    vram_limit_bytes: Option<u64>,
     shm_guest_addr: u64,
     mapper: Option<Arc<dyn HostMemoryMapper>>,
     queues: Arc<Queues>,
@@ -164,6 +168,7 @@ impl Inner {
             self.num_capsets.clone(),
             self.render_node.clone(),
             mapper,
+            self.vram_limit_bytes,
         );
         worker.run();
         self.notify = Some(tx);
@@ -259,6 +264,7 @@ impl GpuDevice {
                 num_capsets: Arc::new(AtomicU32::new(1)),
                 displays,
                 render_node: config.render_node.clone(),
+                vram_limit_bytes: config.vram_limit_bytes,
                 // Filled in by `set_shm_guest_addr` once the bus has placed
                 // BAR2; the device cannot be activated before that.
                 shm_guest_addr: 0,

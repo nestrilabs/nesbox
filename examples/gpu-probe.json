@@ -22,7 +22,8 @@
   "gpu": {
     "render-node": "/dev/dri/renderD128",
     "width": 1920,
-    "height": 1080
+    "height": 1080,
+    "vram-limit-mib": 512
   },
   "shared-directories": [
     {

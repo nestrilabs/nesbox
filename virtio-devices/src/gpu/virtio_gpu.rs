@@ -28,6 +28,7 @@ use super::protocol::{
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_MAX_SCANOUTS,
     VirtioGpuResult,
 };
+use super::vram::VramAccountant;
 use super::{GpuError, GpuQueues, HostMemoryMapper, Result, VirtioShmRegion};
 
 // ---------------------------------------------------------------------------
@@ -147,6 +148,10 @@ pub struct VirtioGpu {
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
     pub num_capsets: u32,
+    /// Bounds how much device memory this guest may hold. `None` leaves the
+    /// guest able to allocate until the card is exhausted, which is only safe
+    /// when it is the sole tenant.
+    vram: Option<VramAccountant>,
 }
 
 impl fmt::Debug for VirtioGpu {
@@ -306,6 +311,7 @@ impl VirtioGpu {
         displays: Box<[DisplayInfo]>,
         gpu_device_path: PathBuf,
         mapper: Arc<dyn HostMemoryMapper>,
+        vram_limit_bytes: Option<u64>,
     ) -> Option<Self> {
         let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(FenceState::default()));
 
@@ -332,6 +338,13 @@ impl VirtioGpu {
             scanouts: Default::default(),
             displays,
             num_capsets,
+            vram: vram_limit_bytes.map(|limit| {
+                log::info!(
+                    "virtio-gpu: VRAM limit {} MiB for this guest",
+                    limit / (1 << 20)
+                );
+                VramAccountant::new(limit)
+            }),
         })
     }
 
@@ -475,6 +488,9 @@ impl VirtioGpu {
             self.rutabaga.unmap(resource_id)?;
         }
         self.rutabaga.unref_resource(resource_id)?;
+        if let Some(vram) = self.vram.as_mut() {
+            vram.release_resource(resource_id);
+        }
         Ok(OkNoData)
     }
 
@@ -583,6 +599,9 @@ impl VirtioGpu {
         {
             Ok(_) => {
                 log::info!("NESBOX_GPU: create_context succeeded");
+                if let Some(vram) = self.vram.as_mut() {
+                    vram.note_context(ctx_id, context_init);
+                }
                 Ok(GpuResponse::OkNoData)
             }
             Err(e) => {
@@ -594,6 +613,11 @@ impl VirtioGpu {
 
     pub fn destroy_context(&mut self, ctx_id: u32) -> VirtioGpuResult {
         self.rutabaga.destroy_context(ctx_id)?;
+        // Releases charges the guest allocated but never claimed with a blob
+        // create; without this they would be held for the life of the VM.
+        if let Some(vram) = self.vram.as_mut() {
+            vram.forget_context(ctx_id);
+        }
         Ok(OkNoData)
     }
 
@@ -613,6 +637,18 @@ impl VirtioGpu {
         commands: &mut [u8],
         fence_ids: &[u64],
     ) -> VirtioGpuResult {
+        // Count the device memory this stream asks for. Measurement only: the
+        // refusal happens in the renderer, because a refusal here cannot be
+        // reported to the guest. RESOURCE_CREATE_BLOB is asynchronous, so
+        // dropping the submit leaves the guest holding a buffer it believes was
+        // created, waiting on a fence that will never signal -- measured, and it
+        // hangs the guest rather than failing it. See `vram.rs`.
+        if let Some(vram) = self.vram.as_mut() {
+            if let Err(why) = vram.observe_submit(ctx_id, commands) {
+                log::warn!("virtio-gpu: ctx {ctx_id}: {why} -- {}", vram.summary());
+            }
+        }
+
         self.rutabaga
             .submit_command(ctx_id, commands, fence_ids)
             .map_err(|e| {
@@ -681,6 +717,11 @@ impl VirtioGpu {
             rutabaga_iovecs,
             None,
         )?;
+
+        // The charge taken at GEM_NEW now has an id the guest can free it by.
+        if let Some(vram) = self.vram.as_mut() {
+            vram.claim_blob(ctx_id, resource_create_blob.blob_id, resource_id);
+        }
 
         let resource = VirtioGpuResource::new(resource_create_blob.size);
         self.resources.insert(resource_id, resource);

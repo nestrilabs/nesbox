@@ -158,11 +158,24 @@ fn main() -> Result<()> {
     // or removed. Its shared window is a real memory slot, taken after the
     // ones guest RAM already occupies.
     if let Some(gpu_cfg) = &config.gpu {
+        // The VRAM limit is enforced inside virglrenderer, which reads it from
+        // the environment: the refusal has to happen where it can be reported to
+        // the guest, and only the renderer owns that channel. See
+        // `virtio-devices/src/gpu/vram.rs`. One VMM process serves one guest, so
+        // process scope is guest scope.
+        if let Some(mib) = gpu_cfg.vram_limit_mib {
+            // SAFETY: single-threaded here. Devices are built before any vCPU or
+            // worker thread is spawned, so no other thread can be reading the
+            // environment concurrently.
+            unsafe { std::env::set_var("NESTRI_VRAM_LIMIT_MIB", mib.to_string()) };
+        }
+
         let slots = MemorySlots::new(vm.vm_fd.clone(), vm.ram_slot_count);
         let gpu_device = Arc::new(GpuDevice::new(
             &GpuConfig {
                 render_node: gpu_cfg.render_node.clone(),
                 displays: vec![DisplayInfo::new(gpu_cfg.width, gpu_cfg.height)],
+                vram_limit_bytes: gpu_cfg.vram_limit_mib.map(|m| m * (1 << 20)),
             },
             vm.mem.clone(),
         )?);

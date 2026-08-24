@@ -15,6 +15,7 @@ pub mod display;
 mod edid;
 mod protocol;
 mod virtio_gpu;
+mod vram;
 mod worker;
 
 pub use self::descriptor_utils::{Error as DescriptorError, Reader, Writer};
