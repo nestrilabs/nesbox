@@ -235,10 +235,33 @@ Do not re-derive these.
 - **rutabaga needs the `virgl_renderer` cargo feature.** Without it the crate
   still builds and `RutabagaBuilder` still runs, but the component the DRM
   native context needs is not there.
-- **The host's virglrenderer supplies the native context, not the guest.** It
-  has renderers for `amdgpu`, `asahi`, `i915`, `msm` and `panfrost`; check with
-  `strings /usr/lib/libvirglrenderer.so.1 | grep -oE '^[a-z0-9]+_ccmd_[a-z_]+'`.
-  The guest needs no GPU driver of its own.
+- **The host's virglrenderer supplies the native context, not the guest.** Check
+  which renderers a given build actually has, rather than assuming — they are a
+  build option and distributions differ:
+  ```
+  strings -a /usr/lib/libvirglrenderer.so.1 \
+    | grep -oE '^[a-z0-9]+_ccmd_[a-z_]+' | sed 's/_ccmd_.*//' | sort -u
+  ```
+  Upstream carries `amdgpu`, `asahi`, `i915`, `msm` and `panfrost`. **The AMD dev
+  box returns `amdgpu` alone** — so that host cannot reproduce the A310 result, and
+  the only symptom is a guest that finds no GPU. The guest needs no GPU driver of
+  its own either way.
+- **The virglrenderer on the AMD dev box has no provenance, and that is a
+  problem.** `pacman -Qo /usr/lib/libvirglrenderer.so.1.11.0` → *no package owns
+  it*: hand-installed, no version string in the binary, unknown commit. It does
+  export what the `map_blob` rewrite needs (`virgl_renderer_resource_map` **and**
+  `virgl_renderer_resource_map_fixed`), so it works — but a GPU measurement taken
+  against it cannot be attributed or bisected later. Build from a recorded commit
+  into its own prefix and select it with `LD_LIBRARY_PATH`; never install over the
+  distro path, because A/B-ing two renderers is exactly what you want the first
+  time a guest fails to render.
+- **There is no ccmd protocol version handshake.** `virgl_renderer_capset_drm`
+  carries `version_major/minor/patchlevel` straight from the *amdgpu kernel driver*
+  (`drm_renderer.c:123`), not a protocol version. So a guest Mesa and a host
+  virglrenderer built months apart fail *silently* rather than cleanly. The check
+  that matters is whether `amdgpu_virtio_proto.h` agrees between the two trees —
+  it is copied between Mesa and virglrenderer by hand, and diffing the two
+  checkouts is a five-second answer.
 - **Mesa's `i915` gallium driver is not the modern Intel one.** It is the gen3
   driver for i830–i945; anything recent wants `iris`. Picking the wrong one
   builds cleanly and produces a driver that never matches the hardware.
@@ -324,6 +347,23 @@ server in the test rootfs, and `iris_dri.so` is built without virtio support
 (`grep -c virtgpu /usr/lib/dri/iris_dri.so` is 0, against 13 for
 `libvulkan_intel.so`). GL over native context would need a Mesa rebuild.
 Vulkan is what Proton uses, so this has not been chased.
+
+**`grep virtgpu` is an ANV-only test — it false-negatives on RADV.** It returns
+**0** for a `libvulkan_radeon.so` that has full native-context support, because
+RADV reaches the transport through the shared `vdrm` layer and never contains the
+literal string. Judging an AMD rootfs by this test would throw away a working one.
+The correct markers come from `src/amd/common/virtio/amdgpu_virtio.c`:
+
+```
+for f in MULTIPLE_AMDGPU_CTX VIRTIO_SYNC_CMD 'vdrm_device_connect failed'; do
+  printf '%-28s %s\n' "$f" "$(grep -ac "$f" libvulkan_radeon.so)"
+done
+```
+
+All three present means the driver was built with `-Damdgpu-virtio=true` (the
+meson gate, `mesa/meson.build:213`). Both rootfs images on the AMD dev box pass:
+the one in `rootfs_and_vmlinux.tar.zst` at Mesa 26.3.0-devel (`git-b78fc73dd8`),
+and an older one at 26.1.0-devel (`git-e100ca7c86`).
 
 ### Still rough
 

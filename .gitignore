@@ -2,3 +2,5 @@
 .vscode/
 .idea/
 .zed/
+/artifacts
+*.tar.zst
