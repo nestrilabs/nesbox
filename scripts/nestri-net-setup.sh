@@ -320,6 +320,32 @@ if [[ -n "${UPLINK_SLAVE:-}" ]]; then
             fi
             run nmcli con up "$UPLINK_SLAVE"
             run nmcli con up "$BRIDGE"
+
+            # Did the address actually arrive? The host just gave up the one it
+            # had, and if the bridge does not get a replacement the box is off
+            # the network with no obvious reason why. The common cause is a
+            # VLAN with no DHCP server on it -- which is a reasonable way to
+            # run a segment where every machine sets its own address, and a
+            # trap for a host that was a DHCP client until a moment ago.
+            if [[ "${DRY_RUN:-}" != 1 && "$HOST_METHOD" != manual ]]; then
+                for _ in 1 2 3 4 5 6 7 8 9 10; do
+                    ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | grep -q inet && break
+                    sleep 1
+                done
+                if ! ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | grep -q inet; then
+                    warn "${BRIDGE} came up without an IPv4 address after 10s."
+                    warn "It is set to DHCP because ${UPLINK} was. If this VLAN has no"
+                    warn "DHCP server -- which is normal on a segment of static hosts --"
+                    warn "give the bridge the address by hand:"
+                    say ""
+                    say "  ${DIM}nmcli con modify ${BRIDGE} ipv4.method manual \\${RESET}"
+                    say "  ${DIM}    ipv4.addresses ${HOST_ADDR:-<addr>/<prefix>} \\${RESET}"
+                    say "  ${DIM}    ipv4.gateway ${HOST_GW:-<gateway>} ipv4.dns ${HOST_DNS:-<dns>}${RESET}"
+                    say "  ${DIM}nmcli con up ${BRIDGE}${RESET}"
+                    say ""
+                    warn "Those are the values ${UPLINK} held before this ran."
+                fi
+            fi
         else
             warn "skipped — guests reach each other and nothing else until it is done"
         fi
