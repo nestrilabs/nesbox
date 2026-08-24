@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::thread;
 
 use std::sync::mpsc::Receiver;
+
+use super::metrics::GpuMetrics;
 use log::{debug, error};
 use rutabaga_gfx::{
     RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
@@ -53,6 +55,7 @@ pub struct Worker {
     mapper: Arc<dyn HostMemoryMapper>,
     /// Per-guest device-memory limit in bytes, or `None` for unbounded.
     vram_limit_bytes: Option<u64>,
+    metrics: Arc<GpuMetrics>,
 }
 
 impl Worker {
@@ -67,6 +70,7 @@ impl Worker {
         gpu_device_path: PathBuf,
         mapper: Arc<dyn HostMemoryMapper>,
         vram_limit_bytes: Option<u64>,
+        metrics: Arc<GpuMetrics>,
     ) -> Self {
         Worker {
             receiver,
@@ -78,6 +82,7 @@ impl Worker {
             gpu_device_path,
             mapper,
             vram_limit_bytes,
+            metrics,
         }
     }
 
@@ -101,6 +106,7 @@ impl Worker {
             self.gpu_device_path.clone(),
             self.mapper.clone(),
             self.vram_limit_bytes,
+            self.metrics.clone(),
         ) else {
             log::error!(
                 "virtio-gpu: backend failed to initialise; the device will accept \

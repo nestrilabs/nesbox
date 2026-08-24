@@ -60,6 +60,9 @@
 // accuracy in the log, not safety.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::metrics::{GpuCounters, GpuMetrics};
 
 /// `enum amdgpu_ccmd` — `AMDGPU_CCMD_GEM_NEW`.
 const AMDGPU_CCMD_GEM_NEW: u32 = 2;
@@ -169,6 +172,8 @@ pub struct VramAccountant {
     gtt_charged: u64,
     peak: u64,
     refusals: u64,
+    /// Where these numbers go so something other than a log reader can see them.
+    metrics: Arc<GpuMetrics>,
     /// Highest watermark already reported, so the log records a guest's rising
     /// occupancy once per step rather than once per allocation.
     reported_peak: u64,
@@ -181,8 +186,10 @@ fn watermark_step(limit: u64) -> u64 {
 }
 
 impl VramAccountant {
-    pub fn new(limit_bytes: u64) -> Self {
+    pub fn new(limit_bytes: u64, metrics: Arc<GpuMetrics>) -> Self {
+        GpuCounters::set(&metrics.counters.vram_limit_bytes, limit_bytes);
         Self {
+            metrics,
             limit: limit_bytes,
             charged: 0,
             pending: HashMap::new(),
@@ -233,6 +240,7 @@ impl VramAccountant {
                 freed / (1 << 20)
             );
         }
+        self.publish();
         if self.drm_contexts.remove(&ctx_id).is_some() {
             // The one point where a whole workload's footprint is known. Logged
             // unconditionally: the watermark above only fires once occupancy is
@@ -288,6 +296,7 @@ impl VramAccountant {
                     tentative = tentative.saturating_add(size);
                     if tentative > self.limit {
                         self.refusals += 1;
+                        self.publish();
                         return Err(Notice::OverLimit {
                             requested: size,
                             charged: self.charged,
@@ -316,6 +325,7 @@ impl VramAccountant {
         }
         self.gtt_charged = self.gtt_charged.saturating_add(proposed_gtt);
         self.peak = self.peak.max(self.charged);
+        self.publish();
 
         // Occupancy is the number capacity planning wants, and it is only
         // observable from here. Report it as it climbs, not per allocation.
@@ -340,7 +350,18 @@ impl VramAccountant {
     pub fn release_resource(&mut self, resource_id: u32) {
         if let Some(charge) = self.live.remove(&resource_id) {
             self.charged = self.charged.saturating_sub(charge.bytes);
+            self.publish();
         }
+    }
+
+    /// Publish the current totals. Called from every path that changes one, so
+    /// the surface cannot drift from the accounting behind it.
+    fn publish(&self) {
+        let c = &self.metrics.counters;
+        GpuCounters::set(&c.vram_bytes, self.charged);
+        GpuCounters::set(&c.vram_peak_bytes, self.peak);
+        GpuCounters::set(&c.vram_refusals, self.refusals);
+        GpuCounters::set(&c.gtt_bytes, self.gtt_charged);
     }
 
     pub fn summary(&self) -> String {
@@ -391,7 +412,7 @@ mod tests {
     }
 
     fn drm_ctx(limit_mib: u64) -> VramAccountant {
-        let mut a = VramAccountant::new(limit_mib * MIB);
+        let mut a = VramAccountant::new(limit_mib * MIB, Arc::new(GpuMetrics::new()));
         a.note_context(1, CAPSET_DRM);
         a
     }
@@ -493,7 +514,7 @@ mod tests {
 
     #[test]
     fn non_drm_contexts_are_not_parsed() {
-        let mut a = VramAccountant::new(64 * MIB);
+        let mut a = VramAccountant::new(64 * MIB, Arc::new(GpuMetrics::new()));
         a.note_context(2, 1 /* virgl 2d */);
         // Bytes that would be a huge GEM_NEW if this were a ccmd stream. A virgl
         // context's payload is a different command language and must pass through.

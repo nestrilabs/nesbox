@@ -9,6 +9,7 @@ pub mod lifecycle;
 pub mod memslot;
 pub mod power;
 pub mod regs;
+pub mod stats;
 pub mod serial;
 pub mod virtiofsd;
 pub mod vm;

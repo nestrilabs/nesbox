@@ -23,6 +23,10 @@ pub struct VmConfig {
     /// Optional GPU. Absent means the guest has no display device.
     #[serde(default)]
     pub gpu: Option<Gpu>,
+    /// Unix socket to serve a JSON metrics snapshot on. Absent means no surface,
+    /// which is right for a hand-driven box and wrong for a supervised one.
+    #[serde(default, rename = "stats-socket")]
+    pub stats_socket: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -157,6 +157,7 @@ fn main() -> Result<()> {
     // Added before virtio-fs so its slot does not shift when a share is added
     // or removed. Its shared window is a real memory slot, taken after the
     // ones guest RAM already occupies.
+    let mut stats_gpu = None;
     if let Some(gpu_cfg) = &config.gpu {
         // The VRAM limit is enforced inside virglrenderer, which reads it from
         // the environment: the refusal has to happen where it can be reported to
@@ -195,6 +196,14 @@ fn main() -> Result<()> {
             "virtio-gpu at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
             bdf.0, bdf.1, bdf.2
         );
+        stats_gpu = Some(gpu_device);
+    }
+
+    // ── Metrics surface ───────────────────────────────────────────────────
+    // Started before the vCPUs, so a supervisor that is already polling sees a
+    // box come up rather than getting connection refused for the first second.
+    if let Some(path) = config.stats_socket.clone() {
+        nesbox_vmm::stats::serve(path, nesbox_vmm::stats::StatsSource::new(stats_gpu))?;
     }
 
     // ── Shared directories over virtio-fs ─────────────────────────────────

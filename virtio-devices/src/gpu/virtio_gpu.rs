@@ -28,6 +28,7 @@ use super::protocol::{
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_MAX_SCANOUTS,
     VirtioGpuResult,
 };
+use super::metrics::{GpuCounters, GpuMetrics};
 use super::vram::VramAccountant;
 use super::{GpuError, GpuQueues, HostMemoryMapper, Result, VirtioShmRegion};
 
@@ -152,6 +153,8 @@ pub struct VirtioGpu {
     /// guest able to allocate until the card is exhausted, which is only safe
     /// when it is the sole tenant.
     vram: Option<VramAccountant>,
+    /// Shared with whoever is watching this device.
+    metrics: Arc<GpuMetrics>,
 }
 
 impl fmt::Debug for VirtioGpu {
@@ -180,8 +183,10 @@ impl VirtioGpu {
     fn create_fence_handler(
         signal: Arc<dyn GpuQueues>,
         fence_state: Arc<Mutex<FenceState>>,
+        metrics: Arc<GpuMetrics>,
     ) -> RutabagaFenceHandler {
         RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
+            GpuCounters::inc(&metrics.counters.fences);
             let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
                 0 => VirtioGpuRing::Global,
                 _ => VirtioGpuRing::ContextSpecific {
@@ -267,8 +272,9 @@ impl VirtioGpu {
         signal: Arc<dyn GpuQueues>,
         fence_state: Arc<Mutex<FenceState>>,
         gpu_device_path: PathBuf,
+        metrics: Arc<GpuMetrics>,
     ) -> Option<Rutabaga> {
-        let fence = Self::create_fence_handler(signal, fence_state);
+        let fence = Self::create_fence_handler(signal, fence_state, metrics);
 
         // Native-context DRM only — no Venus, no virgl2, no gfxstream.
         let capset_mask: u64 = 1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
@@ -312,11 +318,16 @@ impl VirtioGpu {
         gpu_device_path: PathBuf,
         mapper: Arc<dyn HostMemoryMapper>,
         vram_limit_bytes: Option<u64>,
+        metrics: Arc<GpuMetrics>,
     ) -> Option<Self> {
         let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(FenceState::default()));
 
-        let rutabaga =
-            Self::create_rutabaga(signal, fence_state.clone(), gpu_device_path)?;
+        let rutabaga = Self::create_rutabaga(
+            signal,
+            fence_state.clone(),
+            gpu_device_path,
+            metrics.clone(),
+        )?;
 
         let mut num_capsets = 0u32;
         for i in 0.. {
@@ -343,8 +354,9 @@ impl VirtioGpu {
                     "virtio-gpu: VRAM limit {} MiB for this guest",
                     limit / (1 << 20)
                 );
-                VramAccountant::new(limit)
+                VramAccountant::new(limit, metrics.clone())
             }),
+            metrics,
         })
     }
 
@@ -649,9 +661,11 @@ impl VirtioGpu {
             }
         }
 
+        GpuCounters::inc(&self.metrics.counters.submits);
         self.rutabaga
             .submit_command(ctx_id, commands, fence_ids)
             .map_err(|e| {
+                GpuCounters::inc(&self.metrics.counters.submits_failed);
                 log::error!("NESBOX_GPU: submit_command FAILED ctx={} : {:?}", ctx_id, e);
                 ErrUnspec
             })?;

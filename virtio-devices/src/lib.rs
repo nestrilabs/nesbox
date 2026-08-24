@@ -11,6 +11,6 @@ mod vsock;
 pub use blk::BlkDevice;
 pub use console::ConsoleDevice;
 pub use fs::FsDevice;
-pub use gpu::{GpuConfig, GpuDevice};
+pub use gpu::{GpuConfig, GpuDevice, GpuSnapshot, Occupancy};
 pub use net::{NetConfig, NetDevice};
 pub use vsock::VsockDevice;

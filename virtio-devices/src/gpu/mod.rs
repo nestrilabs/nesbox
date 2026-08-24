@@ -15,11 +15,15 @@ pub mod display;
 mod edid;
 mod protocol;
 mod virtio_gpu;
+mod metrics;
+mod occupancy;
 mod vram;
 mod worker;
 
 pub use self::descriptor_utils::{Error as DescriptorError, Reader, Writer};
 pub use self::device::{GpuConfig, GpuDevice};
+pub use self::metrics::GpuSnapshot;
+pub use self::occupancy::Occupancy;
 
 /// Control virtqueue index.
 pub const CTL_INDEX: usize = 0;

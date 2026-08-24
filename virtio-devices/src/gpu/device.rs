@@ -13,6 +13,7 @@
 use crate::common::*;
 use crate::gpu::display::DisplayInfo;
 use crate::gpu::uapi::virtio_gpu_config;
+use crate::gpu::metrics::{GpuMetrics, GpuSnapshot};
 use crate::gpu::worker::Worker;
 use crate::gpu::{
     CTL_INDEX, CUR_INDEX, Descriptor, GpuQueues, HostMemoryMapper, NUM_QUEUES, QUEUE_SIZE,
@@ -120,6 +121,7 @@ struct Inner {
     displays: Box<[DisplayInfo]>,
     render_node: PathBuf,
     vram_limit_bytes: Option<u64>,
+    metrics: Arc<GpuMetrics>,
     shm_guest_addr: u64,
     mapper: Option<Arc<dyn HostMemoryMapper>>,
     queues: Arc<Queues>,
@@ -169,6 +171,7 @@ impl Inner {
             self.render_node.clone(),
             mapper,
             self.vram_limit_bytes,
+            self.metrics.clone(),
         );
         worker.run();
         self.notify = Some(tx);
@@ -227,6 +230,9 @@ fn new_queues() -> [QState; NUM_QUEUES] {
 pub struct GpuDevice {
     inner: Mutex<Inner>,
     queues: Arc<Queues>,
+    /// Held here as well as in `Inner` so a watcher can read metrics without
+    /// taking the device lock the vCPU thread uses.
+    metrics: Arc<GpuMetrics>,
 }
 
 impl GpuDevice {
@@ -239,6 +245,7 @@ impl GpuDevice {
             "GPU render node {:?} does not exist",
             config.render_node
         );
+        let metrics = Arc::new(GpuMetrics::new());
         let displays: Box<[DisplayInfo]> = config.displays.clone().into_boxed_slice();
         anyhow::ensure!(!displays.is_empty(), "the GPU needs at least one display");
 
@@ -265,6 +272,7 @@ impl GpuDevice {
                 displays,
                 render_node: config.render_node.clone(),
                 vram_limit_bytes: config.vram_limit_bytes,
+                metrics: metrics.clone(),
                 // Filled in by `set_shm_guest_addr` once the bus has placed
                 // BAR2; the device cannot be activated before that.
                 shm_guest_addr: 0,
@@ -273,7 +281,14 @@ impl GpuDevice {
                 running: false,
             }),
             queues,
+            metrics,
         })
+    }
+
+    /// A snapshot of what this device is doing, for a supervisor rather than a
+    /// log reader ([0027]).
+    pub fn metrics(&self) -> GpuSnapshot {
+        self.metrics.snapshot()
     }
 
     pub fn bind_interrupts(
