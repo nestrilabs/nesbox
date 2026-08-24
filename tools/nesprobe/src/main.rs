@@ -20,11 +20,24 @@ struct Args {
     seconds: u64,
     fps: u32,
     device: usize,
+    /// Seconds of frames to discard before recording anything.
+    ///
+    /// Not optional in practice. An idle AMD GPU sits in a low DPM state -- on
+    /// the reference host `pp_dpm_sclk` idles at 400 MHz against a 2000 MHz top
+    /// state -- and takes a few seconds under load to reach full clocks,
+    /// measured here as 716 -> 1100 -> 2000 MHz over ~2.5 s. Frames rendered
+    /// during that ramp are several times slower than steady state, and there
+    /// are enough of them to *be* the p99: a 25 s run at ~90 fps is ~2200
+    /// frames, of which ~120 fall in the ramp -- 5%, well above the 1% mark.
+    ///
+    /// So a p99 measured without this is a measurement of the clock ramp, not of
+    /// the stack. Discarding one frame is not enough; the window is seconds long.
+    warmup: u64,
 }
 
 impl Default for Args {
     fn default() -> Self {
-        Self { cost: 200, width: 1920, height: 1080, seconds: 20, fps: 0, device: 0 }
+        Self { cost: 200, width: 1920, height: 1080, seconds: 20, fps: 0, device: 0, warmup: 5 }
     }
 }
 
@@ -45,8 +58,10 @@ fn parse_args() -> Args {
             "--seconds" => { a.seconds = val(i); i += 2 }
             "--fps" => { a.fps = val(i) as u32; i += 2 }
             "--device" => { a.device = val(i) as usize; i += 2 }
+            "--warmup" => { a.warmup = val(i); i += 2 }
             "-h" | "--help" => {
-                println!("nesprobe [--cost N] [--width W] [--height H] [--seconds S] [--fps F] [--device N]");
+                println!("nesprobe [--cost N] [--width W] [--height H] [--seconds S]");
+                println!("         [--fps F] [--device N] [--warmup S]");
                 std::process::exit(0)
             }
             other => { eprintln!("unknown argument: {other}"); std::process::exit(2) }
@@ -380,7 +395,9 @@ fn main() {
     let start = Instant::now();
     let deadline = if args.seconds == 0 { None } else { Some(start + Duration::from_secs(args.seconds)) };
 
+    let warmup_until = start + Duration::from_secs(args.warmup);
     let mut frames: u64 = 0;
+    let mut discarded: u64 = 0;
     let mut frame_times: Vec<f64> = Vec::with_capacity(4096);
     let mut window_start = Instant::now();
     let mut window_frames: u64 = 0;
@@ -396,9 +413,13 @@ fn main() {
             break;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        frame_times.push(ms);
-        frames += 1;
-        window_frames += 1;
+        if Instant::now() < warmup_until {
+            discarded += 1;
+        } else {
+            frame_times.push(ms);
+            frames += 1;
+            window_frames += 1;
+        }
 
         if let Some(iv) = interval {
             next_frame += iv;
@@ -407,7 +428,7 @@ fn main() {
         }
 
         let w = window_start.elapsed();
-        if w >= Duration::from_secs(1) {
+        if w >= Duration::from_secs(1) && window_frames > 0 {
             println!(
                 "  t={:5.1}s  frames={:6}  fps={:7.2}  frame_ms_mean={:7.3}",
                 start.elapsed().as_secs_f64(),
@@ -421,7 +442,7 @@ fn main() {
         }
     }
 
-    let elapsed = start.elapsed().as_secs_f64();
+    let elapsed = start.elapsed().as_secs_f64() - args.warmup as f64;
     frame_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mean = frame_times.iter().sum::<f64>() / frame_times.len().max(1) as f64;
     let pct = |p: f64| -> f64 {
@@ -430,6 +451,7 @@ fn main() {
     };
 
     println!("---");
+    println!("warmup        {} s, {discarded} frames discarded", args.warmup);
     println!("frames        {frames}");
     println!("elapsed       {elapsed:.3} s");
     println!("fps           {:.2}", frames as f64 / elapsed);

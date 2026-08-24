@@ -11,9 +11,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-N=2; COST=400; SECS=30; MEM=1536
-while getopts "n:c:s:m:h" o; do case $o in
-  n) N=$OPTARG;; c) COST=$OPTARG;; s) SECS=$OPTARG;; m) MEM=$OPTARG;;
+N=2; COST=400; SECS=30; MEM=1536; WARMUP=8
+while getopts "n:c:s:m:w:h" o; do case $o in
+  n) N=$OPTARG;; c) COST=$OPTARG;; s) SECS=$OPTARG;; m) MEM=$OPTARG;; w) WARMUP=$OPTARG;;
   h) sed -n '2,12p' "$0"; exit 0;;
 esac; done
 
@@ -30,7 +30,7 @@ for f in "$KERNEL" "$ROOTFS" "$PROBE/nesprobe" "$RENDERER/libvirglrenderer.so.1"
 done
 [[ -x ./target/release/nesbox ]] || { echo "build nesbox first: cargo build --release" >&2; exit 1; }
 
-echo "sweep: N=$N cost=$COST seconds=$SECS mem=${MEM}MiB"
+echo "sweep: N=$N cost=$COST seconds=$SECS warmup=${WARMUP}s mem=${MEM}MiB"
 echo "renderer: $(cd ~/forks/virglrenderer 2>/dev/null && git rev-parse --short HEAD || echo unknown) (patched)"
 echo
 
@@ -66,15 +66,15 @@ JSON
     # mount point cannot be created.
     echo 'mount -t virtiofs probe /mnt || echo SHARE-FAIL'
     sleep 3
-    echo "/mnt/nesprobe --cost $COST --seconds $SECS"
-    sleep $((SECS + 12))
-  } | LD_LIBRARY_PATH=$RENDERER timeout $((SECS + 65)) \
+    echo "/mnt/nesprobe --cost $COST --seconds $SECS --warmup $WARMUP"
+    sleep $((SECS + WARMUP + 12))
+  } | LD_LIBRARY_PATH=$RENDERER timeout $((SECS + WARMUP + 65)) \
         script -qec "env RUST_LOG=warn ./target/release/nesbox $RUN/guest$i.json" /dev/null \
         > "$RUN/guest$i.log" 2>&1 &
   sleep 1
 done
 
-echo "waiting for $N guests (~$((SECS + 40))s)..."
+echo "waiting for $N guests (~$((SECS + WARMUP + 40))s)..."
 wait
 
 printf '%-6s %10s %10s %10s %10s %10s\n' guest frames fps p50_ms p99_ms max_ms
@@ -96,6 +96,7 @@ echo
 echo "sum fps      $tf"
 echo "logs         /tmp/probe-sweep-n${N}-c${COST}-guest*.log"
 echo
-echo "NOTE: fps here is the whole-run average and includes ~4s of GPU clock ramp"
-echo "      plus pipeline compilation. Steady state is in the per-second lines;"
-echo "      p50 is the number to trust for frame cost."
+echo "NOTE: figures exclude the first ${WARMUP}s. An idle AMD GPU sits in a low DPM"
+echo "      state and takes seconds to reach full clocks -- measured 716 -> 2000 MHz"
+echo "      over ~2.5s -- and those frames are numerous enough to BE the p99."
+echo "      A p99 measured without a warmup discard measures the clock ramp."

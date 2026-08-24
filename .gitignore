@@ -5,3 +5,4 @@
 /artifacts
 *.tar.zst
 tools/nesprobe/target
+*.local.json

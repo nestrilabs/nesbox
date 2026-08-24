@@ -23,6 +23,8 @@ a figure from a different host is a different figure, not a confirmation.
 | GPU | Barcelo iGPU, `1002:15e7`, **Vega / gfx90c** — *not* RDNA |
 | RAM | 13.8 GiB |
 | Host kernel | 7.1.8-1-cachyos |
+| CPU governor | `powersave` (**not** `performance` — see §8.2) |
+| GPU DPM states | `pp_dpm_sclk`: 200 / 400 / **2000** MHz, idling at 400 |
 | libdrm | 2.4.134 |
 | virglrenderer | fork at `7fcfce4` **+ the patch in §6** |
 | Guest kernel | 7.2.0+ |
@@ -71,113 +73,100 @@ a push constant, frames counted in-guest.
 
 | `--cost` | p50 ms | p99 ms | p99/p50 |
 |---|---|---|---|
-| 100 | 2.791 | 7.456 | 2.67× |
-| 400 | 9.902 | 10.884 | **1.10×** |
-| 1600 | 37.989 | 38.921 | **1.02×** |
+| 400 | 9.756 | 10.979 | 1.13× |
+| 1600 | 37.895 | 39.161 | 1.03× |
 
 ≈ `frame_ms = 1.4 + 0.023 × cost` — a 13× span with ~1.4 ms of fixed per-frame
 overhead. Monotonic and controllable, which is all a calibration probe needs.
 
-Note the p99 column: **on bare metal, at a non-trivial frame cost, there is
-essentially no tail.** Hold that for §4.2.
+All figures with `--warmup 8`, which is not optional; see §8.2.
 
 ---
 
 ## 4. What the virtio path costs
 
-### 4.1 Throughput: a fixed per-frame cost, not a percentage
-
-`nesprobe`, 1920×1080, 25 s runs, p50 both sides so the comparison is matched:
+`nesprobe`, 1920×1080, 30 s runs, `--warmup 8`, p50 on both sides so the comparison
+is matched:
 
 | `--cost` | host p50 | guest p50 | delta | as % |
 |---|---|---|---|---|
-| 100 | 2.791 | 2.866 | +0.075 ms | +2.7% |
-| 400 | 9.902 | 10.223 | +0.321 ms | +3.2% |
-| 1600 | 37.989 | 38.089 | +0.100 ms | **+0.3%** |
+| 400 | 9.756 | 10.170 | +0.414 ms | **+4.2%** |
 
-**Native context costs a small fixed amount per frame — order 0.1–0.3 ms — not a
-proportion of the work.** So it reads as ~3% on a cheap frame and disappears into
-noise on an expensive one.
+And the distribution, which is the part that matters for anything interactive:
 
-> An earlier draft claimed "≈3%" from whole-run mean fps across runs of *different
-> durations*. That is wrong: clock ramp (§8.2) is a larger fraction of a short run,
-> which flattered the guest. Matched p50 is the honest comparison, and it happens to
-> tell a better story.
+| | p50 | p99 | **p99/p50** |
+|---|---|---|---|
+| host, cost 400 | 9.756 | 10.979 | 1.13× |
+| **guest, cost 400** | 10.170 | **11.266** | **1.11×** |
 
-### 4.2 Latency: there is a ~2.7× frame-time tail, and it is not contention
+**Native context costs about 4% on the median frame and nothing on the tail.** The
+guest's frame-time distribution is as tight as bare metal's.
 
-**This is the most consequential measurement in this file.**
-
-| `--cost` | host p99/p50 | guest p99/p50, **one guest** |
-|---|---|---|
-| 100 | 2.67× | 2.65× |
-| 400 | **1.10×** | **2.69×** |
-| 1600 | **1.02×** | **2.89×** |
-
-At cost 1600 the host's p99 is 38.9 ms against a 38.0 ms p50. The same workload in a
-guest, **alone on the card with nothing to contend against**, has a p99 of
-**110.1 ms**.
-
-And the ratio barely moves as guests are added (§5): 2.69× at one, 2.92× at two,
-2.71× at three, 2.13× at four.
-
-**So the tail is introduced by the virtio-gpu path and is present with a single
-guest.** It is not co-tenancy, and no amount of scheduling will remove it — with one
-guest there is nothing to schedule against.
-
-This is the clearest optimisation target the GPU path has, and bare metal proves the
-headroom is recoverable. Suspects, in rough order of suspicion:
-
-- the submit→fence round-trip through the virtio-gpu worker thread;
-- host scheduling of that worker against the vCPU threads;
-- the per-resource mapping cost recorded in `PROGRESS.md` §7 at ~10.7 µs.
-
-**Unattributed on purpose.** This is a measurement, not a diagnosis. If you want one
-number to go after in this repo, it is this one.
-
----
+> ### An earlier version of this section was wrong, and the error is instructive
+>
+> It reported a **2.7× frame-time tail** in the guest against 1.10× on bare metal,
+> and concluded that the virtio-gpu path introduced a large latency tail present
+> even with a single guest. That conclusion was **entirely a measurement artifact**
+> and is withdrawn.
+>
+> The cause was the GPU clock ramp (§8.2). Every guest run began after a ~40 s boot
+> during which the GPU idled back down to 400 MHz, so the first seconds of each run
+> rendered at a fraction of full clock. Those frames are numerous enough to *be* the
+> p99 — a 25 s run at ~90 fps is ~2200 frames, of which ~120 fall in the ramp, or
+> 5%. Meanwhile the bare-metal figures came from runs executed back-to-back in a
+> loop, so that GPU was already hot. **The comparison was between a cold GPU and a
+> warm one**, and it was measuring power management, not virtualization.
+>
+> Two process failures, worth naming: §8.2 already said "discard a warm-up window,
+> not a warm-up frame" — and the probe discarded exactly one frame. And a
+> surprising result was written up before anyone tried to make it go away.
+>
+> `nesprobe` now takes `--warmup` (default 5 s) and reports how many frames it
+> dropped. Numbers taken without it should not be compared to numbers taken with
+> it.
 
 ## 5. Several guests on one GPU
 
 `nesprobe` at 1920×1080, unpaced so every guest tries to consume the whole card. One
 physical core per guest. Reproduce with `scripts/probe-sweep.sh`.
 
-### 5.1 `--cost 400` (≈10.2 ms/frame solo)
+### 5.1 `--cost 400` (≈10.1 ms/frame solo), `--warmup 8`
 
-| guests | p50 ms, each | p99 ms | Σ throughput (fps) | p50 vs solo |
-|---|---|---|---|---|
-| 1 | 10.22 | 27.5 | 97.8 | 1.00× |
-| 2 | 18.85 / 18.75 | 54.9 | 106.4 | **1.84×** |
-| 3 | 29.62 / 29.56 / 29.36 | 79.4–80.5 | 101.7 | **2.89×** |
-| 4 | 37.64 / 37.64 / 37.53 / 37.40 | 54.9–80.5 | 106.5 | **3.67×** |
+| guests | p50 ms, each | p99 ms | **p99/p50** | Σ throughput (fps) | p50 vs solo |
+|---|---|---|---|---|---|
+| 1 | 10.06 | 11.03 | 1.10× | 98.8 | 1.00× |
+| 2 | 18.73 / 18.69 | 20.62 / 20.50 | 1.10× | 107.9 | **1.86×** |
+| 4 | 37.84 / 37.59 / 37.49 / 37.35 | 39.41 / 39.35 / 39.26 / 39.34 | **1.04×** | 114.3 | **3.73×** |
 
-**Aggregate throughput is flat at 102–106 fps regardless of guest count**, and
-*above* the 97.8 solo figure. The card saturates and is then divided; adding guests
-costs nothing in total work done.
+Four results, and the third is the one that was expected to be bad:
 
-**A single guest cannot saturate the card.** Its synchronous
-submit→fence→submit loop leaves the GPU idle during CPU turnaround, and a second
-guest fills those gaps. Sharing is therefore very slightly *better* than free on
+**Aggregate throughput rises with guest count** — 98.8 → 107.9 → 114.3 fps. Not
+"holds up": *rises*. A single guest cannot saturate the card, because its
+synchronous submit→fence→submit loop leaves the GPU idle during CPU turnaround, and
+another guest fills those gaps. Sharing this GPU is **better than free** on
 throughput.
 
-**Sharing is even.** Per-guest p50 spread *within* a run is under 1% at every count
-— 0.5% at two, 0.9% at three, 0.6% at four. The kernel's DRM scheduler divides
-fairly without being asked to.
+**Per-frame time grows sublinearly** — 1.86× and 3.73× for 2 and 4 guests — so each
+guest gets slightly more than an even share.
 
-**Per-frame time grows sublinearly** — 1.84×, 2.89×, 3.67× for 2, 3, 4 guests — so
-each guest gets a little more than an even share of the card's throughput.
+**The frame-time distribution stays tight, and gets tighter.** p99/p50 is 1.10× at
+one guest, 1.10× at two, **1.04× at four** — against 1.13× on bare metal. Adding
+guests does not lengthen the tail relative to the median; if anything the steadier
+load smooths it. There is **no latency penalty for co-tenancy** on this workload.
+
+**Sharing is even without any arbitration from us.** Per-guest p50 spread within a
+run is under 1.4% at four guests and under 0.3% at two. The kernel's DRM scheduler
+divides fairly on its own.
 
 ### 5.2 Other costs
 
 | cost | guests | p50 ms, each | p99 ms | Σ throughput (fps) |
 |---|---|---|---|---|
-| 100 | 1 | 2.866 | 7.60 | 309.0 |
-| 100 | 4 | 9.506 / 9.501 / 9.499 / 9.483 | 26.3 | 412.9 |
-| 1600 | 1 | 38.089 | 110.1 | 22.8 |
+| 100 | 4 | 9.506 / 9.501 / 9.499 / 9.483 | 26.3 † | 412.9 |
+| 1600 | 1 | 37.895 | 39.161 | 26.4 |
 
-At cost 100, four guests each hold a frame under 10 ms with a **0.2% spread**.
-
----
+† taken before `--warmup` existed, so that p99 is the clock ramp, not the workload.
+Left in because the p50 and the 0.2% spread are still good measurements.
 
 ## 6. The bug that had to be fixed first
 
@@ -239,9 +228,25 @@ failure worth recognising faster next time.
    which with several guests includes queueing behind another one. Solo they agree —
    which is exactly how confusing them survives a single-guest experiment and fails
    on the second.
-2. **Discard a warm-up window, not a warm-up frame.** The GPU takes **~4 seconds**
-   to reach steady clocks from idle: at cost 100 it climbed 144 → 374 fps *within
-   one run*. Anything measured in the first ~5 s is fiction.
+2. **Discard a warm-up *window*, not a warm-up frame — and this rule cost more
+   than all the others combined when it was ignored.** An idle AMD GPU drops to a
+   low DPM state: `pp_dpm_sclk` on this host idles at **400 MHz against a 2000 MHz
+   top state**. Sampled during a run, it climbs **716 → 1100 → 2000 MHz over about
+   2.5 seconds**, then pins at 2000 for the rest of the run.
+
+   Frames rendered during that ramp are several times slower than steady state, and
+   **there are enough of them to be the p99**: a 25 s run at ~90 fps is ~2200
+   frames, of which ~120 fall in the ramp — 5%, well above the 1% mark. So a p99
+   measured without a warm-up discard is a measurement of power management.
+
+   This produced, and then unproduced, this file's biggest wrong conclusion (§4).
+   `nesprobe --warmup` (default 5 s) exists because of it, and reports how many
+   frames it dropped. **Never compare a figure taken with it to one taken without.**
+
+   Corollary: **the same run repeated back-to-back is not the same measurement as
+   one run after an idle gap.** Bare-metal figures were gathered in a loop with a
+   hot GPU; guest figures each followed a 40 s boot with a cold one. That alone
+   manufactured a fake 2.7× difference.
 3. **A read-only rootfs silently disables the shader cache**, logging only
    `Failed to create /root/.cache for shader cache`. Cache-cold frame times are
    arbitrary.
@@ -308,20 +313,22 @@ Expect the documented `Attempted to kill init!` panic when the shell exits;
 
 **Do:**
 
-- **DRM native context works on AMD**, not only Intel, and the virtio path costs a
-  small fixed amount per frame rather than a percentage (§4.1).
+- **DRM native context works on AMD**, not only Intel, and costs ~4% on the median
+  frame and **nothing on the tail** (§4).
 - **One GPU serves several microVMs, and the kernel divides it evenly** without any
   arbitration from us — under 1% spread at every guest count (§5.1).
-- **Aggregate throughput does not degrade** as guests are added; it is flat and
-  slightly above the single-guest figure, because one guest cannot saturate a card.
+- **Aggregate throughput rises** as guests are added — 98.8 → 107.9 → 114.3 fps for
+  1, 2 and 4 — because one guest cannot saturate a card.
+- **Co-tenancy costs nothing on the tail.** p99/p50 is 1.10× at one guest and 1.04×
+  at four, against 1.13× bare metal.
 
 **Do not:**
 
 - **Do not carry any absolute figure to another GPU.** Vega iGPU, no dedicated VRAM,
   one synthetic workload.
 - **Do not read any of this as an RDNA 4 result.**
-- **Do not read p50 as the whole story.** The ~2.7× tail in §4.2 exists with a
-  single guest and is what an interactive workload would actually feel.
+- **Do not compare figures across warm-up conventions.** Anything measured before
+  `--warmup` existed has a p99 that is really the GPU clock ramp (§8.2).
 - **Do not treat `nesprobe` as a stand-in for an application.** It says what the
   stack does to a frame, not what a real workload does.
 
@@ -329,14 +336,11 @@ Expect the documented `Attempted to kill init!` panic when the shell exits;
 
 ## 11. Open, in the order that matters
 
-1. **Where the ~2.7× virtualization tail comes from** (§4.2). Highest value in the
-   repo: bare metal shows 1.02–1.10×, so the headroom is real and recoverable, and
-   no scheduling change can substitute for finding it.
-2. **RDNA 4.** Untested. Everything above is Vega.
-3. **Frame counts from a real application.** `nesprobe` counts its own; an
+1. **RDNA 4.** Untested. Everything above is Vega.
+2. **Frame counts from a real application.** `nesprobe` counts its own; an
    application cannot. A Vulkan layer that reports present timing would generalise.
-4. **Where the ~1.4 ms fixed per-frame cost goes** — virtio round-trips, host
+3. **Where the ~1.4 ms fixed per-frame cost goes** — virtio round-trips, host
    submission, or the render pass itself. It bounds the cheapest possible frame.
-5. **Block I/O under GPU load.** `PROGRESS.md` §6 records an 8.5 ms worst case over a
+4. **Block I/O under GPU load.** `PROGRESS.md` §6 records an 8.5 ms worst case over a
    400 MiB read — over half a 60 Hz frame budget — and it has never been measured
    *with* GPU work in flight.
