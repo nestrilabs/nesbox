@@ -4,3 +4,4 @@
 .zed/
 /artifacts
 *.tar.zst
+tools/nesprobe/target

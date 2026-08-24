@@ -1,0 +1,15 @@
+# Its own workspace, deliberately: nesprobe is a guest-side measurement tool and
+# has nothing to do with building the VMM. `cargo build` at the nesbox root should
+# not pull in ash.
+[workspace]
+
+[package]
+name = "nesprobe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = "0.38"
+
+[profile.release]
+opt-level = 2

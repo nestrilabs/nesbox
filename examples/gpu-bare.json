@@ -1,0 +1,27 @@
+{
+  "boot-source": {
+    "kernel_image_path": "/path/to/artifacts/vmlinux",
+    "boot_args": "console=hvc0 root=/dev/vda ro init=/bin/bash"
+  },
+  "drives": [
+    {
+      "drive_id": "rootfs",
+      "path_on_host": "/path/to/artifacts/rootfs.ext4",
+      "is_root_device": true,
+      "is_read_only": true
+    }
+  ],
+  "machine-config": {
+    "vcpu_count": 2,
+    "mem_size_mib": 2048,
+    "cpu_affinity": [
+      2,
+      3
+    ]
+  },
+  "gpu": {
+    "render-node": "/dev/dri/renderD128",
+    "width": 1920,
+    "height": 1080
+  }
+}
