@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Sample a box's GPU occupancy and VRAM from the kernel's per-client DRM accounting.
+# Sample a guest's GPU occupancy and VRAM from the kernel's per-client DRM
+# accounting.
 #
-# This is the measurement `C` comes from -- GPU engine time per frame period --
-# and the reason it is read here rather than from fences: a fence measures
-# latency, which under co-tenancy includes time queued behind another box.
-# drm-engine-gfx measures occupancy. See .nestri/decisions/0024.
+# Read here rather than from fences on purpose: a fence measures submit-to-signal
+# *latency*, which with more than one guest on the card includes time queued behind
+# another guest's work. drm-engine-gfx measures *occupancy*. Solo the two agree,
+# which is exactly how confusing them survives a single-guest experiment.
 #
-# One nesbox process is one DRM client, so per-process is per-box.
+# One nesbox process is one DRM client, so per-process is per-guest.
 #
 # Usage:  scripts/gpu-sample.sh [pid] [interval_ms]
 #         scripts/gpu-sample.sh            # auto-detect a single running nesbox
@@ -41,7 +42,18 @@ FD="$(find_drm_fd)" || {
   exit 1
 }
 
-field() { grep -m1 "^$1:" "/proc/$PID/fdinfo/$FD" 2>/dev/null | awk '{print $2}'; }
+# Re-resolve the fd every sample. A guest context is a host DRM client: the fd
+# appears when the guest first touches the GPU and vanishes when that context is
+# destroyed, so a number captured once goes stale mid-run.
+field() {
+  local v
+  v=$(grep -m1 "^$1:" "/proc/$PID/fdinfo/$FD" 2>/dev/null | awk '{print $2}')
+  if [[ -z "$v" ]]; then
+    FD="$(find_drm_fd)" || return 1
+    v=$(grep -m1 "^$1:" "/proc/$PID/fdinfo/$FD" 2>/dev/null | awk '{print $2}')
+  fi
+  printf '%s' "$v"
+}
 
 echo "pid $PID  fd $FD  pdev $(field drm-pdev)  interval ${INTERVAL_MS}ms"
 printf '%12s %10s %10s %12s %12s %10s\n' \
