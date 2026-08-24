@@ -284,11 +284,83 @@ Do not re-derive these.
   connections degrade, sessions fall back to relays and everything keeps working
   slightly worse forever, which is the hardest kind of failure to notice. Test
   hole punching against a real peer before switching.
-- **The GPU has never rendered, and the AMD path is unverified.** Nothing has
-  drawn a frame: there is no compositor in the test rootfs. The blob mapping
-  rewrite that makes AMD possible was developed on an Intel host and only
-  verified there — 27 mappings, no failures, GPU still enumerated. Whether
-  `vkcube` now runs on the AMD box is untested.
+- ~~**The GPU has never rendered, and the AMD path is unverified.**~~ **Both done,
+  2026-08-24, on a Barcelo iGPU (Ryzen 5 7530U, Vega/gfx90c).** `vulkaninfo` in the
+  guest reports `AMD Radeon Graphics (RADV RENOIR)`, `0x1002:0x15e7` — the host's
+  card, exact PCI id match — through RADV over native context, and `vkcube` renders
+  through `nescope`'s Wayland compositor. The blob-mapping rewrite is correct.
+
+  **It needed a virglrenderer patch that did not exist.** `vulkaninfo` passing was
+  necessary and not sufficient: it creates contexts and queries the device, and
+  never shares a buffer. The first thing that does failed with
+
+  ```
+  amdgpu_renderer_export_opaque_handle:303: failed to get dmabuf fd: Operation not permitted
+  ```
+
+  which is **the same `EPERM` as §5's dmabuf note, at a second site.** `map_blob`
+  was rewritten to avoid dmabuf export; `export_opaque_handle` was not, and that is
+  the path RADV's Wayland WSI takes to hand a frame to a compositor.
+
+  Why the host cannot know to avoid it: RADV marks shareable buffers with
+  `AMDGPU_GEM_CREATE_VIRTIO_SHARED`, a **Mesa-private bit** (`sid.h`, `1u << 31`,
+  not kernel uapi). The guest converts it to `VIRTGPU_BLOB_FLAG_USE_SHAREABLE` on
+  the *blob* and strips it from the ccmd (`amdgpu_virtio_bo.c:176`). So `GEM_NEW`
+  arrives with clean flags **and before `RESOURCE_CREATE_BLOB`** — the allocation
+  happens before shareability is known. `grep VIRTIO_SHARED` across virglrenderer
+  returns nothing.
+
+  Clearing the capset's `has_vm_always_valid` is **not** a fix:
+  `radv_device.c:1533` makes it mandatory and RADV fails device creation without it.
+
+  Fix in `patches/0001-virglrenderer-amdgpu-strip-VM_ALWAYS_VALID.patch` against
+  virglrenderer `7fcfce4` — strip the flag in `amdgpu_ccmd_gem_new`. Four failures
+  before, zero after. Cost: per-submit validation work, since amdgpu must carry the
+  BO in the validation list rather than assume residency.
+
+- **`gpu.width`/`gpu.height` set the scanout geometry, not the application
+  surface.** Raising them changes nothing a workload does. Measured: solo GPU
+  occupancy was 8.9% at a 1080p scanout and 8.9% at 3840x2160, with VRAM
+  byte-identical at 36.7 MiB — and identical again with `vkcube --width 3840
+  --height 2160`, since the compositor sizes the surface. Anyone treating this
+  field as a load knob will measure noise.
+
+- **`nescope` does not offer the IMMEDIATE present mode.** `vkcube --present_mode 0`
+  fails with `Present mode specified is not supported`, so a guest cannot render
+  uncapped through it — the compositor holds the frame clock. Useful, and note it
+  is guest-side, so it bounds a cooperative workload and not a hostile one.
+
+- **`vkcube` is a fixed, overhead-dominated load and cannot calibrate anything.**
+  Roughly 1.5 ms of GPU time per frame that is the cost of pushing *any* frame
+  through this path rather than the cost of its content, invariant across 2 and 4
+  vCPUs and every geometry above. Two guests rendering at once divided a stable
+  14.2% occupancy sum against 8.9% solo, and with no frame count that could not be
+  resolved into dropped frames versus cheaper frames — it read as a serialization
+  ceiling and was not one. `tools/nesprobe` exists because of this; see
+  [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+- **`VK_KHR_display` cannot work in a native-context guest, and `--wsi display` is
+  a dead end.** The extension is advertised and `vkcube --wsi display` still says
+  `Cannot find any display!` — because the *display* belongs to `virtio_gpu`
+  (`/dev/dri/card0`) while the *renderer* is the host's GPU reached through
+  `renderD128`. RADV cannot enumerate another driver's connectors. A compositor is
+  the only route to a surface, which is what `nescope` is for.
+
+- **The full guest stack powers the box off if it has no session, and it looks like
+  a crash.** With `nestri-guest-hub` running and no vsock and no network, the box
+  reaches a login prompt and powers off a few seconds later — reproducibly, with
+  stdin held open and nothing typed, so it is not a console bug. The hub is an iroh
+  agent with `respawn_max="2"` and an idle timeout; it cannot dial anything, so it
+  gives up. For GPU work that needs none of that, boot
+  `init=/bin/bash` and mount by hand — `examples/` has the pattern, and
+  `test-gpu-bare.json` is a working config. Expect the documented
+  `Attempted to kill init!` panic with `exitcode=0x0` when the shell exits.
+
+- **Do not `debugfs -w` into these images.** It does not maintain `metadata_csum`
+  consistently: a file written that way came back as mode `120777`, a broken
+  symlink, and `e2fsck -fn` reported a wrong inode refcount and an
+  `orphan_present` inconsistency after the guest's own boot-time fsck "repaired"
+  it. Loop-mount as root, or `mkfs` a fresh image.
 - No API socket, no jailer, no seccomp, no snapshots, no CPU pinning. All were
   in the Firecracker fork; none exist here.
 - `virtio-blk` serves requests on a worker thread, but serially and with

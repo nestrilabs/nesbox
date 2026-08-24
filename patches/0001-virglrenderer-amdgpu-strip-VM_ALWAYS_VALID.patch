@@ -1,0 +1,34 @@
+diff --git a/src/drm/amdgpu/amdgpu_renderer.c b/src/drm/amdgpu/amdgpu_renderer.c
+index cf7f4f1..27285cd 100644
+--- a/src/drm/amdgpu/amdgpu_renderer.c
++++ b/src/drm/amdgpu/amdgpu_renderer.c
+@@ -526,11 +526,28 @@ amdgpu_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+       goto alloc_failed;
+    }
+ 
++   /* NESTRI: strip AMDGPU_GEM_CREATE_VM_ALWAYS_VALID.
++    *
++    * amdgpu_gem_prime_export() returns -EPERM for any BO carrying this flag, so
++    * such a BO can never be exported as a dmabuf. We cannot tell at GEM_NEW time
++    * whether the guest will need to export it: the guest marks shareability on
++    * the *blob* (VIRTGPU_BLOB_FLAG_USE_SHAREABLE, from Mesa's private
++    * AMDGPU_GEM_CREATE_VIRTIO_SHARED bit) and RESOURCE_CREATE_BLOB arrives after
++    * this ccmd. So a guest that later shares a buffer with its compositor fails
++    * in amdgpu_renderer_export_opaque_handle(), which is where RADV's Wayland
++    * WSI path lands.
++    *
++    * Dropping the flag costs per-submit validation work -- amdgpu must carry the
++    * BO in the validation list rather than assuming residency -- and buys the
++    * ability to export. Correctness first; the cost is measurable as GPU time.
++    */
++   uint64_t alloc_flags = req->r.flags & ~AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
++
+    struct amdgpu_bo_alloc_request r = {
+       .alloc_size = req->r.alloc_size,
+       .phys_alignment = req->r.phys_alignment,
+       .preferred_heap = req->r.preferred_heap,
+-      .flags = req->r.flags,
++      .flags = alloc_flags,
+    };
+    amdgpu_bo_handle bo_handle;
+    ret = amdgpu_bo_alloc(ctx->dev, &r, &bo_handle);
