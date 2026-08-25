@@ -238,6 +238,31 @@ mod tests {
         assert!(w.try_map(16 * MIB).is_ok());
     }
 
+    /// Why `resource_map_blob` refuses an already-mapped resource.
+    ///
+    /// This models what used to happen: a guest maps the same resource twice, so
+    /// it is charged twice, and the single unmap credits it once. Nothing here is
+    /// wrong -- `WindowQuota` is doing exactly what it was told -- which is the
+    /// point. The accounting cannot detect the duplicate; only the caller knows
+    /// the resource was already mapped, so the guard belongs there and this test
+    /// exists so that removing it has a visible consequence.
+    #[test]
+    fn charging_twice_and_crediting_once_drains_the_quota() {
+        let mut w = q(16, 0);
+        let size = 8 * MIB;
+
+        w.try_map(size).unwrap();
+        w.try_map(size).unwrap(); // the duplicate the caller must prevent
+        w.release(size); // one unmap, because there is one shmem_offset
+
+        assert_eq!(w.used, size, "8 MiB is still held by a mapping that is gone");
+        assert_eq!(w.mappings, 1);
+
+        // And it is cumulative, so a loop closes the window entirely.
+        w.try_map(size).unwrap();
+        assert!(matches!(w.try_map(1), Err(Refused::Bytes { .. })));
+    }
+
     #[test]
     fn the_summary_says_unbounded_rather_than_zero() {
         assert!(q(0, 0).summary().contains("unbounded"));

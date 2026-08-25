@@ -765,14 +765,33 @@ impl VirtioGpu {
         shm_region: &VirtioShmRegion,
         offset: u64,
     ) -> VirtioGpuResult {
-        let res_size = self
-            .resources
-            .get(&resource_id)
-            .ok_or_else(|| {
-                log::error!("NESBOX_GPU: map_blob: resource {resource_id} not found");
-                ErrInvalidResourceId
-            })?
-            .size;
+        let resource = self.resources.get(&resource_id).ok_or_else(|| {
+            log::error!("NESBOX_GPU: map_blob: resource {resource_id} not found");
+            ErrInvalidResourceId
+        })?;
+        let res_size = resource.size;
+
+        // Refuse a resource that is already mapped, and refuse it before anything
+        // is charged.
+        //
+        // Nothing in the protocol stops a guest mapping the same resource twice,
+        // and doing so used to be quietly destructive in two ways. The window
+        // quota was charged on each map and credited on the single unmap, so a
+        // loop drained it permanently. Worse, `shmem_offset` records only the
+        // latest offset while `HostMemoryMapper` keys its slots by guest address,
+        // so the earlier mapping was never torn down: its KVM memory slot leaked
+        // and the stale window mapping stayed addressable by the guest.
+        //
+        // Upstream is no help here -- crosvm overwrites `shmem_offset` the same
+        // way -- but our slots are a bounded resource, so the guard is ours to
+        // add. The guest must unmap before it maps again.
+        if let Some(existing) = resource.shmem_offset {
+            log::warn!(
+                "NESBOX_GPU: map_blob: resource {resource_id} is already mapped at \
+                 offset {existing:#x}; refusing to map it again at {offset:#x}"
+            );
+            return Err(ErrUnspec);
+        }
 
         // Charged before anything is mapped, so a refusal leaves no host address
         // space committed. RESOURCE_MAP_BLOB is synchronous, so unlike a VRAM
