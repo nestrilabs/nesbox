@@ -18,6 +18,7 @@ mod virtio_gpu;
 mod metrics;
 mod occupancy;
 mod vram;
+mod window;
 mod worker;
 
 pub use self::descriptor_utils::{Error as DescriptorError, Reader, Writer};

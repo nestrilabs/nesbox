@@ -73,7 +73,10 @@ fn gpu_json(s: &GpuSnapshot) -> String {
     format!(
         "{{\"submits\":{},\"submits_failed\":{},\"fences\":{},\
          \"vram_bytes\":{},\"vram_peak_bytes\":{},\"vram_limit_bytes\":{},\
-         \"vram_refusals\":{},\"gtt_bytes\":{},\"occupancy\":{occupancy}}}",
+         \"vram_refusals\":{},\"gtt_bytes\":{},\
+         \"window_bytes\":{},\"window_peak_bytes\":{},\"window_limit_bytes\":{},\
+         \"window_mappings\":{},\"window_refusals\":{},\
+         \"occupancy\":{occupancy}}}",
         s.submits,
         s.submits_failed,
         s.fences,
@@ -82,6 +85,11 @@ fn gpu_json(s: &GpuSnapshot) -> String {
         s.vram_limit_bytes,
         s.vram_refusals,
         s.gtt_bytes,
+        s.window_bytes,
+        s.window_peak_bytes,
+        s.window_limit_bytes,
+        s.window_mappings,
+        s.window_refusals,
     )
 }
 
@@ -174,6 +182,11 @@ mod tests {
             vram_limit_bytes: 6,
             vram_refusals: 7,
             gtt_bytes: 8,
+            window_bytes: 20,
+            window_peak_bytes: 21,
+            window_limit_bytes: 22,
+            window_mappings: 23,
+            window_refusals: 24,
             occupancy: Some(virtio_devices::Occupancy {
                 gfx_ns: 9,
                 requested_vram_bytes: 10,
@@ -186,5 +199,7 @@ mod tests {
         assert_eq!(v["gpu"]["occupancy"]["gfx_ns"], 9);
         assert_eq!(v["gpu"]["submits_failed"], 2);
         assert_eq!(v["gpu"]["gtt_bytes"], 8);
+        assert_eq!(v["gpu"]["window_mappings"], 23);
+        assert_eq!(v["gpu"]["window_peak_bytes"], 21);
     }
 }

@@ -41,6 +41,11 @@ changing the meaning of one bumps it.
 | `gpu.vram_limit_bytes` | The configured quota; `0` is unbounded |
 | `gpu.vram_refusals` | Allocations refused for exceeding it |
 | `gpu.gtt_bytes` | GTT asked for. Counted, never enforced — host memory is bounded for the whole process by cgroups |
+| `gpu.window_bytes` | Bytes mapped into the host-visible window (BAR2) now |
+| `gpu.window_peak_bytes` | High-water mark |
+| `gpu.window_limit_bytes` | The configured quota; `0` is unbounded |
+| `gpu.window_mappings` | Live mappings. **Each is a KVM memory slot**, so this is the number that matters for slot pressure rather than the byte total |
+| `gpu.window_refusals` | Mappings refused, for bytes or for count |
 | `gpu.occupancy.gfx_ns` | Nanoseconds the graphics engine has spent on this client, from the kernel's own per-client accounting |
 | `gpu.occupancy.resident_vram_bytes` | What is actually in VRAM. Below `requested` means amdgpu has migrated buffers to GTT |
 | `gpu.occupancy.evicted_vram_bytes` | **Non-zero means this box's quota is above what the card will really give it**, and it is paying the difference in bus traffic |

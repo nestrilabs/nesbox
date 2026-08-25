@@ -49,6 +49,21 @@ pub struct Gpu {
     /// reclaimed from a guest that has taken it.
     #[serde(default)]
     pub vram_limit_mib: Option<u64>,
+    /// Bytes the guest may map into the host-visible window (BAR2), in MiB.
+    ///
+    /// Every mapping costs host address space and a KVM memory slot, and nothing
+    /// in the protocol makes a guest ask for a sensible number of them. Omitted
+    /// means unbounded.
+    #[serde(default)]
+    pub host_visible_window_mib: Option<u64>,
+    /// Live window mappings allowed. Omitted means unbounded.
+    ///
+    /// Each mapping is a KVM memory slot and KVM has a few thousand, so a guest
+    /// mapping single pages could exhaust them. That already fails safely, so this
+    /// is unbounded by default: no measurement yet says what a real workload
+    /// needs, and a cap guessed too low breaks it.
+    #[serde(default)]
+    pub host_visible_max_mappings: Option<u32>,
 }
 
 fn default_render_node() -> PathBuf {

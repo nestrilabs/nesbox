@@ -38,6 +38,16 @@ pub struct GpuCounters {
     /// GTT asked for. Counted, never enforced -- host memory is bounded for the
     /// whole process by cgroups.
     pub gtt_bytes: AtomicU64,
+
+    /// Bytes currently mapped into the host-visible window.
+    pub window_bytes: AtomicU64,
+    pub window_peak_bytes: AtomicU64,
+    /// The configured quota, or 0 for unbounded.
+    pub window_limit_bytes: AtomicU64,
+    /// Mappings live now. Each is a KVM memory slot, so this is the number that
+    /// matters for slot pressure rather than the byte total.
+    pub window_mappings: AtomicU64,
+    pub window_refusals: AtomicU64,
 }
 
 impl GpuCounters {
@@ -66,6 +76,11 @@ pub struct GpuSnapshot {
     pub vram_limit_bytes: u64,
     pub vram_refusals: u64,
     pub gtt_bytes: u64,
+    pub window_bytes: u64,
+    pub window_peak_bytes: u64,
+    pub window_limit_bytes: u64,
+    pub window_mappings: u64,
+    pub window_refusals: u64,
     /// `None` until the guest has created its first GPU context, which is when
     /// the DRM client this reads comes into existence. Reported as absent rather
     /// than as zeroes, because zeroes look like an idle GPU.
@@ -98,6 +113,11 @@ impl GpuMetrics {
             vram_limit_bytes: load(&c.vram_limit_bytes),
             vram_refusals: load(&c.vram_refusals),
             gtt_bytes: load(&c.gtt_bytes),
+            window_bytes: load(&c.window_bytes),
+            window_peak_bytes: load(&c.window_peak_bytes),
+            window_limit_bytes: load(&c.window_limit_bytes),
+            window_mappings: load(&c.window_mappings),
+            window_refusals: load(&c.window_refusals),
             occupancy: self.occupancy.read(),
         }
     }

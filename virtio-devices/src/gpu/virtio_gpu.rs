@@ -30,6 +30,7 @@ use super::protocol::{
 };
 use super::metrics::{GpuCounters, GpuMetrics};
 use super::vram::VramAccountant;
+use super::window::WindowQuota;
 use super::{GpuError, GpuQueues, HostMemoryMapper, Result, VirtioShmRegion};
 
 // ---------------------------------------------------------------------------
@@ -153,6 +154,8 @@ pub struct VirtioGpu {
     /// guest able to allocate until the card is exhausted, which is only safe
     /// when it is the sole tenant.
     vram: Option<VramAccountant>,
+    /// Bounds what the guest may map into BAR2 and reach directly.
+    window: WindowQuota,
     /// Shared with whoever is watching this device.
     metrics: Arc<GpuMetrics>,
 }
@@ -318,6 +321,8 @@ impl VirtioGpu {
         gpu_device_path: PathBuf,
         mapper: Arc<dyn HostMemoryMapper>,
         vram_limit_bytes: Option<u64>,
+        window_limit_bytes: u64,
+        window_max_mappings: u32,
         metrics: Arc<GpuMetrics>,
     ) -> Option<Self> {
         let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(FenceState::default()));
@@ -356,6 +361,11 @@ impl VirtioGpu {
                 );
                 VramAccountant::new(limit, metrics.clone())
             }),
+            window: WindowQuota::new(
+                window_limit_bytes,
+                window_max_mappings,
+                metrics.clone(),
+            ),
             metrics,
         })
     }
@@ -497,7 +507,10 @@ impl VirtioGpu {
         }
 
         if resource.rutabaga_external_mapping {
+            // A guest may unref a resource without unmapping it first, so the
+            // window has to be credited here too or it drains over a session.
             self.rutabaga.unmap(resource_id)?;
+            self.window.release(resource.size);
         }
         self.rutabaga.unref_resource(resource_id)?;
         if let Some(vram) = self.vram.as_mut() {
@@ -767,12 +780,29 @@ impl VirtioGpu {
             })?
             .size;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|e| {
-            log::error!("NESBOX_GPU: map_blob: map_info failed: {e:?}");
-            ErrUnspec
-        })?;
+        // Charged before anything is mapped, so a refusal leaves no host address
+        // space committed. RESOURCE_MAP_BLOB is synchronous, so unlike a VRAM
+        // refusal this one reaches the guest -- as a failed mmap, which Mesa
+        // reports as a failed buffer map.
+        if let Err(why) = self.window.try_map(res_size) {
+            log::warn!(
+                "NESBOX_GPU: map_blob: refusing resource {resource_id}: {why} -- {}",
+                self.window.summary()
+            );
+            return Err(ErrUnspec);
+        }
+
+        let map_info = match self.rutabaga.map_info(resource_id) {
+            Ok(i) => i,
+            Err(e) => {
+                self.window.release(res_size);
+                log::error!("NESBOX_GPU: map_blob: map_info failed: {e:?}");
+                return Err(ErrUnspec);
+            }
+        };
 
         if offset.saturating_add(res_size) > shm_region.size as u64 {
+            self.window.release(res_size);
             log::error!(
                 "NESBOX_GPU: map_blob: {res_size:#x} bytes at offset {offset:#x} does not \
                  fit the {:#x}-byte window",
@@ -789,10 +819,16 @@ impl VirtioGpu {
         // AMDGPU_GEM_CREATE_VM_ALWAYS_VALID, and `amdgpu_gem_prime_export`
         // refuses those with EPERM unconditionally. No capability changes that,
         // so it is not a fallback worth keeping.
-        let mapping = self.rutabaga.map(resource_id).map_err(|e| {
-            log::error!("NESBOX_GPU: map_blob: resource {resource_id} would not map: {e:?}");
-            ErrUnspec
-        })?;
+        let mapping = match self.rutabaga.map(resource_id) {
+            Ok(m) => m,
+            Err(e) => {
+                self.window.release(res_size);
+                log::error!(
+                    "NESBOX_GPU: map_blob: resource {resource_id} would not map: {e:?}"
+                );
+                return Err(ErrUnspec);
+            }
+        };
 
         if mapping.size < res_size {
             log::error!(
@@ -801,6 +837,7 @@ impl VirtioGpu {
                 mapping.size
             );
             let _ = self.rutabaga.unmap(resource_id);
+            self.window.release(res_size);
             return Err(ErrUnspec);
         }
 
@@ -811,6 +848,7 @@ impl VirtioGpu {
                 mapping.size
             );
             let _ = self.rutabaga.unmap(resource_id);
+            self.window.release(res_size);
             return Err(ErrUnspec);
         }
 
@@ -861,6 +899,7 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
         resource.shmem_offset = None;
         resource.rutabaga_external_mapping = false;
+        self.window.release(size);
         Ok(OkNoData)
     }
 }

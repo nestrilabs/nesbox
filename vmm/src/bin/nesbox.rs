@@ -177,6 +177,10 @@ fn main() -> Result<()> {
                 render_node: gpu_cfg.render_node.clone(),
                 displays: vec![DisplayInfo::new(gpu_cfg.width, gpu_cfg.height)],
                 vram_limit_bytes: gpu_cfg.vram_limit_mib.map(|m| m * (1 << 20)),
+                window_limit_bytes: gpu_cfg
+                    .host_visible_window_mib
+                    .map_or(0, |m| m * (1 << 20)),
+                window_max_mappings: gpu_cfg.host_visible_max_mappings.unwrap_or(0),
             },
             vm.mem.clone(),
         )?);

@@ -55,6 +55,8 @@ pub struct Worker {
     mapper: Arc<dyn HostMemoryMapper>,
     /// Per-guest device-memory limit in bytes, or `None` for unbounded.
     vram_limit_bytes: Option<u64>,
+    window_limit_bytes: u64,
+    window_max_mappings: u32,
     metrics: Arc<GpuMetrics>,
 }
 
@@ -70,6 +72,8 @@ impl Worker {
         gpu_device_path: PathBuf,
         mapper: Arc<dyn HostMemoryMapper>,
         vram_limit_bytes: Option<u64>,
+        window_limit_bytes: u64,
+        window_max_mappings: u32,
         metrics: Arc<GpuMetrics>,
     ) -> Self {
         Worker {
@@ -82,6 +86,8 @@ impl Worker {
             gpu_device_path,
             mapper,
             vram_limit_bytes,
+            window_limit_bytes,
+            window_max_mappings,
             metrics,
         }
     }
@@ -106,6 +112,8 @@ impl Worker {
             self.gpu_device_path.clone(),
             self.mapper.clone(),
             self.vram_limit_bytes,
+            self.window_limit_bytes,
+            self.window_max_mappings,
             self.metrics.clone(),
         ) else {
             log::error!(

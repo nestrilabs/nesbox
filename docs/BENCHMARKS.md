@@ -23,8 +23,38 @@ a figure from a different host is a different figure, not a confirmation.
 | GPU | Barcelo iGPU, `1002:15e7`, **Vega / gfx90c** — *not* RDNA |
 | RAM | 13.8 GiB |
 | Host kernel | 7.1.8-1-cachyos |
+| Form factor | **Laptop, running on battery, discharging** — see the warning below |
+| Power profile | ACPI `platform_profile` = `balanced`; EPP = `balance_power` |
 | CPU governor | `powersave` (**not** `performance` — see §8.2) |
+| CPU clocks | `scaling_max_freq` **4.55 GHz**, observed under sustained load **~2.15 GHz** |
+| `amd_pstate` | `active` |
 | GPU DPM states | `pp_dpm_sclk`: 200 / 400 / **2000** MHz, idling at 400 |
+
+> ### Read every number here as a floor, not a measurement of the software
+>
+> This is a **battery-powered laptop on a balanced power profile.** The CPU is
+> rated at 4.55 GHz and sustained 2.15 GHz — **under half its clock** — and the
+> iGPU's 2000 MHz ceiling is a mobile part's. Nothing here was tuned for
+> throughput, deliberately: it is the machine the work happened on.
+>
+> What that does and does not affect:
+>
+> - **Ratios are the durable results.** ~96% of bare-metal median frame time,
+>   97.9% of a capped host's CPU, 1.04–1.10× p99/p50 across four boxes — these
+>   compare a guest to the *same host*, so power state cancels out. They are the
+>   numbers to quote.
+> - **Absolute figures are not the hardware's.** Frame times, MB/s and fps would
+>   all improve on mains power, a performance profile, or a desktop part. Nobody
+>   should read 98.8 fps at `cost=400` as a property of the card.
+> - **Power management is an active hazard**, not background noise, and it has
+>   produced two false findings already: the GPU clock ramp in §4 and the CPU
+>   quota nonlinearity in §12.1. On a battery-powered laptop, *any* result where
+>   load is intermittent should be suspected of measuring a P-state before it is
+>   believed.
+>
+> **The RDNA 4 host is the validation, not a repeat.** It is a better-configured
+> machine, and re-running this suite there is the point of `scripts/` being one
+> command each — see §13 item 1.
 | libdrm | 2.4.134 |
 | virglrenderer | fork at `7fcfce4` **+ the patch in §6** |
 | Guest kernel | 7.2.0+ |
@@ -558,7 +588,74 @@ right at boot.
 
 ---
 
-## 13. Open, in the order that matters
+## 13. The host-visible window
+
+A blob the guest wants to touch with the CPU is mapped into BAR2 and registered
+with KVM, so afterwards the guest reads and writes it without trapping to us. That
+is what makes it fast, and why it needs a bound: every mapping costs host address
+space and a **KVM memory slot**, and nothing in the protocol makes a guest ask for
+a sensible number of them.
+
+```json
+"host-visible-window-mib": 256,
+"host-visible-max-mappings": 512
+```
+
+Both omitted means unbounded. Bytes is the quota a tier would be sized against;
+the mapping count is separate because slots are a different resource — KVM has a
+few thousand, and a guest mapping single pages could exhaust them. It defaults to
+unbounded because **no measurement yet says what a real workload needs**, and a cap
+guessed too low breaks it.
+
+### 13.1 What a workload actually uses
+
+`nesprobe` at 1080p, unbounded: **616 KiB across 9 mappings**, peak 616 KiB.
+
+So for this workload the window is nearly free, and a quota is about bounding the
+pathological case rather than sizing the normal one. A real title with many
+CPU-visible buffers will be much larger, and that number does not exist yet.
+
+### 13.2 This is the one GPU bound that can be refused synchronously
+
+Unlike a VRAM allocation (§11), `RESOURCE_MAP_BLOB` **is synchronous** — the guest
+kernel waits for `RESP_OK_MAP_INFO` because userspace needs the offset before it
+can mmap anything. So a refusal is delivered immediately rather than vanishing into
+an async queue.
+
+Measured with `host-visible-max-mappings: 4`, below the 9 the probe needs:
+
+```
+map_blob: refusing resource 9: host-visible window has 4 of 4 mappings in use
+EXIT=139
+```
+
+**The refusal arrives, and the guest process dies of SIGSEGV rather than getting a
+clean error.** Two things worth separating there:
+
+- **The protocol did its job.** Mesa's `amdvgpu_bo_cpu_map` returns failure
+  correctly (`return *cpu == NULL`), so the error *is* propagated at that layer —
+  its `assert(cpu_addr != NULL)` is compiled out under `NDEBUG`, but the return
+  value is honest. The fault is above the vdrm layer, in code that does not check
+  it.
+- **It is contained.** The guest shell printed `EXIT=139`, so **the box survived
+  and only the offending process died.** Compare §11, where a VRAM refusal wedged
+  the whole guest. A dead process is a much better failure than a hung box.
+
+So the ranking of the three GPU bounds by how gracefully they refuse:
+
+| bound | refusal reaches guest? | what dies |
+|---|---|---|
+| Host-visible window | **Yes, synchronously** | The process |
+| VRAM quota | No — async, unreportable | The box hangs (§11.1) |
+| VRAM via heap report | Not a refusal — the guest sizes itself down | Nothing |
+
+The pattern is consistent and worth stating plainly: **tell a guest the truth up
+front and nothing has to fail; refuse it mid-flight and the quality of the failure
+depends on a protocol detail we do not control.**
+
+---
+
+## 14. Open, in the order that matters
 
 1. **RDNA 4.** Untested. Everything above is Vega.
 2. **Frame counts from a real application.** `nesprobe` counts its own; an
