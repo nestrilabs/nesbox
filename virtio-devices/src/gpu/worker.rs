@@ -306,7 +306,9 @@ impl Worker {
                 virtio_gpu.resource_create_3d(info.resource_id, resource_create_3d)
             }
 
-            GpuCommand::ResourceUnref(info) => virtio_gpu.unref_resource(info.resource_id),
+            GpuCommand::ResourceUnref(info) => {
+                virtio_gpu.unref_resource(info.resource_id, &self.shm_region)
+            }
 
             GpuCommand::SetScanout(info) => virtio_gpu.set_scanout(
                 info.scanout_id,
