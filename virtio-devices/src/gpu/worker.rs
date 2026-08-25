@@ -55,6 +55,8 @@ pub struct Worker {
     mapper: Arc<dyn HostMemoryMapper>,
     /// Per-guest device-memory limit in bytes, or `None` for unbounded.
     vram_limit_bytes: Option<u64>,
+    window_limit_bytes: u64,
+    window_max_mappings: u32,
     metrics: Arc<GpuMetrics>,
 }
 
@@ -70,6 +72,8 @@ impl Worker {
         gpu_device_path: PathBuf,
         mapper: Arc<dyn HostMemoryMapper>,
         vram_limit_bytes: Option<u64>,
+        window_limit_bytes: u64,
+        window_max_mappings: u32,
         metrics: Arc<GpuMetrics>,
     ) -> Self {
         Worker {
@@ -82,6 +86,8 @@ impl Worker {
             gpu_device_path,
             mapper,
             vram_limit_bytes,
+            window_limit_bytes,
+            window_max_mappings,
             metrics,
         }
     }
@@ -106,6 +112,8 @@ impl Worker {
             self.gpu_device_path.clone(),
             self.mapper.clone(),
             self.vram_limit_bytes,
+            self.window_limit_bytes,
+            self.window_max_mappings,
             self.metrics.clone(),
         ) else {
             log::error!(
@@ -298,7 +306,9 @@ impl Worker {
                 virtio_gpu.resource_create_3d(info.resource_id, resource_create_3d)
             }
 
-            GpuCommand::ResourceUnref(info) => virtio_gpu.unref_resource(info.resource_id),
+            GpuCommand::ResourceUnref(info) => {
+                virtio_gpu.unref_resource(info.resource_id, &self.shm_region)
+            }
 
             GpuCommand::SetScanout(info) => virtio_gpu.set_scanout(
                 info.scanout_id,
@@ -336,6 +346,20 @@ impl Worker {
             GpuCommand::ResourceAttachBacking(info) => {
                 if reader.available_bytes() == 0 {
                     error!("virtio-gpu: ResourceAttachBacking missing backing entries");
+                    return Err(GpuResponse::ErrUnspec);
+                }
+                // `nr_entries` is a guest u32 and it used to size a host Vec
+                // directly, so a guest could reserve 64 GiB before a single
+                // entry was read. An entry cannot exist unless there are bytes
+                // to read it from, so the chain is the bound -- exact, and no
+                // constant to guess at.
+                let fits = reader.available_bytes() / size_of::<virtio_gpu_mem_entry>();
+                if info.nr_entries as usize > fits {
+                    error!(
+                        "virtio-gpu: ResourceAttachBacking claims {} entries, but only \
+                         {fits} fit the descriptor chain",
+                        info.nr_entries
+                    );
                     return Err(GpuResponse::ErrUnspec);
                 }
                 let mut vecs = Vec::with_capacity(info.nr_entries as usize);
@@ -441,6 +465,21 @@ impl Worker {
                 }
                 let num_fences = info.num_in_fences as usize;
                 let cmd_size = info.size as usize;
+                // Both are guest u32s that sized host allocations before
+                // anything was read: 32 GiB of fence ids and 4 GiB of command
+                // buffer, from one command. As above, what the chain actually
+                // carries is the bound.
+                let claimed = num_fences
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|fences| fences.checked_add(cmd_size));
+                if claimed.is_none_or(|n| n > reader.available_bytes()) {
+                    error!(
+                        "virtio-gpu: SUBMIT_3D claims {num_fences} fences and {cmd_size} \
+                         command bytes, more than the {} the chain carries",
+                        reader.available_bytes()
+                    );
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
                 let mut fence_ids: Vec<u64> = Vec::with_capacity(num_fences);
                 for _ in 0..num_fences {
                     match reader.read_obj::<u64>() {

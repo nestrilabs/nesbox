@@ -27,6 +27,34 @@ pub struct VmConfig {
     /// which is right for a hand-driven box and wrong for a supervised one.
     #[serde(default, rename = "stats-socket")]
     pub stats_socket: Option<PathBuf>,
+    /// seccomp-bpf confinement: `enforce`, `audit`, or `off`.
+    ///
+    /// `enforce` kills the process on a syscall outside the policy. `audit`
+    /// reports which syscall it was and exits, which is how the policy is
+    /// extended. Default `enforce` -- a security control that is off by default
+    /// is not a control.
+    #[serde(default = "default_seccomp")]
+    pub seccomp: String,
+    /// Enter a private user and network namespace before the guest runs.
+    ///
+    /// seccomp allows `socket` and `connect`, so a compromised device model
+    /// otherwise has the host's network. This takes the network away entirely --
+    /// the guest keeps its own link, because the tap is opened before the
+    /// unshare and an open descriptor is unaffected by it.
+    ///
+    /// Default off, and not because it is unimportant. Entering a user namespace
+    /// maps only this uid and gid, so access that depends on supplementary group
+    /// membership stops working, and Mesa opens the DRM render node *after* this
+    /// point. Where the render node is `0660 root:render` this will stop the GPU
+    /// working; where it is `0666` it is free. See
+    /// `isolation::enter_network_namespace` for the full argument, and turn it
+    /// on deliberately after testing on the host it will run on.
+    #[serde(default)]
+    pub unshare_network: bool,
+}
+
+fn default_seccomp() -> String {
+    "enforce".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -49,6 +77,21 @@ pub struct Gpu {
     /// reclaimed from a guest that has taken it.
     #[serde(default)]
     pub vram_limit_mib: Option<u64>,
+    /// Bytes the guest may map into the host-visible window (BAR2), in MiB.
+    ///
+    /// Every mapping costs host address space and a KVM memory slot, and nothing
+    /// in the protocol makes a guest ask for a sensible number of them. Omitted
+    /// means unbounded.
+    #[serde(default)]
+    pub host_visible_window_mib: Option<u64>,
+    /// Live window mappings allowed. Omitted means unbounded.
+    ///
+    /// Each mapping is a KVM memory slot and KVM has a few thousand, so a guest
+    /// mapping single pages could exhaust them. That already fails safely, so this
+    /// is unbounded by default: no measurement yet says what a real workload
+    /// needs, and a cap guessed too low breaks it.
+    #[serde(default)]
+    pub host_visible_max_mappings: Option<u32>,
 }
 
 fn default_render_node() -> PathBuf {

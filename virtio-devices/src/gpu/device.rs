@@ -70,6 +70,10 @@ pub struct GpuConfig {
     /// Device memory this guest may hold, in bytes. `None` lets it allocate
     /// until the card is exhausted, which is only safe for a sole tenant.
     pub vram_limit_bytes: Option<u64>,
+    /// Bytes the guest may map into the host-visible window. 0 is unbounded.
+    pub window_limit_bytes: u64,
+    /// Live mappings allowed. 0 is unbounded; each one is a KVM memory slot.
+    pub window_max_mappings: u32,
 }
 
 /// The queue state and interrupt plumbing the worker and the fence handler
@@ -121,6 +125,8 @@ struct Inner {
     displays: Box<[DisplayInfo]>,
     render_node: PathBuf,
     vram_limit_bytes: Option<u64>,
+    window_limit_bytes: u64,
+    window_max_mappings: u32,
     metrics: Arc<GpuMetrics>,
     shm_guest_addr: u64,
     mapper: Option<Arc<dyn HostMemoryMapper>>,
@@ -171,6 +177,8 @@ impl Inner {
             self.render_node.clone(),
             mapper,
             self.vram_limit_bytes,
+            self.window_limit_bytes,
+            self.window_max_mappings,
             self.metrics.clone(),
         );
         worker.run();
@@ -275,6 +283,8 @@ impl GpuDevice {
                 displays,
                 render_node: config.render_node.clone(),
                 vram_limit_bytes: config.vram_limit_bytes,
+                window_limit_bytes: config.window_limit_bytes,
+                window_max_mappings: config.window_max_mappings,
                 metrics: metrics.clone(),
                 // Filled in by `set_shm_guest_addr` once the bus has placed
                 // BAR2; the device cannot be activated before that.
@@ -395,7 +405,7 @@ impl GpuDevice {
                 }
             }
             CFG_QUEUE_SEL => i.qs = v2,
-            CFG_QUEUE_SIZE => i.sqm().size = v2,
+            CFG_QUEUE_SIZE => set_queue_size(i.sqm(), v2, QUEUE_SIZE),
             CFG_QUEUE_MSIX => i.sqm().vec = v2,
             CFG_QUEUE_ENABLE => i.sqm().enabled = v2 != 0,
             _ => write_queue_addr(i.sqm(), off, v3),

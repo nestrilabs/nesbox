@@ -329,7 +329,7 @@ impl BlkDevice {
             CFG_QUEUE_SEL => i.qs = v2,
             CFG_QUEUE_SIZE => {
                 if i.qs == 0 {
-                    i.q.size = v2;
+                    set_queue_size(&mut i.q, v2, QUEUE_SIZE)
                 }
             }
             CFG_QUEUE_MSIX => i.q.vec = v2,

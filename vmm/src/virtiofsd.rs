@@ -189,8 +189,15 @@ impl Virtiofsd {
 impl Drop for Virtiofsd {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        // Reaping reaches `wait4`, which is on the seccomp policy for exactly
+        // this call -- see `vmm/src/seccomp.rs`. Without it this line kills the
+        // process with SIGSYS and everything below is skipped.
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket_path);
+        // virtiofsd writes a pidfile beside its socket and does not remove it.
+        // Nothing here created it, so nothing here used to clean it up, and a
+        // directory per VM accumulated in the runtime directory forever.
+        let _ = std::fs::remove_file(self.socket_path.with_extension("sock.pid"));
     }
 }
 

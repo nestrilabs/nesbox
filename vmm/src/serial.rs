@@ -102,8 +102,11 @@ impl Serial {
             REG_IIR => IIR_NO_INTERRUPT,
             REG_LCR => i.lcr,
             REG_MCR => i.mcr,
-            // Always ready to transmit, never anything to receive.
-            REG_LSR => LSR_THR_EMPTY | LSR_TRANSMITTER_IDLE | (0 & LSR_DATA_READY),
+            // Always ready to transmit, and `LSR_DATA_READY` is deliberately
+            // never set: this port is write-only, guest input arrives on the
+            // virtio console. It used to be written as `| (0 & LSR_DATA_READY)`
+            // to show that, which is an expression that can only be zero.
+            REG_LSR => LSR_THR_EMPTY | LSR_TRANSMITTER_IDLE,
             REG_MSR => MSR_DEFAULTS,
             REG_SCR => i.scr,
             _ => 0,

@@ -86,6 +86,27 @@ fn main() -> Result<()> {
 
     info!("Starting VMM with config: {:#?}", config);
 
+    // ── Private user namespace, if asked for ──────────────────────────────
+    // Here and nowhere later: the kernel only lets a *single-threaded* process
+    // create a user namespace, and the block and console devices each spawn a
+    // worker as they are built. This is only half the job -- it buys the
+    // privilege to unshare the network further down, once the tap is open.
+    if config.unshare_network {
+        nesbox_vmm::isolation::enter_user_namespace()?;
+    }
+
+    // What is actually confining this process, said out loud before anything
+    // depends on it. Several bounds this codebase assumes -- host memory for GTT
+    // most of all -- are applied by whoever supervises us or not at all, and the
+    // difference used to be invisible.
+    nesbox_vmm::isolation::Report::gather().log();
+
+    // A VRAM limit is enforced inside virglrenderer, not here, and which
+    // renderer gets loaded is LD_LIBRARY_PATH's decision. Checked before the
+    // device is built so a limit that would silently do nothing stops the boot
+    // rather than becoming a number in a config nobody rechecks.
+    nesbox_vmm::renderer::check(config.gpu.as_ref().and_then(|g| g.vram_limit_mib))?;
+
     // Create KVM VM
     let vm = vm::Vm::new(
         config.machine_config.mem_size_mib,
@@ -187,6 +208,8 @@ fn main() -> Result<()> {
                 render_node: gpu_cfg.render_node.clone(),
                 displays: vec![DisplayInfo::new(gpu_cfg.width, gpu_cfg.height)],
                 vram_limit_bytes: gpu_cfg.vram_limit_mib.map(|m| m * (1 << 20)),
+                window_limit_bytes: gpu_cfg.host_visible_window_mib.map_or(0, |m| m * (1 << 20)),
+                window_max_mappings: gpu_cfg.host_visible_max_mappings.unwrap_or(0),
             },
             vm.mem.clone(),
         )?);
@@ -263,6 +286,35 @@ fn main() -> Result<()> {
     let power = Arc::new(PowerDevice::new(shutdown.clone()));
     install_signal_handlers(shutdown.clone())?;
 
+    // ── Take away the network ─────────────────────────────────────────────
+    // Deliberately here: after the tap is opened, after virtiofsd is spawned and
+    // after the stats socket is bound. All three keep working across the unshare
+    // because a descriptor -- and a socket's namespace -- is fixed when it is
+    // created, not when it is used. Moving this earlier breaks all three.
+    if config.unshare_network {
+        if config.vsock.is_some() {
+            log::warn!(
+                "unshare-network is on and a vsock device is configured. vsock is \
+                 namespace-aware and this combination has not been measured; if the \
+                 guest's control channel goes quiet, this is the first thing to turn off."
+            );
+        }
+        nesbox_vmm::isolation::enter_network_namespace()?;
+    }
+
+    // ── Confine the process ───────────────────────────────────────────────
+    // Last thing before the guest runs, and deliberately after every device is
+    // built: virtiofsd has been spawned by now, and `execve` is not on the
+    // policy. Anything that needs to open a new path or start a process must
+    // happen above this line.
+    let seccomp_mode = nesbox_vmm::seccomp::Mode::parse(&config.seccomp).ok_or_else(|| {
+        anyhow::anyhow!(
+            "seccomp: {:?} is not one of enforce, audit, off",
+            config.seccomp
+        )
+    })?;
+    nesbox_vmm::seccomp::apply_baseline(seccomp_mode).context("could not confine the VMM")?;
+
     // ── Run vCPUs ─────────────────────────────────────────────────────────
     // The CPU set every vCPU thread is confined to, if the config named one.
     // Built once here rather than per thread: it is the same set for all of
@@ -288,6 +340,22 @@ fn main() -> Result<()> {
                     if let Some(set) = cpuset {
                         set_affinity_or_warn(vcpu_id, &set);
                     }
+                    // NOT confined further, and the reason is structural.
+                    //
+                    // A vCPU needs almost nothing, so a tight per-thread filter
+                    // here would be the single biggest hardening available --
+                    // `seccomp::vcpu()` exists and is tested. It cannot be
+                    // installed yet: **device workers are spawned lazily by
+                    // whichever vCPU thread services the guest's activation
+                    // write**, and a thread inherits its creator's filters. The
+                    // GPU worker would come into existence already forbidden from
+                    // opening the render node, and measured, it dies at virtio-gpu
+                    // probe.
+                    //
+                    // The fix is to stop vCPU threads being the parents of
+                    // long-lived workers -- have activation hand the work to a
+                    // thread that already exists under the baseline. Until then
+                    // this is deliberately left off rather than shipped broken.
                     if let Err(e) =
                         vm::run_vcpu_loop(mem, vcpu_fd, pci_bus, serial, power, shutdown)
                     {
@@ -324,6 +392,11 @@ fn main() -> Result<()> {
     // Devices and their backends are torn down here: dropping the virtiofsd
     // supervisors kills them, and the VM's memory goes with the process.
     drop(fs_daemons);
+    // Empty once every daemon has removed its socket and pidfile. `remove_dir`
+    // rather than `remove_dir_all`: if anything is unexpectedly still in there,
+    // leaving it is better than deleting it, and the failure is silent because a
+    // stray directory is not worth failing a shutdown over.
+    let _ = std::fs::remove_dir(&runtime_dir);
 
     let reason = shutdown.reason().unwrap_or(ExitReason::GuestFault);
     if reason.is_clean() {

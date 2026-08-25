@@ -28,6 +28,7 @@ use super::protocol::{
     VirtioGpuResult,
 };
 use super::vram::VramAccountant;
+use super::window::WindowQuota;
 use super::{GpuError, GpuQueues, HostMemoryMapper, Result, VirtioShmRegion};
 
 // ---------------------------------------------------------------------------
@@ -126,6 +127,21 @@ impl VirtioGpuResource {
             rutabaga_external_mapping: false,
         }
     }
+
+    /// Where in guest physical address space this resource is mapped, if it is.
+    ///
+    /// `shmem_offset` is the authoritative "is this mapped" signal — it is set
+    /// on a successful `RESOURCE_MAP_BLOB` and cleared on unmap, and since the
+    /// double-map guard it is also what refuses a second mapping.
+    ///
+    /// This exists so the two paths that tear a mapping down cannot disagree
+    /// about whether there is one. They already did once: `resource_unmap_blob`
+    /// computed this address and removed the KVM slot, while `unref_resource`
+    /// looked at `rutabaga_external_mapping` instead and never removed it.
+    fn mapped_at(&self, shm_region: &VirtioShmRegion) -> Option<u64> {
+        self.shmem_offset
+            .map(|offset| shm_region.guest_addr + offset)
+    }
 }
 
 #[derive(Debug)]
@@ -151,6 +167,8 @@ pub struct VirtioGpu {
     /// guest able to allocate until the card is exhausted, which is only safe
     /// when it is the sole tenant.
     vram: Option<VramAccountant>,
+    /// Bounds what the guest may map into BAR2 and reach directly.
+    window: WindowQuota,
     /// Shared with whoever is watching this device.
     metrics: Arc<GpuMetrics>,
 }
@@ -316,6 +334,8 @@ impl VirtioGpu {
         gpu_device_path: PathBuf,
         mapper: Arc<dyn HostMemoryMapper>,
         vram_limit_bytes: Option<u64>,
+        window_limit_bytes: u64,
+        window_max_mappings: u32,
         metrics: Arc<GpuMetrics>,
     ) -> Option<Self> {
         let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(FenceState::default()));
@@ -354,6 +374,7 @@ impl VirtioGpu {
                 );
                 VramAccountant::new(limit, metrics.clone())
             }),
+            window: WindowQuota::new(window_limit_bytes, window_max_mappings, metrics.clone()),
             metrics,
         })
     }
@@ -480,7 +501,11 @@ impl VirtioGpu {
         Ok(self.result_from_query(resource_id))
     }
 
-    pub fn unref_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
+    pub fn unref_resource(
+        &mut self,
+        resource_id: u32,
+        shm_region: &VirtioShmRegion,
+    ) -> VirtioGpuResult {
         let resource = self
             .resources
             .remove(&resource_id)
@@ -494,9 +519,44 @@ impl VirtioGpu {
             return Err(ErrUnspec);
         }
 
-        if resource.rutabaga_external_mapping {
-            self.rutabaga.unmap(resource_id)?;
+        // A guest may unref a resource it never unmapped, so everything
+        // `resource_unmap_blob` does has to happen here as well -- and in the
+        // same order, because the order is a safety property rather than a
+        // tidiness one.
+        //
+        // This used to release virglrenderer's mapping and credit the window
+        // while leaving the KVM memory slot registered, which is that ordering
+        // exactly inverted. The slot leaked -- and slots are finite, so a
+        // map/unref loop exhausted them -- but the worse half is that the guest
+        // went on addressing host memory after the renderer had freed it, and
+        // that memory could already have been handed to something else.
+        if let Some(guest_addr) = resource.mapped_at(shm_region) {
+            // Take it away from the guest first. If that fails it must not be
+            // released, so the unref is refused and the resource kept: a
+            // resource the guest still holds is a far smaller problem than a
+            // window into freed host memory.
+            if let Err(err) = self.mapper.unmap(guest_addr, resource.size) {
+                log::error!(
+                    "NESBOX_GPU: unref_resource: resource {resource_id} at {guest_addr:#x} \
+                     would not unmap, refusing the unref: {err:#}"
+                );
+                self.resources.insert(resource_id, resource);
+                return Err(ErrUnspec);
+            }
+            if resource.rutabaga_external_mapping {
+                if let Err(e) = self.rutabaga.unmap(resource_id) {
+                    // As in `resource_unmap_blob`: worth knowing about, not
+                    // worth abandoning the rest of the teardown over.
+                    log::warn!(
+                        "NESBOX_GPU: unref_resource: virglrenderer kept resource \
+                         {resource_id} mapped: {e:?}"
+                    );
+                }
+            }
+            // Credited here too, or the window drains over a session.
+            self.window.release(resource.size);
         }
+
         self.rutabaga.unref_resource(resource_id)?;
         if let Some(vram) = self.vram.as_mut() {
             vram.release_resource(resource_id);
@@ -756,21 +816,57 @@ impl VirtioGpu {
         shm_region: &VirtioShmRegion,
         offset: u64,
     ) -> VirtioGpuResult {
-        let res_size = self
-            .resources
-            .get(&resource_id)
-            .ok_or_else(|| {
-                log::error!("NESBOX_GPU: map_blob: resource {resource_id} not found");
-                ErrInvalidResourceId
-            })?
-            .size;
-
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|e| {
-            log::error!("NESBOX_GPU: map_blob: map_info failed: {e:?}");
-            ErrUnspec
+        let resource = self.resources.get(&resource_id).ok_or_else(|| {
+            log::error!("NESBOX_GPU: map_blob: resource {resource_id} not found");
+            ErrInvalidResourceId
         })?;
+        let res_size = resource.size;
+
+        // Refuse a resource that is already mapped, and refuse it before anything
+        // is charged.
+        //
+        // Nothing in the protocol stops a guest mapping the same resource twice,
+        // and doing so used to be quietly destructive in two ways. The window
+        // quota was charged on each map and credited on the single unmap, so a
+        // loop drained it permanently. Worse, `shmem_offset` records only the
+        // latest offset while `HostMemoryMapper` keys its slots by guest address,
+        // so the earlier mapping was never torn down: its KVM memory slot leaked
+        // and the stale window mapping stayed addressable by the guest.
+        //
+        // Upstream is no help here -- crosvm overwrites `shmem_offset` the same
+        // way -- but our slots are a bounded resource, so the guard is ours to
+        // add. The guest must unmap before it maps again.
+        if let Some(existing) = resource.shmem_offset {
+            log::warn!(
+                "NESBOX_GPU: map_blob: resource {resource_id} is already mapped at \
+                 offset {existing:#x}; refusing to map it again at {offset:#x}"
+            );
+            return Err(ErrUnspec);
+        }
+
+        // Charged before anything is mapped, so a refusal leaves no host address
+        // space committed. RESOURCE_MAP_BLOB is synchronous, so unlike a VRAM
+        // refusal this one reaches the guest -- as a failed mmap, which Mesa
+        // reports as a failed buffer map.
+        if let Err(why) = self.window.try_map(res_size) {
+            log::warn!(
+                "NESBOX_GPU: map_blob: refusing resource {resource_id}: {why} -- {}",
+                self.window.summary()
+            );
+            return Err(ErrUnspec);
+        }
+
+        let map_info = match self.rutabaga.map_info(resource_id) {
+            Ok(i) => i,
+            Err(e) => {
+                self.window.release(res_size);
+                log::error!("NESBOX_GPU: map_blob: map_info failed: {e:?}");
+                return Err(ErrUnspec);
+            }
+        };
 
         if offset.saturating_add(res_size) > shm_region.size as u64 {
+            self.window.release(res_size);
             log::error!(
                 "NESBOX_GPU: map_blob: {res_size:#x} bytes at offset {offset:#x} does not \
                  fit the {:#x}-byte window",
@@ -787,10 +883,14 @@ impl VirtioGpu {
         // AMDGPU_GEM_CREATE_VM_ALWAYS_VALID, and `amdgpu_gem_prime_export`
         // refuses those with EPERM unconditionally. No capability changes that,
         // so it is not a fallback worth keeping.
-        let mapping = self.rutabaga.map(resource_id).map_err(|e| {
-            log::error!("NESBOX_GPU: map_blob: resource {resource_id} would not map: {e:?}");
-            ErrUnspec
-        })?;
+        let mapping = match self.rutabaga.map(resource_id) {
+            Ok(m) => m,
+            Err(e) => {
+                self.window.release(res_size);
+                log::error!("NESBOX_GPU: map_blob: resource {resource_id} would not map: {e:?}");
+                return Err(ErrUnspec);
+            }
+        };
 
         if mapping.size < res_size {
             log::error!(
@@ -799,6 +899,7 @@ impl VirtioGpu {
                 mapping.size
             );
             let _ = self.rutabaga.unmap(resource_id);
+            self.window.release(res_size);
             return Err(ErrUnspec);
         }
 
@@ -809,6 +910,7 @@ impl VirtioGpu {
                 mapping.size
             );
             let _ = self.rutabaga.unmap(resource_id);
+            self.window.release(res_size);
             return Err(ErrUnspec);
         }
 
@@ -833,10 +935,11 @@ impl VirtioGpu {
             .resources
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
-        let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
         let size = resource.size;
         let external = resource.rutabaga_external_mapping;
-        let guest_addr = shm_region.guest_addr + shmem_offset;
+        // Same helper `unref_resource` uses, so the two teardown paths cannot
+        // disagree about whether a resource is mapped or where.
+        let guest_addr = resource.mapped_at(shm_region).ok_or(ErrUnspec)?;
 
         // Take it away from the guest first: virglrenderer's mapping must not
         // be released while the guest can still reach it.
@@ -861,6 +964,7 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
         resource.shmem_offset = None;
         resource.rutabaga_external_mapping = false;
+        self.window.release(size);
         Ok(OkNoData)
     }
 }
@@ -899,6 +1003,60 @@ mod tests {
         assert_eq!(
             s.iter_enabled().collect::<Vec<_>>(),
             (1..VIRTIO_GPU_MAX_SCANOUTS).step_by(2).collect::<Vec<_>>()
+        );
+    }
+
+    const WINDOW: VirtioShmRegion = VirtioShmRegion {
+        guest_addr: 0xfff0_0000_0000,
+        size: 0x2_0000_0000,
+    };
+
+    /// `unref_resource` and `resource_unmap_blob` both have to tear a mapping
+    /// down, and they disagreed: unmap keyed on `shmem_offset` and removed the
+    /// KVM slot, unref keyed on `rutabaga_external_mapping` and did not. A guest
+    /// that mapped a blob and then unref'd it without unmapping left the slot
+    /// registered -- finite, so a loop exhausted them, and worse, the guest went
+    /// on addressing host memory the renderer had already freed.
+    ///
+    /// Testing the whole path needs a rutabaga context and therefore a real GPU,
+    /// so what is locked here is the thing they disagreed about: one answer to
+    /// "is this mapped, and where".
+    #[test]
+    fn a_mapped_resource_reports_where_it_is_mapped() {
+        let mut resource = VirtioGpuResource::new(0x1000);
+        assert_eq!(
+            resource.mapped_at(&WINDOW),
+            None,
+            "a resource that was never mapped has no address to unmap"
+        );
+
+        // What a successful RESOURCE_MAP_BLOB records.
+        resource.shmem_offset = Some(0x4000);
+        resource.rutabaga_external_mapping = true;
+        assert_eq!(
+            resource.mapped_at(&WINDOW),
+            Some(WINDOW.guest_addr + 0x4000),
+            "and one that was mapped reports the address the slot is keyed by"
+        );
+
+        // What unmap clears. Both paths must then agree there is nothing to do,
+        // so a later unref does not try to remove a slot that is already gone.
+        resource.shmem_offset = None;
+        resource.rutabaga_external_mapping = false;
+        assert_eq!(resource.mapped_at(&WINDOW), None);
+    }
+
+    /// The specific inversion that caused the bug: `rutabaga_external_mapping`
+    /// is not the signal, and a teardown path that consults it instead of the
+    /// offset has no address to hand `HostMemoryMapper::unmap` at all.
+    #[test]
+    fn the_renderer_flag_is_not_what_says_a_slot_is_registered() {
+        let mut resource = VirtioGpuResource::new(0x1000);
+        resource.rutabaga_external_mapping = true;
+        assert_eq!(
+            resource.mapped_at(&WINDOW),
+            None,
+            "the renderer flag alone must never be read as 'a KVM slot exists'"
         );
     }
 }

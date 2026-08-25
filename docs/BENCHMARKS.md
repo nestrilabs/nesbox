@@ -23,8 +23,38 @@ a figure from a different host is a different figure, not a confirmation.
 | GPU | Barcelo iGPU, `1002:15e7`, **Vega / gfx90c** — *not* RDNA |
 | RAM | 13.8 GiB |
 | Host kernel | 7.1.8-1-cachyos |
+| Form factor | **Laptop, running on battery, discharging** — see the warning below |
+| Power profile | ACPI `platform_profile` = `balanced`; EPP = `balance_power` |
 | CPU governor | `powersave` (**not** `performance` — see §8.2) |
+| CPU clocks | `scaling_max_freq` **4.55 GHz**, observed under sustained load **~2.15 GHz** |
+| `amd_pstate` | `active` |
 | GPU DPM states | `pp_dpm_sclk`: 200 / 400 / **2000** MHz, idling at 400 |
+
+> ### Read every number here as a floor, not a measurement of the software
+>
+> This is a **battery-powered laptop on a balanced power profile.** The CPU is
+> rated at 4.55 GHz and sustained 2.15 GHz — **under half its clock** — and the
+> iGPU's 2000 MHz ceiling is a mobile part's. Nothing here was tuned for
+> throughput, deliberately: it is the machine the work happened on.
+>
+> What that does and does not affect:
+>
+> - **Ratios are the durable results.** ~96% of bare-metal median frame time,
+>   97.9% of a capped host's CPU, 1.04–1.10× p99/p50 across four boxes — these
+>   compare a guest to the *same host*, so power state cancels out. They are the
+>   numbers to quote.
+> - **Absolute figures are not the hardware's.** Frame times, MB/s and fps would
+>   all improve on mains power, a performance profile, or a desktop part. Nobody
+>   should read 98.8 fps at `cost=400` as a property of the card.
+> - **Power management is an active hazard**, not background noise, and it has
+>   produced two false findings already: the GPU clock ramp in §4 and the CPU
+>   quota nonlinearity in §12.1. On a battery-powered laptop, *any* result where
+>   load is intermittent should be suspected of measuring a P-state before it is
+>   believed.
+>
+> **The RDNA 4 host is the validation, not a repeat.** It is a better-configured
+> machine, and re-running this suite there is the point of `scripts/` being one
+> command each — see §13 item 1.
 | libdrm | 2.4.134 |
 | virglrenderer | fork at `7fcfce4` **+ the patch in §6** |
 | Guest kernel | 7.2.0+ |
@@ -398,9 +428,11 @@ Two parts, in `patches/0002`:
 - **Refuse in `GEM_NEW`.** Contains a guest that ignores the report, at the cost of
   that guest wedging.
 
-Only the VRAM heap is bounded. GTT is host system memory, capped for the whole VMM
-process by cgroups; counting it twice would refuse guests for memory they never
-took from the card.
+Only the VRAM heap is bounded. GTT is host system memory; counting it twice would
+refuse guests for memory they never took from the card. Whether that host memory
+is capped at all is the supervisor's `memory.max` to set and not something nesbox
+applies — see §12.3 for what such a cap does and does not do, and note that nesbox
+now says at startup which limits are actually in force.
 
 ### 11.3 Measured
 
@@ -452,7 +484,182 @@ Two smaller findings worth keeping:
 
 ---
 
-## 12. Open, in the order that matters
+## 12. Does a cgroup on the VMM bound the guest inside it?
+
+A guest gets CPU, memory and disk through the VMM's own threads, so the kernel's
+cgroup controllers ought to bound a guest without nesbox implementing anything.
+`scripts/envelope.sh` tests that. It needs **no root**: systemd delegates `cpu`,
+`io`, `memory` and `cpuset` to the user session, so `systemd-run --user --scope`
+applies a limit the same way a supervisor would.
+
+```sh
+scripts/envelope.sh          # all three
+scripts/envelope.sh io       # one
+```
+
+The short answer is **one of three holds cleanly, one leaks, and one does
+something other than what it looks like.**
+
+### 12.1 CPU — holds, and virtualization costs ~2%
+
+`openssl speed sha256` in the guest, and the identical command on the host as a
+control.
+
+| | guest | host | guest/host |
+|---|---|---|---|
+| unlimited | 2,157,396k | 2,186,751k | **98.7%** |
+| `CPUQuota=50%` | 504,652k | 515,643k | **97.9%** |
+
+**A quota applies to a guest almost exactly as it applies to a native process**,
+and CPU virtualization costs **1.3–2.1%**.
+
+**The trap is the other ratio.** A 50% quota does not give 50% of throughput — it
+gives **23.4%** in the guest. That looks like a catastrophic virtualization
+penalty and is not one: the host shows **23.6%** with no VM involved at all. The
+nonlinearity belongs to the host, not to us. CPU frequency during a capped run
+swings 1.4–2.4 GHz against a steady 2.15 GHz uncapped, so power management is
+involved, though that does not fully account for it and no claim is made here that
+it does.
+
+Shortening the enforcement window makes it worse, not better — `50%` at a 100 ms
+period gives 484,422k, at 10 ms 456,466k, at 5 ms 442,565k — so it is not an
+artefact of long freezes. Two vCPUs and one vCPU behave identically, so it is not
+vCPU contention either.
+
+> **Compare a capped guest against a capped host, never against an uncapped one.**
+> Doing otherwise here would have reported a 4× virtualization penalty. That is the
+> same error as §4: the wrong baseline, not the wrong system.
+
+### 12.2 Block I/O — bounds device traffic, and is void on a warm cache
+
+`dd if=/dev/vda iflag=direct`, 300 MiB, against `IOReadBandwidthMax=20M`.
+
+| | throughput |
+|---|---|
+| unlimited, host cache cold | 997 MB/s |
+| **20 MB/s cap, cold** | **53.9 MB/s** |
+| **20 MB/s cap, host cache warm** | **1.9 GB/s** |
+
+Two findings, and the second is the one that matters.
+
+**The cap works, imprecisely** — an 18× reduction, but 2.7× above the number
+asked for. Host readahead turns the guest's 1 MiB direct reads into larger device
+reads, and the cap is on device bandwidth rather than on what the guest sees.
+
+**The cap does not work at all once the host has the image cached.** `iflag=direct`
+stops the *guest* caching; nothing stops the *host* caching the backing file. A
+read the host page cache satisfies never reaches the device, so `io.max` never sees
+it — the capped guest ran **35× faster than the uncapped cold one**.
+
+So an I/O bound on a guest holds only while its working set misses host cache. This
+is the same missing `O_DIRECT` that makes every guest byte cost host memory twice
+(§6): one flag, two problems.
+
+> Any storage benchmark that does not state its cache state is measuring the cache.
+> `envelope.sh` evicts the image with `POSIX_FADV_DONTNEED` between runs, which
+> needs no root.
+
+### 12.3 Memory — not a dial, and what it does depends on the host
+
+`dd` into guest tmpfs, which is guest RAM, so the VMM really faults the pages in.
+Guest RAM 1024 MiB.
+
+| | throughput |
+|---|---|
+| `MemoryMax=2G` (above guest RAM) | 459 MB/s |
+| `MemoryMax=384M` (below guest RAM) | **240 MB/s** |
+
+The guest was **not killed and did not shrink**. It got 48% slower, with no error
+reported anywhere — because this host has 13.5 GiB of zram swap, so guest RAM was
+reclaimed into it and the guest stuttered on faults it cannot see or account for.
+
+**On a host without swap the same cap OOM-kills the VMM instead.** Same
+configuration, entirely different failure, decided by something outside the
+config.
+
+Either way: **`memory.max` cannot make a guest use less memory**, only punish it
+for using what it was given. It is a blast radius, not a dial. Guest RAM has to be
+right at boot.
+
+### 12.4 What this means for bounding a box
+
+| bound | verdict |
+|---|---|
+| CPU | **Holds.** Costs ~2% over native, and quota-to-throughput is nonlinear on the host too |
+| Block I/O | **Holds only against cold cache.** Needs `O_DIRECT` in the VMM to be a real bound |
+| Host RAM | **Not a bound on the guest.** Sets what happens when a guest exceeds its allocation, not what it may allocate |
+| VRAM | Holds — but by quota and heap report, not by cgroup (§11) |
+
+---
+
+## 13. The host-visible window
+
+A blob the guest wants to touch with the CPU is mapped into BAR2 and registered
+with KVM, so afterwards the guest reads and writes it without trapping to us. That
+is what makes it fast, and why it needs a bound: every mapping costs host address
+space and a **KVM memory slot**, and nothing in the protocol makes a guest ask for
+a sensible number of them.
+
+```json
+"host-visible-window-mib": 256,
+"host-visible-max-mappings": 512
+```
+
+Both omitted means unbounded. Bytes is the quota a tier would be sized against;
+the mapping count is separate because slots are a different resource — KVM has a
+few thousand, and a guest mapping single pages could exhaust them. It defaults to
+unbounded because **no measurement yet says what a real workload needs**, and a cap
+guessed too low breaks it.
+
+### 13.1 What a workload actually uses
+
+`nesprobe` at 1080p, unbounded: **616 KiB across 9 mappings**, peak 616 KiB.
+
+So for this workload the window is nearly free, and a quota is about bounding the
+pathological case rather than sizing the normal one. A real title with many
+CPU-visible buffers will be much larger, and that number does not exist yet.
+
+### 13.2 This is the one GPU bound that can be refused synchronously
+
+Unlike a VRAM allocation (§11), `RESOURCE_MAP_BLOB` **is synchronous** — the guest
+kernel waits for `RESP_OK_MAP_INFO` because userspace needs the offset before it
+can mmap anything. So a refusal is delivered immediately rather than vanishing into
+an async queue.
+
+Measured with `host-visible-max-mappings: 4`, below the 9 the probe needs:
+
+```
+map_blob: refusing resource 9: host-visible window has 4 of 4 mappings in use
+EXIT=139
+```
+
+**The refusal arrives, and the guest process dies of SIGSEGV rather than getting a
+clean error.** Two things worth separating there:
+
+- **The protocol did its job.** Mesa's `amdvgpu_bo_cpu_map` returns failure
+  correctly (`return *cpu == NULL`), so the error *is* propagated at that layer —
+  its `assert(cpu_addr != NULL)` is compiled out under `NDEBUG`, but the return
+  value is honest. The fault is above the vdrm layer, in code that does not check
+  it.
+- **It is contained.** The guest shell printed `EXIT=139`, so **the box survived
+  and only the offending process died.** Compare §11, where a VRAM refusal wedged
+  the whole guest. A dead process is a much better failure than a hung box.
+
+So the ranking of the three GPU bounds by how gracefully they refuse:
+
+| bound | refusal reaches guest? | what dies |
+|---|---|---|
+| Host-visible window | **Yes, synchronously** | The process |
+| VRAM quota | No — async, unreportable | The box hangs (§11.1) |
+| VRAM via heap report | Not a refusal — the guest sizes itself down | Nothing |
+
+The pattern is consistent and worth stating plainly: **tell a guest the truth up
+front and nothing has to fail; refuse it mid-flight and the quality of the failure
+depends on a protocol detail we do not control.**
+
+---
+
+## 14. Open, in the order that matters
 
 1. **RDNA 4.** Untested. Everything above is Vega.
 2. **Frame counts from a real application.** `nesprobe` counts its own; an
