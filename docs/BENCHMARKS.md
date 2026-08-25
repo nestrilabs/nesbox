@@ -450,7 +450,115 @@ Two smaller findings worth keeping:
 
 ---
 
-## 12. Open, in the order that matters
+## 12. Does a cgroup on the VMM bound the guest inside it?
+
+A guest gets CPU, memory and disk through the VMM's own threads, so the kernel's
+cgroup controllers ought to bound a guest without nesbox implementing anything.
+`scripts/envelope.sh` tests that. It needs **no root**: systemd delegates `cpu`,
+`io`, `memory` and `cpuset` to the user session, so `systemd-run --user --scope`
+applies a limit the same way a supervisor would.
+
+```sh
+scripts/envelope.sh          # all three
+scripts/envelope.sh io       # one
+```
+
+The short answer is **one of three holds cleanly, one leaks, and one does
+something other than what it looks like.**
+
+### 12.1 CPU — holds, and virtualization costs ~2%
+
+`openssl speed sha256` in the guest, and the identical command on the host as a
+control.
+
+| | guest | host | guest/host |
+|---|---|---|---|
+| unlimited | 2,157,396k | 2,186,751k | **98.7%** |
+| `CPUQuota=50%` | 504,652k | 515,643k | **97.9%** |
+
+**A quota applies to a guest almost exactly as it applies to a native process**,
+and CPU virtualization costs **1.3–2.1%**.
+
+**The trap is the other ratio.** A 50% quota does not give 50% of throughput — it
+gives **23.4%** in the guest. That looks like a catastrophic virtualization
+penalty and is not one: the host shows **23.6%** with no VM involved at all. The
+nonlinearity belongs to the host, not to us. CPU frequency during a capped run
+swings 1.4–2.4 GHz against a steady 2.15 GHz uncapped, so power management is
+involved, though that does not fully account for it and no claim is made here that
+it does.
+
+Shortening the enforcement window makes it worse, not better — `50%` at a 100 ms
+period gives 484,422k, at 10 ms 456,466k, at 5 ms 442,565k — so it is not an
+artefact of long freezes. Two vCPUs and one vCPU behave identically, so it is not
+vCPU contention either.
+
+> **Compare a capped guest against a capped host, never against an uncapped one.**
+> Doing otherwise here would have reported a 4× virtualization penalty. That is the
+> same error as §4: the wrong baseline, not the wrong system.
+
+### 12.2 Block I/O — bounds device traffic, and is void on a warm cache
+
+`dd if=/dev/vda iflag=direct`, 300 MiB, against `IOReadBandwidthMax=20M`.
+
+| | throughput |
+|---|---|
+| unlimited, host cache cold | 997 MB/s |
+| **20 MB/s cap, cold** | **53.9 MB/s** |
+| **20 MB/s cap, host cache warm** | **1.9 GB/s** |
+
+Two findings, and the second is the one that matters.
+
+**The cap works, imprecisely** — an 18× reduction, but 2.7× above the number
+asked for. Host readahead turns the guest's 1 MiB direct reads into larger device
+reads, and the cap is on device bandwidth rather than on what the guest sees.
+
+**The cap does not work at all once the host has the image cached.** `iflag=direct`
+stops the *guest* caching; nothing stops the *host* caching the backing file. A
+read the host page cache satisfies never reaches the device, so `io.max` never sees
+it — the capped guest ran **35× faster than the uncapped cold one**.
+
+So an I/O bound on a guest holds only while its working set misses host cache. This
+is the same missing `O_DIRECT` that makes every guest byte cost host memory twice
+(§6): one flag, two problems.
+
+> Any storage benchmark that does not state its cache state is measuring the cache.
+> `envelope.sh` evicts the image with `POSIX_FADV_DONTNEED` between runs, which
+> needs no root.
+
+### 12.3 Memory — not a dial, and what it does depends on the host
+
+`dd` into guest tmpfs, which is guest RAM, so the VMM really faults the pages in.
+Guest RAM 1024 MiB.
+
+| | throughput |
+|---|---|
+| `MemoryMax=2G` (above guest RAM) | 459 MB/s |
+| `MemoryMax=384M` (below guest RAM) | **240 MB/s** |
+
+The guest was **not killed and did not shrink**. It got 48% slower, with no error
+reported anywhere — because this host has 13.5 GiB of zram swap, so guest RAM was
+reclaimed into it and the guest stuttered on faults it cannot see or account for.
+
+**On a host without swap the same cap OOM-kills the VMM instead.** Same
+configuration, entirely different failure, decided by something outside the
+config.
+
+Either way: **`memory.max` cannot make a guest use less memory**, only punish it
+for using what it was given. It is a blast radius, not a dial. Guest RAM has to be
+right at boot.
+
+### 12.4 What this means for bounding a box
+
+| bound | verdict |
+|---|---|
+| CPU | **Holds.** Costs ~2% over native, and quota-to-throughput is nonlinear on the host too |
+| Block I/O | **Holds only against cold cache.** Needs `O_DIRECT` in the VMM to be a real bound |
+| Host RAM | **Not a bound on the guest.** Sets what happens when a guest exceeds its allocation, not what it may allocate |
+| VRAM | Holds — but by quota and heap report, not by cgroup (§11) |
+
+---
+
+## 13. Open, in the order that matters
 
 1. **RDNA 4.** Untested. Everything above is Vega.
 2. **Frame counts from a real application.** `nesprobe` counts its own; an
