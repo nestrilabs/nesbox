@@ -228,7 +228,10 @@ impl FsDevice {
         tag_bytes[..tag.len()].copy_from_slice(tag.as_bytes());
 
         let frontend = Frontend::connect(socket_path, NUM_QUEUES as u64).with_context(|| {
-            format!("failed to connect to virtiofsd at {}", socket_path.display())
+            format!(
+                "failed to connect to virtiofsd at {}",
+                socket_path.display()
+            )
         })?;
         let kick_fds = (0..NUM_QUEUES)
             .map(|_| EventFd::new(0).context("failed to create virtio-fs kick eventfd"))
@@ -266,7 +269,14 @@ impl FsDevice {
 
     fn build_pci_config() -> ([u8; 256], u16) {
         // Class 0x018000: mass storage, other.
-        let mut cfg = PciConfig::new(0x1AF4, PCI_DEVICE_ID, 0x01, 0x01_80_00, 0x1AF4, VIRTIO_ID_FS);
+        let mut cfg = PciConfig::new(
+            0x1AF4,
+            PCI_DEVICE_ID,
+            0x01,
+            0x01_80_00,
+            0x1AF4,
+            VIRTIO_ID_FS,
+        );
         cfg.set_bar_mem(0, BAR0_SIZE);
         cfg.set_irq_pin(1);
         cfg.add_virtio_cap(1, 0, OFF_COMMON as u32, 0x38);
@@ -362,7 +372,11 @@ impl FsDevice {
         } else if o < OFF_MSIX_PBA {
             self.inner.lock().unwrap().msix.read(o - OFF_MSIX_TABLE, d);
         } else if o < BAR0_SIZE {
-            self.inner.lock().unwrap().msix.read_pba(o - OFF_MSIX_PBA, d);
+            self.inner
+                .lock()
+                .unwrap()
+                .msix
+                .read_pba(o - OFF_MSIX_PBA, d);
         } else {
             d.fill(0);
         }
@@ -382,7 +396,8 @@ impl FsDevice {
         } else if o < OFF_MSIX_PBA {
             let mut i = self.inner.lock().unwrap();
             if i.msix.write(o - OFF_MSIX_TABLE, d) {
-                i.msix.trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
+                i.msix
+                    .trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
             }
         }
     }

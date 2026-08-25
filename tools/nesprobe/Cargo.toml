@@ -1,15 +1,8 @@
-# Its own workspace, deliberately: nesprobe is a guest-side measurement tool and
-# has nothing to do with building the VMM. `cargo build` at the nesbox root should
-# not pull in ash.
-[workspace]
-
 [package]
 name = "nesprobe"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-ash = "0.38"
-
-[profile.release]
-opt-level = 2
+# Straight from git as crates.io version is 2 years out-of-date, git is preferable for ash
+ash = { git = "https://github.com/ash-rs/ash", rev = "a9a1fb17e98a0cde146caada86200d809306200d" }

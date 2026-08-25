@@ -89,12 +89,26 @@ pub fn collect_descs(
     let mut idx = head;
     for _ in 0..max {
         let base = vm_memory::GuestAddress(desc_base + idx as u64 * VRING_DESC_SIZE);
-        let addr: u64 = match mem.read_obj(base) { Ok(v) => u64::from_le(v), Err(_) => break };
-        let len: u32 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 8)) { Ok(v) => u32::from_le(v), Err(_) => break };
-        let fl: u16 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 12)) { Ok(v) => u16::from_le(v), Err(_) => break };
-        let nx: u16 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 14)) { Ok(v) => u16::from_le(v), Err(_) => break };
+        let addr: u64 = match mem.read_obj(base) {
+            Ok(v) => u64::from_le(v),
+            Err(_) => break,
+        };
+        let len: u32 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 8)) {
+            Ok(v) => u32::from_le(v),
+            Err(_) => break,
+        };
+        let fl: u16 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 12)) {
+            Ok(v) => u16::from_le(v),
+            Err(_) => break,
+        };
+        let nx: u16 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 14)) {
+            Ok(v) => u16::from_le(v),
+            Err(_) => break,
+        };
         descs.push((addr, len, fl));
-        if fl & VRING_DESC_F_NEXT == 0 { break; }
+        if fl & VRING_DESC_F_NEXT == 0 {
+            break;
+        }
         idx = nx;
     }
     descs
@@ -103,11 +117,19 @@ pub fn collect_descs(
 /// Read one avail descriptor from the queue. Returns None if empty.
 pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64, u32, u16)>)> {
     let a = vm_memory::GuestAddress(q.avail + 2);
-    let idx: u16 = match mem.read_obj(a) { Ok(v) => u16::from_le(v), Err(_) => return None };
-    if idx == q.last { return None; }
+    let idx: u16 = match mem.read_obj(a) {
+        Ok(v) => u16::from_le(v),
+        Err(_) => return None,
+    };
+    if idx == q.last {
+        return None;
+    }
     let slot = (q.last % q.size) as u64;
     let r = vm_memory::GuestAddress(q.avail + 4 + slot * 2);
-    let h: u16 = match mem.read_obj(r) { Ok(v) => u16::from_le(v), Err(_) => return None };
+    let h: u16 = match mem.read_obj(r) {
+        Ok(v) => u16::from_le(v),
+        Err(_) => return None,
+    };
     q.last = q.last.wrapping_add(1);
     let descs = collect_descs(mem, q.desc, h, q.size);
     Some((h, descs))
@@ -139,7 +161,9 @@ pub fn write_queue_addr(q: &mut QState, off: u64, v32: u32) {
 
 /// Fire an interrupt via eventfd. Handles MSI-X masked vectors.
 pub fn fire_irq_intx(fd: &Option<Arc<EventFd>>) {
-    if let Some(f) = fd { let _ = f.write(1); }
+    if let Some(f) = fd {
+        let _ = f.write(1);
+    }
 }
 
 // ── PCI config-space helpers ────────────────────────────────────────────────
@@ -218,7 +242,12 @@ impl<const N: usize> Default for MsixTable<N> {
 impl<const N: usize> MsixTable<N> {
     /// Attach host interrupt resources: one vector per table entry, the router
     /// that programs them, and the legacy INTx eventfd.
-    pub fn bind(&mut self, vectors: Vec<MsiVector>, router: Arc<dyn MsiRouter>, intx: Arc<EventFd>) {
+    pub fn bind(
+        &mut self,
+        vectors: Vec<MsiVector>,
+        router: Arc<dyn MsiRouter>,
+        intx: Arc<EventFd>,
+    ) {
         self.vectors = vectors;
         self.router = Some(router);
         self.intx = Some(intx);
@@ -226,7 +255,10 @@ impl<const N: usize> MsixTable<N> {
 
     pub fn read(&self, offset: u64, data: &mut [u8]) {
         let ei = (offset / 16) as usize;
-        if ei >= N { data.fill(0); return; }
+        if ei >= N {
+            data.fill(0);
+            return;
+        }
         let so = (offset % 16) as usize;
         let end = (so + data.len()).min(16);
         data[..end - so].copy_from_slice(&self.entries[ei][so..end]);
@@ -239,7 +271,9 @@ impl<const N: usize> MsixTable<N> {
     /// interrupt was pending in the PBA, meaning it should be delivered now.
     pub fn write(&mut self, offset: u64, data: &[u8]) -> bool {
         let ei = (offset / 16) as usize;
-        if ei >= N { return false; }
+        if ei >= N {
+            return false;
+        }
         let so = (offset % 16) as usize;
         let end = (so + data.len()).min(16);
         let was_masked = self.entries[ei][12] & 1 != 0;
@@ -250,7 +284,9 @@ impl<const N: usize> MsixTable<N> {
 
         let had_pending = (self.pba >> ei) & 1 != 0;
         let deliver_now = was_masked && now_unmasked && had_pending;
-        if deliver_now { self.pba &= !(1 << ei); }
+        if deliver_now {
+            self.pba &= !(1 << ei);
+        }
         deliver_now
     }
 
@@ -267,7 +303,11 @@ impl<const N: usize> MsixTable<N> {
             return;
         };
         if let Err(err) = router.set_msi_route(vector.gsi, addr, msg_data) {
-            log::error!("failed to route MSI-X vector {} (gsi {}): {err:#}", ei, vector.gsi);
+            log::error!(
+                "failed to route MSI-X vector {} (gsi {}): {err:#}",
+                ei,
+                vector.gsi
+            );
         }
     }
 
@@ -277,8 +317,13 @@ impl<const N: usize> MsixTable<N> {
     /// MSI-X, which is how the device gets through early probing.
     pub fn trigger(&mut self, vector: u16) {
         if !self.enabled || vector == VIRTQ_MSI_NO_VECTOR {
-            log::trace!("INTx fallback: vector={vector} msix_enabled={}", self.enabled);
-            if let Some(intx) = &self.intx { let _ = intx.write(1); }
+            log::trace!(
+                "INTx fallback: vector={vector} msix_enabled={}",
+                self.enabled
+            );
+            if let Some(intx) = &self.intx {
+                let _ = intx.write(1);
+            }
             return;
         }
         let idx = vector as usize;
@@ -298,14 +343,21 @@ impl<const N: usize> MsixTable<N> {
 
     /// Deliver an interrupt that a table write just unmasked.
     pub fn trigger_unmasked(&self, idx: usize) {
-        if let Some(v) = self.vectors.get(idx) { v.trigger(); }
+        if let Some(v) = self.vectors.get(idx) {
+            v.trigger();
+        }
     }
 
     pub fn read_pba(&self, offset: u64, data: &mut [u8]) {
         let b = self.pba.to_le_bytes();
         let s = offset as usize;
         let e = (s + data.len()).min(8);
-        if s < 8 { data[..e - s].copy_from_slice(&b[s..e]); data[e - s..].fill(0); } else { data.fill(0); }
+        if s < 8 {
+            data[..e - s].copy_from_slice(&b[s..e]);
+            data[e - s..].fill(0);
+        } else {
+            data.fill(0);
+        }
     }
 
     /// The eventfd an interrupt for `vector` would be delivered on: its MSI-X
@@ -332,14 +384,35 @@ pub fn com_read(
     device_features: u64,
     num_queues: u64,
     msix_config_vec: u64,
-    qsel: u64, qsize: u64, qvec: u64, qen: u64, qnoff: u64,
-    qdlo: u64, qdhi: u64, qalo: u64, qahi: u64, qulo: u64, quhi: u64,
+    qsel: u64,
+    qsize: u64,
+    qvec: u64,
+    qen: u64,
+    qnoff: u64,
+    qdlo: u64,
+    qdhi: u64,
+    qalo: u64,
+    qahi: u64,
+    qulo: u64,
+    quhi: u64,
 ) -> u64 {
     match off {
         CFG_DEVICE_FEAT_SEL => com.dfs as u64,
-        CFG_DEVICE_FEAT => if com.dfs == 0 { device_features & 0xFFFF_FFFF } else { device_features >> 32 },
+        CFG_DEVICE_FEAT => {
+            if com.dfs == 0 {
+                device_features & 0xFFFF_FFFF
+            } else {
+                device_features >> 32
+            }
+        }
         CFG_DRIVER_FEAT_SEL => com.dff as u64,
-        CFG_DRIVER_FEAT => if com.dff == 0 { com.df & 0xFFFF_FFFF } else { com.df >> 32 },
+        CFG_DRIVER_FEAT => {
+            if com.dff == 0 {
+                com.df & 0xFFFF_FFFF
+            } else {
+                com.df >> 32
+            }
+        }
         CFG_MSIX_CONFIG => msix_config_vec,
         CFG_NUM_QUEUES => num_queues,
         CFG_STATUS => com.st as u64,
@@ -348,9 +421,12 @@ pub fn com_read(
         CFG_QUEUE_MSIX => qvec,
         CFG_QUEUE_ENABLE => qen,
         CFG_QUEUE_NOTIFY_OFF => qnoff,
-        CFG_QUEUE_DESC_LO => qdlo, CFG_QUEUE_DESC_HI => qdhi,
-        CFG_QUEUE_AVAIL_LO => qalo, CFG_QUEUE_AVAIL_HI => qahi,
-        CFG_QUEUE_USED_LO => qulo, CFG_QUEUE_USED_HI => quhi,
+        CFG_QUEUE_DESC_LO => qdlo,
+        CFG_QUEUE_DESC_HI => qdhi,
+        CFG_QUEUE_AVAIL_LO => qalo,
+        CFG_QUEUE_AVAIL_HI => qahi,
+        CFG_QUEUE_USED_LO => qulo,
+        CFG_QUEUE_USED_HI => quhi,
         _ => 0,
     }
 }

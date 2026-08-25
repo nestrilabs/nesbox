@@ -12,8 +12,8 @@
 
 use crate::common::*;
 use crate::gpu::display::DisplayInfo;
-use crate::gpu::uapi::virtio_gpu_config;
 use crate::gpu::metrics::{GpuMetrics, GpuSnapshot};
+use crate::gpu::uapi::virtio_gpu_config;
 use crate::gpu::worker::Worker;
 use crate::gpu::{
     CTL_INDEX, CUR_INDEX, Descriptor, GpuQueues, HostMemoryMapper, NUM_QUEUES, QUEUE_SIZE,
@@ -251,7 +251,10 @@ impl GpuDevice {
 
         let queues = Arc::new(Queues {
             mem: mem.clone(),
-            ctl: Mutex::new(QState { size: QUEUE_SIZE, ..Default::default() }),
+            ctl: Mutex::new(QState {
+                size: QUEUE_SIZE,
+                ..Default::default()
+            }),
             msix: Mutex::new(MsixTable::default()),
         });
         let (cfg, msix_cap) = Self::build_pci_config();
@@ -297,11 +300,7 @@ impl GpuDevice {
         router: Arc<dyn MsiRouter>,
         intx: Arc<EventFd>,
     ) {
-        self.queues
-            .msix
-            .lock()
-            .unwrap()
-            .bind(vectors, router, intx);
+        self.queues.msix.lock().unwrap().bind(vectors, router, intx);
     }
 
     /// Attach the thing that can turn host memory into guest memory. Required
@@ -340,12 +339,7 @@ impl GpuDevice {
         cfg.add_virtio_cap(3, 0, OFF_ISR as u32, 1);
         cfg.add_virtio_cap(4, 0, OFF_DEVICE as u32, 16);
         // Tell the guest BAR2 is a window it may map blob resources through.
-        cfg.add_virtio_shm_cap(
-            VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
-            SHM_BAR as u8,
-            0,
-            SHM_SIZE,
-        );
+        cfg.add_virtio_shm_cap(VIRTIO_GPU_SHM_ID_HOST_VISIBLE, SHM_BAR as u8, 0, SHM_SIZE);
         let msix_cap =
             cfg.add_msix_cap(MSIX_VECTORS - 1, OFF_MSIX_TABLE as u32, OFF_MSIX_PBA as u32);
         cfg.add_pcie_cap(PCIE_TYPE_RC_INTEGRATED);
@@ -431,11 +425,7 @@ impl GpuDevice {
         } else if o < OFF_MSIX_TABLE {
             d.fill(0);
         } else if o < OFF_MSIX_PBA {
-            self.queues
-                .msix
-                .lock()
-                .unwrap()
-                .read(o - OFF_MSIX_TABLE, d);
+            self.queues.msix.lock().unwrap().read(o - OFF_MSIX_TABLE, d);
         } else if o < BAR0_SIZE {
             self.queues
                 .msix

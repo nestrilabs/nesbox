@@ -321,7 +321,11 @@ impl VsockDevice {
         } else if o < OFF_MSIX_PBA {
             self.inner.lock().unwrap().msix.read(o - OFF_MSIX_TABLE, d);
         } else if o < BAR0_SIZE {
-            self.inner.lock().unwrap().msix.read_pba(o - OFF_MSIX_PBA, d);
+            self.inner
+                .lock()
+                .unwrap()
+                .msix
+                .read_pba(o - OFF_MSIX_PBA, d);
         } else {
             d.fill(0);
         }
@@ -342,7 +346,8 @@ impl VsockDevice {
         } else if o < OFF_MSIX_PBA {
             let mut i = self.inner.lock().unwrap();
             if i.msix.write(o - OFF_MSIX_TABLE, d) {
-                i.msix.trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
+                i.msix
+                    .trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
             }
         }
     }

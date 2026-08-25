@@ -126,7 +126,10 @@ mod tests {
     fn small_guest_is_one_region() {
         let r = ram_regions(1024 << 20);
         assert_eq!(r, vec![(GuestAddress(0), 1024 << 20)]);
-        assert_eq!(acpi_start(1024 << 20), GuestAddress((1024 << 20) - 0x1_0000));
+        assert_eq!(
+            acpi_start(1024 << 20),
+            GuestAddress((1024 << 20) - 0x1_0000)
+        );
     }
 
     #[test]
@@ -182,6 +185,9 @@ mod tests {
         assert_eq!(ram_top(1024 << 20), 1024 << 20);
         // Past the hole, RAM resumes at 4 GiB, so the top is higher than the
         // size alone would suggest.
-        assert_eq!(ram_top(8192 << 20), MMIO_HOLE_END + (8192 << 20) - MMIO_HOLE_START);
+        assert_eq!(
+            ram_top(8192 << 20),
+            MMIO_HOLE_END + (8192 << 20) - MMIO_HOLE_START
+        );
     }
 }

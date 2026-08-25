@@ -9,26 +9,24 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "linux")]
-use rutabaga_gfx::{
-    RUTABAGA_PATH_TYPE_GPU, RutabagaComponentType, RutabagaPath,
-};
 use rutabaga_gfx::{
     RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder,
     RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D,
 };
+#[cfg(target_os = "linux")]
+use rutabaga_gfx::{RUTABAGA_PATH_TYPE_GPU, RutabagaComponentType, RutabagaPath};
 use vm_memory::{GuestAddress, GuestMemoryBackend};
 
 use vm_memory::GuestMemoryMmap;
 
 use super::display::{DisplayInfo, Rect};
+use super::metrics::{GpuCounters, GpuMetrics};
 use super::protocol::GpuResponse::*;
 use super::protocol::{
     GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_MAX_SCANOUTS,
     VirtioGpuResult,
 };
-use super::metrics::{GpuCounters, GpuMetrics};
 use super::vram::VramAccountant;
 use super::{GpuError, GpuQueues, HostMemoryMapper, Result, VirtioShmRegion};
 
@@ -851,7 +849,9 @@ impl VirtioGpu {
         }
         if external {
             if let Err(e) = self.rutabaga.unmap(resource_id) {
-                log::warn!("NESBOX_GPU: unmap_blob: virglrenderer kept resource {resource_id} mapped: {e:?}");
+                log::warn!(
+                    "NESBOX_GPU: unmap_blob: virglrenderer kept resource {resource_id} mapped: {e:?}"
+                );
             }
         }
 

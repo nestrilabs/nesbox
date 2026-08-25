@@ -1,10 +1,14 @@
 [workspace]
 resolver = "3"
-members = ["vmm", "virtio-devices", "pci"]
-exclude = ["tools/nesprobe"]
+members = ["vmm", "virtio-devices", "pci", "tools/*"]
 
 [workspace.dependencies]
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
 linux-loader = "0.14"
 acpi_tables = "0.2"
 rutabaga_gfx = { version = "0.1.80", features = ["virgl_renderer"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = 2
+lto = "thin"

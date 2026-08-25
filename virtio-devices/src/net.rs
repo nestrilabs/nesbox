@@ -9,7 +9,7 @@
 //! chosen once the guest has said which offloads it understands.
 
 use crate::common::*;
-use crate::tap::{TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, TUN_F_TSO_ECN, TUN_F_UFO, Tap};
+use crate::tap::{TUN_F_CSUM, TUN_F_TSO_ECN, TUN_F_TSO4, TUN_F_TSO6, TUN_F_UFO, Tap};
 use anyhow::{Context, Result};
 use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
 use pci::{MsiRouter, MsiVector, PciDevice};
@@ -439,7 +439,11 @@ impl NetDevice {
         } else if o < OFF_MSIX_PBA {
             self.inner.lock().unwrap().msix.read(o - OFF_MSIX_TABLE, d);
         } else if o < BAR0_SIZE {
-            self.inner.lock().unwrap().msix.read_pba(o - OFF_MSIX_PBA, d);
+            self.inner
+                .lock()
+                .unwrap()
+                .msix
+                .read_pba(o - OFF_MSIX_PBA, d);
         } else {
             d.fill(0);
         }
@@ -460,7 +464,8 @@ impl NetDevice {
         } else if o < OFF_MSIX_PBA {
             let mut i = self.inner.lock().unwrap();
             if i.msix.write(o - OFF_MSIX_TABLE, d) {
-                i.msix.trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
+                i.msix
+                    .trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
             }
         }
     }

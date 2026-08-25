@@ -68,11 +68,12 @@ impl virtio_devices::gpu::HostMemoryMapper for MemorySlots {
             Some(recycled) => recycled,
             None => self.next_slot.fetch_add(1, Ordering::SeqCst),
         };
-        self.set_region(slot, guest_addr, host_addr, size).map_err(|err| {
-            // Give the number back; nothing was registered under it.
-            self.free.lock().unwrap().push(slot);
-            err
-        })?;
+        self.set_region(slot, guest_addr, host_addr, size)
+            .map_err(|err| {
+                // Give the number back; nothing was registered under it.
+                self.free.lock().unwrap().push(slot);
+                err
+            })?;
         mapped.insert(guest_addr, slot);
         log::debug!(
             "memory slot {slot}: guest {guest_addr:#x} <- host {host_addr:#x}, {size:#x} bytes"

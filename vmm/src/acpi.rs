@@ -45,9 +45,7 @@ fn build_dsdt(mmio64: crate::layout::Mmio64Window) -> Vec<u8> {
     );
     let io_range1 = aml::AddressSpace::new_io(0x0000u16, 0x0cf7u16, None);
     let io_range2 = aml::AddressSpace::new_io(0x0d00u16, 0xffffu16, None);
-    let crs = aml::ResourceTemplate::new(vec![
-        &bus, &cam1, &mem32, &mem64, &io_range1, &io_range2,
-    ]);
+    let crs = aml::ResourceTemplate::new(vec![&bus, &cam1, &mem32, &mem64, &io_range1, &io_range2]);
 
     // _PRT: one entry per slot, mapping INTA# to a GSI. Address 0xFFFF in the
     // low word means "any function of this device".
@@ -243,17 +241,23 @@ pub fn setup_acpi(
     let rsdp = build_rsdp(xsdt_addr);
 
     let mut cur = start_addr;
-    mem.write_slice(&dsdt, cur).context("Failed to write DSDT")?;
+    mem.write_slice(&dsdt, cur)
+        .context("Failed to write DSDT")?;
     cur = GuestAddress(cur.0 + dsdt.len() as u64);
-    mem.write_slice(&fadt, cur).context("Failed to write FADT")?;
+    mem.write_slice(&fadt, cur)
+        .context("Failed to write FADT")?;
     cur = GuestAddress(cur.0 + fadt.len() as u64);
-    mem.write_slice(&madt, cur).context("Failed to write MADT")?;
+    mem.write_slice(&madt, cur)
+        .context("Failed to write MADT")?;
     cur = GuestAddress(cur.0 + madt.len() as u64);
-    mem.write_slice(&mcfg, cur).context("Failed to write MCFG")?;
+    mem.write_slice(&mcfg, cur)
+        .context("Failed to write MCFG")?;
     cur = GuestAddress(cur.0 + mcfg.len() as u64);
-    mem.write_slice(&xsdt, cur).context("Failed to write XSDT")?;
+    mem.write_slice(&xsdt, cur)
+        .context("Failed to write XSDT")?;
     cur = GuestAddress(cur.0 + xsdt.len() as u64);
-    mem.write_slice(&rsdp, cur).context("Failed to write RSDP")?;
+    mem.write_slice(&rsdp, cur)
+        .context("Failed to write RSDP")?;
 
     Ok(GuestAddress(xsdt_addr + xsdt.len() as u64))
 }

@@ -274,10 +274,7 @@ impl VramAccountant {
             // The renderer applies exactly these checks and rejects the whole
             // stream if any fails. Mirror them so our view of the stream cannot
             // diverge from the view the renderer would take.
-            if len < CCMD_HDR_LEN
-                || len > commands.len() - off
-                || len % CCMD_ALIGN != 0
-            {
+            if len < CCMD_HDR_LEN || len > commands.len() - off || len % CCMD_ALIGN != 0 {
                 return Err(Notice::Malformed("bad record length"));
             }
 
@@ -285,8 +282,8 @@ impl VramAccountant {
                 if len < GEM_NEW_MIN_LEN {
                     return Err(Notice::Malformed("GEM_NEW too short to account"));
                 }
-                let blob_id = rd_u64(rec, GEM_NEW_OFF_BLOB_ID)
-                    .ok_or(Notice::Malformed("GEM_NEW blob_id"))?;
+                let blob_id =
+                    rd_u64(rec, GEM_NEW_OFF_BLOB_ID).ok_or(Notice::Malformed("GEM_NEW blob_id"))?;
                 let size = rd_u64(rec, GEM_NEW_OFF_ALLOC_SIZE)
                     .ok_or(Notice::Malformed("GEM_NEW alloc_size"))?;
                 let heap = rd_u32(rec, GEM_NEW_OFF_PREFERRED_HEAP)
@@ -319,7 +316,10 @@ impl VramAccountant {
         for (key, bytes) in proposed {
             // A repeated blob_id within a live context would be a renderer error
             // too; keep the larger charge rather than losing track of one.
-            let entry = self.pending.entry(key).or_insert(Charge { bytes: 0, ctx_id });
+            let entry = self
+                .pending
+                .entry(key)
+                .or_insert(Charge { bytes: 0, ctx_id });
             entry.bytes = entry.bytes.max(bytes);
             self.charged = self.charged.saturating_add(bytes);
         }
@@ -420,10 +420,16 @@ mod tests {
     #[test]
     fn charges_vram_and_refuses_past_the_limit() {
         let mut a = drm_ctx(512);
-        assert!(a.observe_submit(1, &gem_new(1, 256 * MIB, AMDGPU_GEM_DOMAIN_VRAM)).is_ok());
+        assert!(
+            a.observe_submit(1, &gem_new(1, 256 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
+                .is_ok()
+        );
         assert_eq!(a.charged, 256 * MIB);
 
-        assert!(a.observe_submit(1, &gem_new(2, 200 * MIB, AMDGPU_GEM_DOMAIN_VRAM)).is_ok());
+        assert!(
+            a.observe_submit(1, &gem_new(2, 200 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
+                .is_ok()
+        );
         assert_eq!(a.charged, 456 * MIB);
 
         // 456 + 100 > 512
@@ -438,7 +444,10 @@ mod tests {
     fn gtt_is_counted_but_never_enforced() {
         let mut a = drm_ctx(64);
         // Four times the VRAM limit, in GTT. Must be allowed.
-        assert!(a.observe_submit(1, &gem_new(1, 256 * MIB, AMDGPU_GEM_DOMAIN_GTT)).is_ok());
+        assert!(
+            a.observe_submit(1, &gem_new(1, 256 * MIB, AMDGPU_GEM_DOMAIN_GTT))
+                .is_ok()
+        );
         assert_eq!(a.charged, 0);
         assert!(a.summary().contains("GTT 256 MiB"));
     }
@@ -458,7 +467,8 @@ mod tests {
     #[test]
     fn release_requires_a_blob_claim_first() {
         let mut a = drm_ctx(512);
-        a.observe_submit(1, &gem_new(7, 128 * MIB, AMDGPU_GEM_DOMAIN_VRAM)).unwrap();
+        a.observe_submit(1, &gem_new(7, 128 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
+            .unwrap();
 
         // Unreffing a resource that never claimed this charge frees nothing.
         a.release_resource(99);
@@ -474,7 +484,8 @@ mod tests {
     #[test]
     fn a_dropped_context_releases_unclaimed_charges() {
         let mut a = drm_ctx(512);
-        a.observe_submit(1, &gem_new(1, 300 * MIB, AMDGPU_GEM_DOMAIN_VRAM)).unwrap();
+        a.observe_submit(1, &gem_new(1, 300 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
+            .unwrap();
         // Guest never issued the blob create, then dropped the context. Without
         // this the limit would be held for the life of the VM.
         a.forget_context(1);
@@ -484,7 +495,8 @@ mod tests {
     #[test]
     fn a_dropped_context_releases_claimed_charges_too() {
         let mut a = drm_ctx(512);
-        a.observe_submit(1, &gem_new(1, 300 * MIB, AMDGPU_GEM_DOMAIN_VRAM)).unwrap();
+        a.observe_submit(1, &gem_new(1, 300 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
+            .unwrap();
         a.claim_blob(1, 1, 50);
         // The renderer's drm_context_deinit frees every object the context made,
         // whether or not the guest unreffed the resource first, so the charge
@@ -501,9 +513,11 @@ mod tests {
     fn one_contexts_teardown_leaves_anothers_charges_alone() {
         let mut a = drm_ctx(1024);
         a.note_context(2, CAPSET_DRM);
-        a.observe_submit(1, &gem_new(1, 100 * MIB, AMDGPU_GEM_DOMAIN_VRAM)).unwrap();
+        a.observe_submit(1, &gem_new(1, 100 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
+            .unwrap();
         a.claim_blob(1, 1, 10);
-        a.observe_submit(2, &gem_new(1, 200 * MIB, AMDGPU_GEM_DOMAIN_VRAM)).unwrap();
+        a.observe_submit(2, &gem_new(1, 200 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
+            .unwrap();
         a.claim_blob(2, 1, 20);
         // Same blob_id in both contexts: blob ids are per-context, so these are
         // different buffers and must be accounted separately.
@@ -518,7 +532,10 @@ mod tests {
         a.note_context(2, 1 /* virgl 2d */);
         // Bytes that would be a huge GEM_NEW if this were a ccmd stream. A virgl
         // context's payload is a different command language and must pass through.
-        assert!(a.observe_submit(2, &gem_new(1, 4096 * MIB, AMDGPU_GEM_DOMAIN_VRAM)).is_ok());
+        assert!(
+            a.observe_submit(2, &gem_new(1, 4096 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
+                .is_ok()
+        );
         assert_eq!(a.charged, 0);
     }
 
@@ -547,22 +564,34 @@ mod tests {
         let mut bad = 2u32.to_le_bytes().to_vec();
         bad.extend_from_slice(&4u32.to_le_bytes()); // len = 4, below the header
         bad.extend_from_slice(&[0u8; 8]);
-        assert!(matches!(a.observe_submit(1, &bad), Err(Notice::Malformed(_))));
+        assert!(matches!(
+            a.observe_submit(1, &bad),
+            Err(Notice::Malformed(_))
+        ));
 
         // len past the end of the buffer
         let mut over = gem_new(1, MIB, AMDGPU_GEM_DOMAIN_VRAM);
         over[4..8].copy_from_slice(&4096u32.to_le_bytes());
-        assert!(matches!(a.observe_submit(1, &over), Err(Notice::Malformed(_))));
+        assert!(matches!(
+            a.observe_submit(1, &over),
+            Err(Notice::Malformed(_))
+        ));
 
         // len not 8-aligned
         let mut unaligned = gem_new(1, MIB, AMDGPU_GEM_DOMAIN_VRAM);
         unaligned[4..8].copy_from_slice(&52u32.to_le_bytes());
-        assert!(matches!(a.observe_submit(1, &unaligned), Err(Notice::Malformed(_))));
+        assert!(matches!(
+            a.observe_submit(1, &unaligned),
+            Err(Notice::Malformed(_))
+        ));
 
         // trailing bytes that are not a whole record
         let mut trailing = gem_new(1, MIB, AMDGPU_GEM_DOMAIN_VRAM);
         trailing.extend_from_slice(&[0u8; 4]);
-        assert!(matches!(a.observe_submit(1, &trailing), Err(Notice::Malformed(_))));
+        assert!(matches!(
+            a.observe_submit(1, &trailing),
+            Err(Notice::Malformed(_))
+        ));
 
         // A GEM_NEW truncated below its accountable fields must be refused, not
         // waved through. The renderer would zero-fill and allocate; we cannot
@@ -570,7 +599,10 @@ mod tests {
         let mut short = gem_new(1, MIB, AMDGPU_GEM_DOMAIN_VRAM);
         short.truncate(40);
         short[4..8].copy_from_slice(&40u32.to_le_bytes());
-        assert!(matches!(a.observe_submit(1, &short), Err(Notice::Malformed(_))));
+        assert!(matches!(
+            a.observe_submit(1, &short),
+            Err(Notice::Malformed(_))
+        ));
 
         // Nothing above charged anything.
         assert_eq!(a.charged, 0);
@@ -579,7 +611,8 @@ mod tests {
     #[test]
     fn a_size_that_overflows_u64_cannot_wrap_past_the_limit() {
         let mut a = drm_ctx(512);
-        a.observe_submit(1, &gem_new(1, 256 * MIB, AMDGPU_GEM_DOMAIN_VRAM)).unwrap();
+        a.observe_submit(1, &gem_new(1, 256 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
+            .unwrap();
         let err = a.observe_submit(1, &gem_new(2, u64::MAX, AMDGPU_GEM_DOMAIN_VRAM));
         assert!(matches!(err, Err(Notice::OverLimit { .. })));
         assert_eq!(a.charged, 256 * MIB);
@@ -588,6 +621,9 @@ mod tests {
     #[test]
     fn a_zero_limit_refuses_all_vram() {
         let mut a = drm_ctx(0);
-        assert!(a.observe_submit(1, &gem_new(1, 4096, AMDGPU_GEM_DOMAIN_VRAM)).is_err());
+        assert!(
+            a.observe_submit(1, &gem_new(1, 4096, AMDGPU_GEM_DOMAIN_VRAM))
+                .is_err()
+        );
     }
 }

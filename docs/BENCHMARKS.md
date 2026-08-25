@@ -270,16 +270,18 @@ Prerequisites: `cargo build --release`; an `artifacts/` directory holding `vmlin
 `rootfs.ext4` and `probe-share/nesprobe`; a patched virglrenderer built to a prefix.
 
 ```bash
-# Build the probe. Its own workspace, so the VMM build does not pull in ash.
-cd tools/nesprobe && cargo build --release && cd -
-cp tools/nesprobe/target/release/nesprobe artifacts/probe-share/
+# Build the probe. ~~Its own workspace, so the VMM build does not pull in ash.~~
+# (dathorse): EVEN IF IT'S IN SAME WORKSPACE; IT WON'T MEAN IT GETS COMPILED IN WITH ASH
+#   separate workspaces in same project is messy and creates bad separation.
+cargo build --release --bin nesprobe
+cp target/release/nesprobe artifacts/probe-share/
 
 # Concurrency sweep -- N guests, fixed per-frame cost. The main instrument.
 scripts/probe-sweep.sh -n 4 -c 400 -s 30
 
 # One guest, interactively, to poke at something by hand
 LD_LIBRARY_PATH=artifacts/virgl-patched/lib \
-  RUST_LOG=info ./target/release/nesbox examples/gpu-probe.json   # fix the paths first
+  RUST_LOG=info ./nesbox examples/gpu-probe.json   # fix the paths first
 #   in guest: mount -t proc proc /proc; mount -t sysfs sysfs /sys
 #             mount -t tmpfs tmpfs /tmp; mount -t virtiofs probe /mnt
 #             /mnt/nesprobe --cost 400 --seconds 30
