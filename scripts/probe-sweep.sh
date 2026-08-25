@@ -69,7 +69,7 @@ JSON
     sleep 3
     echo "/mnt/nesprobe --cost $COST --seconds $SECS --warmup $WARMUP"
     sleep $((SECS + WARMUP + 12))
-  } | LD_LIBRARY_PATH=$RENDERER timeout $((SECS + WARMUP + 65)) \
+  } | LD_LIBRARY_PATH=$VIRGLRENDERER timeout $((SECS + WARMUP + 65)) \
         script -qec "env RUST_LOG=warn "$NESBOX" $RUN/guest$i.json" /dev/null \
         > "$RUN/guest$i.log" 2>&1 &
   sleep 1
