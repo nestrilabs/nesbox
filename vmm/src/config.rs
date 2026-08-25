@@ -27,6 +27,18 @@ pub struct VmConfig {
     /// which is right for a hand-driven box and wrong for a supervised one.
     #[serde(default, rename = "stats-socket")]
     pub stats_socket: Option<PathBuf>,
+    /// seccomp-bpf confinement: `enforce`, `audit`, or `off`.
+    ///
+    /// `enforce` kills the process on a syscall outside the policy. `audit`
+    /// reports which syscall it was and exits, which is how the policy is
+    /// extended. Default `enforce` -- a security control that is off by default
+    /// is not a control.
+    #[serde(default = "default_seccomp")]
+    pub seccomp: String,
+}
+
+fn default_seccomp() -> String {
+    "enforce".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

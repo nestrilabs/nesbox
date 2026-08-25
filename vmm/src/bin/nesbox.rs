@@ -253,6 +253,19 @@ fn main() -> Result<()> {
     let power = Arc::new(PowerDevice::new(shutdown.clone()));
     install_signal_handlers(shutdown.clone())?;
 
+    // ── Confine the process ───────────────────────────────────────────────
+    // Last thing before the guest runs, and deliberately after every device is
+    // built: virtiofsd has been spawned by now, and `execve` is not on the
+    // policy. Anything that needs to open a new path or start a process must
+    // happen above this line.
+    let seccomp_mode = nesbox_vmm::seccomp::Mode::parse(&config.seccomp).ok_or_else(|| {
+        anyhow::anyhow!(
+            "seccomp: {:?} is not one of enforce, audit, off",
+            config.seccomp
+        )
+    })?;
+    nesbox_vmm::seccomp::apply_baseline(seccomp_mode).context("could not confine the VMM")?;
+
     // ── Run vCPUs ─────────────────────────────────────────────────────────
     // The CPU set every vCPU thread is confined to, if the config named one.
     // Built once here rather than per thread: it is the same set for all of
@@ -278,6 +291,22 @@ fn main() -> Result<()> {
                     if let Some(set) = cpuset {
                         set_affinity_or_warn(vcpu_id, &set);
                     }
+                    // NOT confined further, and the reason is structural.
+                    //
+                    // A vCPU needs almost nothing, so a tight per-thread filter
+                    // here would be the single biggest hardening available --
+                    // `seccomp::vcpu()` exists and is tested. It cannot be
+                    // installed yet: **device workers are spawned lazily by
+                    // whichever vCPU thread services the guest's activation
+                    // write**, and a thread inherits its creator's filters. The
+                    // GPU worker would come into existence already forbidden from
+                    // opening the render node, and measured, it dies at virtio-gpu
+                    // probe.
+                    //
+                    // The fix is to stop vCPU threads being the parents of
+                    // long-lived workers -- have activation hand the work to a
+                    // thread that already exists under the baseline. Until then
+                    // this is deliberately left off rather than shipped broken.
                     if let Err(e) =
                         vm::run_vcpu_loop(mem, vcpu_fd, pci_bus, serial, power, shutdown)
                     {
