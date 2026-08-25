@@ -309,6 +309,11 @@ fn baseline() -> Vec<libc::c_long> {
         libc::SYS_getdents64, libc::SYS_readlink, libc::SYS_readlinkat,
         libc::SYS_access, libc::SYS_getcwd, libc::SYS_unlink, libc::SYS_unlinkat,
         libc::SYS_rename, libc::SYS_mkdir, libc::SYS_fchmod, libc::SYS_fchmodat,
+        // Removing the per-VM runtime directory at shutdown. `std::fs::remove_dir`
+        // reaches `rmdir`, not `unlinkat(AT_REMOVEDIR)`, so having the latter is
+        // not enough -- found by running the teardown under `audit`, which named
+        // syscall 84 rather than leaving a bare SIGSYS to guess at.
+        libc::SYS_rmdir,
         // Mesa's shader cache watches its directory.
         libc::SYS_inotify_init1, libc::SYS_inotify_add_watch, libc::SYS_inotify_rm_watch,
         // The metrics socket, and Mesa talking to a compositor.

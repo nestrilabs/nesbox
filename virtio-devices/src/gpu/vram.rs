@@ -48,9 +48,16 @@
 // # What counts
 //
 // Only allocations that ask for `AMDGPU_GEM_DOMAIN_VRAM`. GTT buffers live in
-// host system memory, which is bounded for the whole VMM process by cgroups, and
-// double-counting them here would refuse guests for memory they are not taking
-// from the card. GTT totals are tracked for observability and never enforced.
+// host system memory, and double-counting them here would refuse guests for
+// memory they are not taking from the card. GTT totals are tracked for
+// observability and never enforced.
+//
+// That used to be justified by saying host memory "is bounded for the whole VMM
+// process by cgroups". Nothing in this repository applies a cgroup, so the claim
+// was only ever true if whoever launched the process remembered -- and nothing
+// checked or said. `vmm/src/isolation.rs` now reports the limits actually in
+// force at startup and warns when there is no `memory.max` above this process,
+// which is exactly the case where GTT growth is bounded by nothing at all.
 //
 // # Trust
 //

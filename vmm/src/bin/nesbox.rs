@@ -86,6 +86,27 @@ fn main() -> Result<()> {
 
     info!("Starting VMM with config: {:#?}", config);
 
+    // ── Private user namespace, if asked for ──────────────────────────────
+    // Here and nowhere later: the kernel only lets a *single-threaded* process
+    // create a user namespace, and the block and console devices each spawn a
+    // worker as they are built. This is only half the job -- it buys the
+    // privilege to unshare the network further down, once the tap is open.
+    if config.unshare_network {
+        nesbox_vmm::isolation::enter_user_namespace()?;
+    }
+
+    // What is actually confining this process, said out loud before anything
+    // depends on it. Several bounds this codebase assumes -- host memory for GTT
+    // most of all -- are applied by whoever supervises us or not at all, and the
+    // difference used to be invisible.
+    nesbox_vmm::isolation::Report::gather().log();
+
+    // A VRAM limit is enforced inside virglrenderer, not here, and which
+    // renderer gets loaded is LD_LIBRARY_PATH's decision. Checked before the
+    // device is built so a limit that would silently do nothing stops the boot
+    // rather than becoming a number in a config nobody rechecks.
+    nesbox_vmm::renderer::check(config.gpu.as_ref().and_then(|g| g.vram_limit_mib))?;
+
     // Create KVM VM
     let vm = vm::Vm::new(
         config.machine_config.mem_size_mib,
@@ -253,6 +274,22 @@ fn main() -> Result<()> {
     let power = Arc::new(PowerDevice::new(shutdown.clone()));
     install_signal_handlers(shutdown.clone())?;
 
+    // ── Take away the network ─────────────────────────────────────────────
+    // Deliberately here: after the tap is opened, after virtiofsd is spawned and
+    // after the stats socket is bound. All three keep working across the unshare
+    // because a descriptor -- and a socket's namespace -- is fixed when it is
+    // created, not when it is used. Moving this earlier breaks all three.
+    if config.unshare_network {
+        if config.vsock.is_some() {
+            log::warn!(
+                "unshare-network is on and a vsock device is configured. vsock is \
+                 namespace-aware and this combination has not been measured; if the \
+                 guest's control channel goes quiet, this is the first thing to turn off."
+            );
+        }
+        nesbox_vmm::isolation::enter_network_namespace()?;
+    }
+
     // ── Confine the process ───────────────────────────────────────────────
     // Last thing before the guest runs, and deliberately after every device is
     // built: virtiofsd has been spawned by now, and `execve` is not on the
@@ -343,6 +380,11 @@ fn main() -> Result<()> {
     // Devices and their backends are torn down here: dropping the virtiofsd
     // supervisors kills them, and the VM's memory goes with the process.
     drop(fs_daemons);
+    // Empty once every daemon has removed its socket and pidfile. `remove_dir`
+    // rather than `remove_dir_all`: if anything is unexpectedly still in there,
+    // leaving it is better than deleting it, and the failure is silent because a
+    // stray directory is not worth failing a shutdown over.
+    let _ = std::fs::remove_dir(&runtime_dir);
 
     let reason = shutdown.reason().unwrap_or(ExitReason::GuestFault);
     if reason.is_clean() {

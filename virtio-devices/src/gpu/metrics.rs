@@ -35,8 +35,9 @@ pub struct GpuCounters {
     pub vram_limit_bytes: AtomicU64,
     /// Allocations refused for exceeding the quota.
     pub vram_refusals: AtomicU64,
-    /// GTT asked for. Counted, never enforced -- host memory is bounded for the
-    /// whole process by cgroups.
+    /// GTT asked for. Counted, never enforced. Whether host memory is bounded
+    /// at all is the supervisor's cgroup to set; `vmm/src/isolation.rs` reports
+    /// what is actually in force and warns when nothing is.
     pub gtt_bytes: AtomicU64,
 
     /// Bytes currently mapped into the host-visible window.

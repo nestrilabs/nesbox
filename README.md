@@ -125,13 +125,17 @@ works today, verified by running it:
 
 What is missing is as important:
 
-- **No seccomp filter and no jailer.** The VMM runs with the privileges it was
-  given. This matters if you are considering it for untrusted guests.
+- **No jailer, no uid per guest, no mount namespace.** The VMM is confined by a
+  seccomp-bpf allowlist (on by default) and can optionally enter a private network
+  namespace, but it runs as whoever launched it. Boxes sharing a user account are
+  separated by the VM boundary and little else — see [SECURITY.md](docs/SECURITY.md).
 - **No management API.** Configuration is a JSON file and the process is the
-  interface.
-- **No snapshots**, no live migration, no CPU pinning.
-- **Performance is unmeasured.** No benchmark has been run, so this README
-  quotes no numbers.
+  interface. A read-only metrics socket exists ([STATS.md](docs/STATS.md)); there
+  is no way to *control* a running box over it.
+- **No snapshots** and no live migration. vCPU threads can be confined to a set of
+  host CPUs with `cpu_affinity`, which places them but does not cap them.
+- **Performance numbers live in [BENCHMARKS.md](docs/BENCHMARKS.md)**, measured on
+  one host; this README quotes none of them.
 
 ## Isolation
 
@@ -158,11 +162,11 @@ Roughly in priority order:
 
 - **Overlapping block I/O** — requests are served off the vCPU thread but still
   one at a time; io_uring would let a deep queue run concurrently.
-- **Seccomp and a jailer** — confine the VMM process itself.
-- **CPU pinning** — pin vCPU threads to host cores to cut scheduler jitter in
-  latency-sensitive rendering.
-- **A management API** — expose lifecycle control, GPU health and VRAM usage
-  over a socket.
+- **A uid per guest and a mount namespace** — seccomp landed and bounds what a
+  compromised device model can *call*; these bound what it can *reach*, which is
+  the larger gap. See [SECURITY.md](docs/SECURITY.md).
+- **A management API** — the stats socket already reports GPU health and VRAM
+  usage; lifecycle control over a socket is what is still missing.
 - **Shader cache mounting** — a persistent host directory for virglrenderer, to
   avoid recompiling shaders every boot.
 - **Nvidia GPU support (`virtio-nvgpu`)** — active development; requires

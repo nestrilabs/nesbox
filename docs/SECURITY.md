@@ -16,10 +16,10 @@ nothing measurable at runtime.
 shader cache, and the metrics socket needs the rest. So a compromised device model
 keeps read and write access to every path this process's uid can reach, and it
 keeps network egress. Read that plainly: **seccomp does not stop data leaving.**
-What stops that is a uid per guest, a mount namespace and a network namespace, and
-none of the three is implemented here yet — see *What this does not do yet*. If two
-boxes run under the same user account, this filter does not separate them; the VM
-boundary does.
+What stops that is a uid per guest, a mount namespace and a network namespace. The
+network namespace is implemented and off by default (`unshare-network`, below);
+the other two are not implemented at all. If two boxes run under the same user
+account, this filter does not separate them; the VM boundary does.
 
 ```json
 "seccomp": "enforce"    // default. A syscall outside the policy kills the process
@@ -43,7 +43,7 @@ both maintained against running VMMs:
 - **Firecracker's `resources/seccomp/x86_64-*.json`** for the VMM and vCPU halves,
   and for the shape of the installer.
 
-110 syscalls in the baseline. The list is broad because it must hold the union of
+111 syscalls in the baseline. The list is broad because it must hold the union of
 every thread's needs, and the GPU worker drags in most of Mesa. **The point is not
 that the list is short — it is what is absent from it.**
 
@@ -53,8 +53,15 @@ It was considered. The jailer is `chroot` + cgroups + rlimits + uid/gid drop, an
 **seccomp is not in it** — Firecracker's filters live in a separate crate applied
 by the VMM itself.
 
-- **cgroups** are already applied from outside, by whatever supervises the process
-  (see `BENCHMARKS.md` §12). Doing it twice means two places to be wrong.
+- **cgroups** are the supervisor's to apply, not ours (see `BENCHMARKS.md` §12 for
+  what they actually bound, which is less than it sounds). Doing it in two places
+  means two places to be wrong. What nesbox owes in return is *visibility*: it now
+  reads its own cgroup at startup and says which limits are in force, walking up
+  the hierarchy because a limit on an ancestor bounds us while our own file still
+  reads `max`. Earlier versions of this file, `vram.rs` and `STATS.md` all asserted
+  that host memory "is bounded for the whole process by cgroups" as though it were
+  a property of the system. It was a property of whoever wrote the unit file, and
+  nothing checked.
 - **`chroot` fights the requirements**: the DRM render node, virtiofs source
   directories, and the metrics socket path all live outside any plausible jail.
 - It assumes Firecracker's API-socket contract, which is not ours.
@@ -93,9 +100,66 @@ mistake is worth keeping: **a policy verified only against the paths a benchmark
 takes is verified against the paths a benchmark takes.** Teardown, error paths and
 the guest's own bad behaviour are where the remaining gaps will be.
 
+## Limits that only exist if something enforces them
+
+Two bounds in this codebase are applied by something other than nesbox, and both
+used to be assumed rather than checked. A limit that silently does not apply is
+worse than no limit, because it is a limit you have stopped thinking about.
+
+**The VRAM budget is enforced inside virglrenderer**, by
+`patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`, which reads
+`NESTRI_VRAM_LIMIT_MIB`. Which renderer gets loaded is `LD_LIBRARY_PATH`'s
+decision, made outside this program. Point it at a stock virglrenderer and
+`vram-limit-mib` becomes a no-op: the config still names a number, the stats
+socket still reports `vram_limit_bytes`, and `vram_refusals` sits at zero because
+nothing is refusing anything.
+
+nesbox now finds the `libvirglrenderer` it actually mapped — from
+`/proc/self/maps`, not the link-time name, since a wrong `LD_LIBRARY_PATH` is the
+whole failure — and **refuses to start** when a limit is configured and that
+library does not carry the marker. Without a configured limit it is a log line.
+The check is evidence rather than proof: it shows the library was built from a
+tree that knows the variable, not that the enforcement path is reached. A marker
+*symbol* resolved with `dlsym` would be stronger and the patch should grow one.
+
+**Host memory is bounded by a cgroup, or by nothing.** `vram.rs` deliberately does
+not enforce a GTT limit because GTT is host system memory and that is supposed to
+be capped for the process. Nothing here caps it. nesbox now reports the limits
+actually in force at startup — walking up the cgroup hierarchy, because an
+ancestor's limit bounds us while our own file still reads `max` — and warns when
+there is no `memory.max` above it at all.
+
 ## What this does not do yet
 
-### One uid per guest, and namespaces — the largest gap, and it is not seccomp
+### A network namespace: available, and off by default
+
+`"unshare-network": true` puts the box in a private user and network namespace.
+Afterwards the process has no interfaces beyond a `lo` left down, so `connect`
+remains a syscall it may make and reaches nothing. **The guest keeps its own
+link**: the tap descriptor is opened before the unshare, and a descriptor — like a
+socket's namespace — is fixed when it is created, not when it is used. The same
+reasoning keeps the metrics socket reachable from the host.
+
+It is done in two steps for a reason that is not obvious and was measured rather
+than guessed. `unshare(CLONE_NEWUSER)` requires a **single-threaded** process, and
+by the time the tap is open the block and console devices have each spawned a
+worker — the combined call returns `EINVAL` on a real boot. So the user namespace
+is entered at the very top of `main`, purely to acquire `CAP_SYS_ADMIN` over
+namespaces, and the network namespace is unshared later, where it belongs.
+
+**Why it is off by default.** Entering a user namespace maps only this uid and
+gid, so supplementary groups do not survive, and every subsequent open resolves
+against the reduced credentials. Where `/dev/kvm` and the render node are `0666`
+this costs nothing. Where they are the more usual `0660 root:kvm` / `0660
+root:render` and access comes from group membership, **the box will not start or
+the GPU will not work**. Test it on the host it will run on. Opening the render
+node before the unshare and handing the worker the descriptor would remove the
+objection and is what would let this become a default.
+
+`vsock` is untested in combination with it — the kernel's vsock is
+namespace-aware — and nesbox warns when both are configured.
+
+### One uid per guest, and a mount namespace — the largest gap, and it is not seccomp
 
 Every box currently runs as whatever user launched it. Because the baseline allows
 `openat` and `connect`, a compromised device model inherits that uid's entire
@@ -105,10 +169,13 @@ from each other by anything in this file.
 Three things fix it, and none of them is a syscall filter:
 
 - **A uid per guest.** The jailer's uid/gid drop, noted below as "worth taking";
-  it is the single highest-value unfinished item in this document.
+  it is the single highest-value unfinished item in this document. nesbox cannot
+  do this to itself — an unprivileged process cannot change uid — so it belongs to
+  whatever launches the box.
 - **A mount namespace**, so the paths a guest's VMM can name are the ones it was
   given.
-- **A network namespace** with no route out, so egress is not a policy decision.
+- **A network namespace** with no route out — *this one is implemented*, as
+  `unshare-network` above, and off by default.
 
 Narrowing `ioctl` is worth doing and buys less than any one of these. Ranking the
 work honestly matters more than doing the tractable part first.

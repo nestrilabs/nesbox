@@ -426,9 +426,11 @@ Two parts, in `patches/0002`:
 - **Refuse in `GEM_NEW`.** Contains a guest that ignores the report, at the cost of
   that guest wedging.
 
-Only the VRAM heap is bounded. GTT is host system memory, capped for the whole VMM
-process by cgroups; counting it twice would refuse guests for memory they never
-took from the card.
+Only the VRAM heap is bounded. GTT is host system memory; counting it twice would
+refuse guests for memory they never took from the card. Whether that host memory
+is capped at all is the supervisor's `memory.max` to set and not something nesbox
+applies — see §12.3 for what such a cap does and does not do, and note that nesbox
+now says at startup which limits are actually in force.
 
 ### 11.3 Measured
 

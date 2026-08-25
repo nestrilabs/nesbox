@@ -35,6 +35,22 @@ pub struct VmConfig {
     /// is not a control.
     #[serde(default = "default_seccomp")]
     pub seccomp: String,
+    /// Enter a private user and network namespace before the guest runs.
+    ///
+    /// seccomp allows `socket` and `connect`, so a compromised device model
+    /// otherwise has the host's network. This takes the network away entirely --
+    /// the guest keeps its own link, because the tap is opened before the
+    /// unshare and an open descriptor is unaffected by it.
+    ///
+    /// Default off, and not because it is unimportant. Entering a user namespace
+    /// maps only this uid and gid, so access that depends on supplementary group
+    /// membership stops working, and Mesa opens the DRM render node *after* this
+    /// point. Where the render node is `0660 root:render` this will stop the GPU
+    /// working; where it is `0666` it is free. See
+    /// `isolation::enter_network_namespace` for the full argument, and turn it
+    /// on deliberately after testing on the host it will run on.
+    #[serde(default)]
+    pub unshare_network: bool,
 }
 
 fn default_seccomp() -> String {
