@@ -360,9 +360,18 @@ suspect the run length before believing the card is unfair.**
 
 ### Reading a result
 
-`completed` is the field to check first. A run that dies early still produces
-numbers, and they are the numbers of a partial run — everything else in the
-section is meaningless if it is `false`.
+`completed` is the field to check first, and **every section has one**. A run that
+dies early still produces numbers of the right shape, and they are the numbers of a
+partial run: a sweep that lost every guest still reports `sum fps 0`, which reads
+exactly like a measurement. `scaling` carries one per guest count as well as an
+overall.
+
+**A failed section will not overwrite a completed one.** Re-running `--only
+scaling` after a failure leaves the previous good numbers in place and adds
+`kept_earlier_result_for` saying so — because losing a fifteen-minute measurement
+to a run that crashed, and being left with something that still looks like a
+result, is the worse of the two outcomes. And a run whose output will not parse
+leaves the committed file untouched rather than replacing it.
 
 `ratios`, not absolutes. §12.1's warning generalises: this reference host is a
 laptop on battery sustaining under half its rated clock, so a guest-to-host ratio

@@ -162,7 +162,7 @@ stage_sweep_dir() {
 section_scaling() {
     say "  scaling: 1, 2 and 4 guests on one GPU (probe-sweep.sh)"
     local dir; dir=$(stage_sweep_dir)
-    local first=1 out="{"
+    local first=1 out="{" all_ok=true
     for n in 1 2 4; do
         say "    n=$n"
         local raw
@@ -180,10 +180,22 @@ section_scaling() {
         local p50s p99s
         p50s=$(awk 'NF==6 && $1 ~ /^[0-9]+$/ { printf "%s%s", sep, ($4 ~ /^[0-9.]+$/ ? $4 : "null"); sep="," }' <<<"$raw")
         p99s=$(awk 'NF==6 && $1 ~ /^[0-9]+$/ { printf "%s%s", sep, ($5 ~ /^[0-9.]+$/ ? $5 : "null"); sep="," }' <<<"$raw")
+        # A sweep that produced a table is not a sweep that produced results: a
+        # guest that failed prints an em dash, and a sweep that lost every guest
+        # still yields "sum fps 0". Without this the section emitted zeros and
+        # nulls that look exactly like a measurement, and the merge below then
+        # overwrote a good result with them.
+        local rows nulls ok=true
+        rows=$(awk -v s="$p50s" 'BEGIN { print (s == "") ? 0 : split(s, a, ",") }')
+        nulls=$(grep -o null <<<"$p50s,$p99s" | wc -l)
+        [[ $rows -eq $n && $nulls -eq 0 ]] || ok=false
+        [[ ${sum:-0} != 0 && -n ${sum:-} ]] || ok=false
+        $ok || { say "    WARNING: n=$n did not complete"; all_ok=false; }
+
         ((first)) || out+=","; first=0
-        out+="\"$n\":{\"sum_fps\":$(jnum "$sum"),\"p50_ms\":[${p50s}],\"p99_ms\":[${p99s}]}"
+        out+="\"$n\":{\"completed\":$ok,\"sum_fps\":$(jnum "$sum"),\"p50_ms\":[${p50s}],\"p99_ms\":[${p99s}]}"
     done
-    echo "$out}"
+    echo "{\"completed\":$all_ok,\"by_guest_count\":$out}}"
 }
 
 section_envelope() {
@@ -222,8 +234,16 @@ section_envelope() {
     mbu=$(dd_mb_per_s "$raw" "unlimited, cold")
     mb=$(dd_mb_per_s "$raw" "cap, cold")
     mbw=$(dd_mb_per_s "$raw" "cap, warm")
+    # All three figures or none: a missing one means a sub-run failed or the
+    # prose changed shape, and either way the remaining numbers cannot be compared
+    # against each other, which is the entire point of this section.
+    local ok=true
+    for v in "$mbu" "$mb" "$mbw"; do [[ -n ${v:-} ]] || ok=false; done
+    $ok || say "    WARNING: envelope did not complete -- an io figure is missing"
+
     cat <<JSON
 {
+  "completed": $ok,
   "io_mb_per_s": {
     "uncapped_cold": $(jnum "$mbu"),
     "capped_20mb_cold": $(jnum "$mb"),
@@ -285,7 +305,22 @@ if os.path.exists(out):
     try:
         old = json.load(open(out))
         merged = dict(old.get("results", {}))
-        merged.update(fresh.get("results", {}))
+        kept = []
+        for name, new_section in fresh.get("results", {}).items():
+            was = merged.get(name)
+            # A run that failed still emits a shaped section. Overwriting a good
+            # measurement with it loses the good one and leaves something that
+            # reads like a result, which is the worse of the two outcomes.
+            if (isinstance(was, dict) and was.get("completed") is True
+                    and isinstance(new_section, dict)
+                    and new_section.get("completed") is not True):
+                kept.append(name)
+                continue
+            merged[name] = new_section
+        if kept:
+            fresh["kept_earlier_result_for"] = kept
+            sys.stderr.write(
+                "  kept the earlier completed result for: %s\n" % ", ".join(kept))
         fresh["results"] = merged
         # Sections carried over were measured under an earlier provenance. Say so
         # rather than implying one sitting.
@@ -304,7 +339,10 @@ if python3 -c "$MERGE" "$OUT.tmp" "$OUT" "${to_run[*]}"; then
     say ""
     say "wrote $OUT"
 else
-    mv "$OUT.tmp" "$OUT"
-    say "WARNING: could not assemble valid JSON; raw output left at $OUT"
+    # Deliberately not written over $OUT. A committed result is worth more than
+    # this run's output, and replacing it with something that would not parse
+    # loses both.
+    say "WARNING: could not assemble valid JSON. $OUT is untouched;"
+    say "         the unparsable output is at $OUT.tmp"
     exit 1
 fi

@@ -10,7 +10,18 @@
 set -uo pipefail
 
 _first() { for f in "$@"; do [[ -r $f ]] && { tr -d '\n' < "$f"; return; }; done; }
-_json_str() { [[ -n ${1:-} ]] && printf '"%s"' "${1//\"/\\\"}" || printf 'null'; }
+
+# Encoded by json.dumps rather than by hand. Escaping only the quote character
+# was not merely incomplete, it corrupted silently: a value containing a
+# backslash produced "has\backslash", and because \b is a legal JSON escape
+# that *parses* -- to "has", a backspace, then "ackslash". A wrong value that
+# loads is worse than a malformed file that does not, and a tab produced the
+# malformed file as well. python3 is already required to assemble the result, so
+# this costs one process per field on a script that runs once.
+_json_str() {
+    [[ -n ${1:-} ]] || { printf 'null'; return; }
+    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1"
+}
 _json_num() { [[ ${1:-} =~ ^[0-9]+$ ]] && printf '%s' "$1" || printf 'null'; }
 
 # The render node to test. Prefers the one a caller names, else the first that a
@@ -57,10 +68,16 @@ bench_provenance_json() {
     done
 
     local cpu0=/sys/devices/system/cpu/cpu0/cpufreq
-    local dpm=""
-    for f in /sys/class/drm/card*/device/pp_dpm_sclk; do
-        [[ -r $f ]] && { dpm=$(awk '{printf "%s ", $2}' "$f" | sed 's/ $//'); break; }
-    done
+    # Read the clock states of the card that will run the benchmark, not of
+    # whichever card happens to sort first. The render node's `device` link points
+    # at the PCI device owning these attributes, so there is no cardN to guess --
+    # and on this host the only card is `card1`, so a `card*` glob was right by
+    # luck rather than by construction.
+    local dpm="" dpmf=""
+    [[ -n $node ]] && dpmf="/sys/class/drm/$(basename "$node")/device/pp_dpm_sclk"
+    if [[ -n $dpmf && -r $dpmf ]]; then
+        dpm=$(awk '{printf "%s ", $2}' "$dpmf" | sed 's/ $//')
+    fi
 
     cat <<JSON
 {

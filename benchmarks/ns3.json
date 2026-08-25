@@ -34,7 +34,7 @@
       "artifacts_device": "nvme0n1"
     },
     "versions": {
-      "nesbox": "317ff74",
+      "nesbox": "0285f7f",
       "nesbox_dirty": true,
       "virglrenderer": "7fcfce4",
       "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
@@ -62,40 +62,46 @@
       }
     },
     "scaling": {
-      "1": {
-        "sum_fps": 98.08,
-        "p50_ms": [
-          10.103
-        ],
-        "p99_ms": [
-          11.494
-        ]
-      },
-      "2": {
-        "sum_fps": 109.88,
-        "p50_ms": [
-          18.722,
-          18.677
-        ],
-        "p99_ms": [
-          20.463,
-          20.405
-        ]
-      },
-      "4": {
-        "sum_fps": 119.05,
-        "p50_ms": [
-          37.576,
-          37.503,
-          37.372,
-          37.226
-        ],
-        "p99_ms": [
-          39.54,
-          39.667,
-          39.489,
-          39.547
-        ]
+      "completed": true,
+      "by_guest_count": {
+        "1": {
+          "completed": true,
+          "sum_fps": 98.13,
+          "p50_ms": [
+            10.076
+          ],
+          "p99_ms": [
+            11.562
+          ]
+        },
+        "2": {
+          "completed": true,
+          "sum_fps": 109.13,
+          "p50_ms": [
+            18.715,
+            18.688
+          ],
+          "p99_ms": [
+            20.444,
+            20.466
+          ]
+        },
+        "4": {
+          "completed": true,
+          "sum_fps": 118.3,
+          "p50_ms": [
+            37.718,
+            37.55,
+            37.368,
+            37.187
+          ],
+          "p99_ms": [
+            39.202,
+            39.092,
+            39.053,
+            39.054
+          ]
+        }
       }
     },
     "seccomp": {
@@ -122,11 +128,11 @@
     }
   },
   "carried_from_earlier_run": [
+    "envelope",
     "gpu",
-    "scaling",
     "seccomp"
   ],
   "sections_run": [
-    "envelope"
+    "scaling"
   ]
 }
