@@ -6,9 +6,20 @@ the card and through it other guests on the same card. **That risk is structural
 and a syscall filter does not remove it.**
 
 What a filter buys is a bound on what a *compromised device model* can do
-afterwards. No `execve`. No new files. No `ptrace`, `mount`, `bpf`, `init_module`,
-`kexec_load`, `pivot_root`, `setuid`. It is the difference between a bad day and an
-incident, and it costs nothing measurable at runtime.
+afterwards. No `execve`. No `ptrace`, `mount`, `bpf`, `init_module`, `kexec_load`,
+`pivot_root`, `setuid`. It cannot start a program, load code into the kernel,
+inspect another process, or change how the host is put together, and it costs
+nothing measurable at runtime.
+
+**It can still open files and open sockets.** `openat`, `socket`, `connect` and
+`sendto` are all on the baseline — the GPU worker needs the render node and Mesa's
+shader cache, and the metrics socket needs the rest. So a compromised device model
+keeps read and write access to every path this process's uid can reach, and it
+keeps network egress. Read that plainly: **seccomp does not stop data leaving.**
+What stops that is a uid per guest, a mount namespace and a network namespace, and
+none of the three is implemented here yet — see *What this does not do yet*. If two
+boxes run under the same user account, this filter does not separate them; the VM
+boundary does.
 
 ```json
 "seccomp": "enforce"    // default. A syscall outside the policy kills the process
@@ -32,7 +43,7 @@ both maintained against running VMMs:
 - **Firecracker's `resources/seccomp/x86_64-*.json`** for the VMM and vCPU halves,
   and for the shape of the installer.
 
-109 syscalls in the baseline. The list is broad because it must hold the union of
+110 syscalls in the baseline. The list is broad because it must hold the union of
 every thread's needs, and the GPU worker drags in most of Mesa. **The point is not
 that the list is short — it is what is absent from it.**
 
@@ -70,7 +81,37 @@ native context, VRAM accounting, the metrics socket, `nesprobe` completing with
 variation on this host, and both p99s are dominated by GPU clock ramp at a 2 s
 warm-up (`BENCHMARKS.md` §8.2), not by the filter.
 
+**What that run did not cover: shutdown.** It was measured with a config that has
+no `shared-directories`, so it never reached `Virtiofsd::drop`, which reaps each
+daemon with `wait4` — a syscall the first version of the policy did not allow. Any
+VM with a shared directory therefore died of `SIGSYS` on every clean exit: sockets
+left behind, the exit code a signal instead of the reason the VM stopped, and the
+one signal that is supposed to mean *a device model was compromised* firing on
+ordinary teardown. `wait4` is on the list now and
+`a_child_can_still_be_reaped_under_the_baseline` covers it, but the shape of the
+mistake is worth keeping: **a policy verified only against the paths a benchmark
+takes is verified against the paths a benchmark takes.** Teardown, error paths and
+the guest's own bad behaviour are where the remaining gaps will be.
+
 ## What this does not do yet
+
+### One uid per guest, and namespaces — the largest gap, and it is not seccomp
+
+Every box currently runs as whatever user launched it. Because the baseline allows
+`openat` and `connect`, a compromised device model inherits that uid's entire
+filesystem reach and its network. Two guests under one account are not isolated
+from each other by anything in this file.
+
+Three things fix it, and none of them is a syscall filter:
+
+- **A uid per guest.** The jailer's uid/gid drop, noted below as "worth taking";
+  it is the single highest-value unfinished item in this document.
+- **A mount namespace**, so the paths a guest's VMM can name are the ones it was
+  given.
+- **A network namespace** with no route out, so egress is not a policy decision.
+
+Narrowing `ioctl` is worth doing and buys less than any one of these. Ranking the
+work honestly matters more than doing the tractable part first.
 
 ### No argument filtering, and `ioctl` is the one that matters
 
@@ -114,8 +155,14 @@ with no message means the failure was in a thread too young to take a signal.
 - The filter is **per-process, one process per box**, so it is per-tenant by
   construction. It is *not* per-device: crosvm gets that by running each device in
   its own process, and a single-process VMM cannot match it.
-- **virtiofsd is a separate process** and is not covered by this filter. It applies
-  its own sandbox.
+- **virtiofsd is a separate process, is not covered by this filter, and is not
+  sandboxed at all.** `Virtiofsd::spawn` passes `--sandbox none`, which turns off
+  virtiofsd's own namespace sandbox — it needs privileges an unprivileged VMM does
+  not have. So the process holding a FUSE channel to the guest *and* the shared
+  directories open is unconfined. An earlier version of this file claimed it
+  "applies its own sandbox"; that was wrong, and it was the sentence most likely to
+  stop someone asking. Running it under its own uid, or giving the VMM enough
+  privilege to let virtiofsd sandbox itself, is unfinished work.
 - `seccomp` itself is on the allowlist. That looks wrong and is not: filters are
   monotonic — every filter on a thread must allow a syscall, so an added filter can
   only remove, and with `NO_NEW_PRIVS` set there is no way to relax one. The worst a

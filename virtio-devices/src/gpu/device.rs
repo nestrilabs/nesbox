@@ -411,7 +411,7 @@ impl GpuDevice {
                 }
             }
             CFG_QUEUE_SEL => i.qs = v2,
-            CFG_QUEUE_SIZE => i.sqm().size = v2,
+            CFG_QUEUE_SIZE => set_queue_size(i.sqm(), v2, QUEUE_SIZE),
             CFG_QUEUE_MSIX => i.sqm().vec = v2,
             CFG_QUEUE_ENABLE => i.sqm().enabled = v2 != 0,
             _ => write_queue_addr(i.sqm(), off, v3),

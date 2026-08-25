@@ -78,6 +78,35 @@ pub fn write_val(data: &mut [u8], val: u64) {
     }
 }
 
+/// Apply a queue size the guest wrote, against the maximum this device
+/// advertises.
+///
+/// Both ends need bounding and neither used to be checked.
+///
+/// **Zero** is stored as written, because zero legitimately means "this queue is
+/// unused" -- but it can never reach `pop_avail`, where `q.last % q.size` is a
+/// division, not an error. Three MMIO writes from inside a guest were enough to
+/// panic the VMM. The refusal lives in `pop_avail` and `push_used` rather than
+/// here so that it holds however a `QState` was built.
+///
+/// **Above the advertised maximum** is clamped. The spec says a driver MUST NOT
+/// write more than `queue_size_max`, so a larger value is a broken or hostile
+/// driver either way; clamping keeps a merely-confused one working. It matters
+/// because `max` is what bounds the chain walk below, and a guest that can raise
+/// it can make `collect_descs` walk a chain far longer than the ring it
+/// advertised -- every descriptor of which is host memory `Reader` commits.
+pub fn set_queue_size(q: &mut QState, requested: u16, max: u16) {
+    if requested > max {
+        log::warn!(
+            "virtio: guest asked for a {requested}-entry queue against a maximum \
+             of {max}; clamping"
+        );
+        q.size = max;
+    } else {
+        q.size = requested;
+    }
+}
+
 /// Collect descriptors from a vring chain.
 pub fn collect_descs(
     mem: &GuestMemoryMmap,
@@ -87,6 +116,14 @@ pub fn collect_descs(
 ) -> Vec<(u64, u32, u16)> {
     let mut descs = Vec::new();
     let mut idx = head;
+    // An index at or past the ring is off the descriptor table the guest
+    // published. Reading it would still be a bounds-checked guest-memory access,
+    // so this is not a host escape -- it is the spec's rule (`next` must be
+    // below the queue size), and honouring it keeps the walk inside the ring
+    // that `max` is counting.
+    if idx >= max {
+        return descs;
+    }
     for _ in 0..max {
         let base = vm_memory::GuestAddress(desc_base + idx as u64 * VRING_DESC_SIZE);
         let addr: u64 = match mem.read_obj(base) { Ok(v) => u64::from_le(v), Err(_) => break };
@@ -95,6 +132,7 @@ pub fn collect_descs(
         let nx: u16 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 14)) { Ok(v) => u16::from_le(v), Err(_) => break };
         descs.push((addr, len, fl));
         if fl & VRING_DESC_F_NEXT == 0 { break; }
+        if nx >= max { break; }
         idx = nx;
     }
     descs
@@ -102,6 +140,12 @@ pub fn collect_descs(
 
 /// Read one avail descriptor from the queue. Returns None if empty.
 pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64, u32, u16)>)> {
+    // A queue the guest sized to zero has no ring to index into, and the
+    // remainder below would panic rather than report anything. See
+    // `set_queue_size`.
+    if q.size == 0 {
+        return None;
+    }
     let a = vm_memory::GuestAddress(q.avail + 2);
     let idx: u16 = match mem.read_obj(a) { Ok(v) => u16::from_le(v), Err(_) => return None };
     if idx == q.last { return None; }
@@ -115,6 +159,11 @@ pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64
 
 /// Write a used element and advance the used index.
 pub fn push_used(mem: &GuestMemoryMmap, q: &QState, head: u16, len: u32) {
+    // Same division, same reason. Nothing was taken from a zero-sized queue, so
+    // there is nothing to complete on one.
+    if q.size == 0 {
+        return;
+    }
     let ua = vm_memory::GuestAddress(q.used + 2);
     let ui: u16 = mem.read_obj(ua).map(u16::from_le).unwrap_or(0);
     let us = (ui % q.size) as u64;
@@ -352,5 +401,68 @@ pub fn com_read(
         CFG_QUEUE_AVAIL_LO => qalo, CFG_QUEUE_AVAIL_HI => qahi,
         CFG_QUEUE_USED_LO => qulo, CFG_QUEUE_USED_HI => quhi,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use vm_memory::GuestAddress;
+
+    const MAX: u16 = 256;
+
+    fn mem() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap()
+    }
+
+    /// A guest that sizes a queue to zero used to panic the VMM: `q.last %
+    /// q.size` is a division. Three MMIO writes, from inside the guest, and the
+    /// box is gone.
+    #[test]
+    fn a_zero_sized_queue_is_refused_rather_than_dividing_by_it() {
+        // `last` differs from the avail index the guest published (zero), so
+        // this gets past the is-it-empty check and reaches the remainder. With
+        // `last == 0` the queue reads as empty and the division is never tried,
+        // which would make this test pass against the bug it exists for.
+        let mut q = QState { size: 0, enabled: true, last: 1, ..Default::default() };
+        assert!(pop_avail(&mem(), &mut q).is_none());
+        // And completing on one is a no-op rather than the same division.
+        push_used(&mem(), &q, 0, 0);
+    }
+
+    /// Zero is kept as written -- it means "unused", and rewriting it to the
+    /// maximum would hand a guest a live queue it asked not to have.
+    #[test]
+    fn zero_is_stored_not_rewritten() {
+        let mut q = QState::default();
+        set_queue_size(&mut q, 0, MAX);
+        assert_eq!(q.size, 0);
+    }
+
+    /// The advertised maximum is what bounds the chain walk, so a guest must not
+    /// be able to raise it: 65535 descriptors of up to 4 GiB each is host memory
+    /// `Reader` would commit.
+    #[test]
+    fn a_size_above_the_advertised_maximum_is_clamped() {
+        let mut q = QState::default();
+        set_queue_size(&mut q, u16::MAX, MAX);
+        assert_eq!(q.size, MAX);
+    }
+
+    #[test]
+    fn an_ordinary_size_is_taken_verbatim() {
+        let mut q = QState::default();
+        set_queue_size(&mut q, 128, MAX);
+        assert_eq!(q.size, 128);
+        set_queue_size(&mut q, MAX, MAX);
+        assert_eq!(q.size, MAX);
+    }
+
+    /// `next` must be below the queue size. An index past the ring is off the
+    /// table the guest published, so the walk stops instead of following it.
+    #[test]
+    fn a_chain_head_past_the_ring_yields_nothing() {
+        assert!(collect_descs(&mem(), 0x1000, MAX, MAX).is_empty());
+        assert!(collect_descs(&mem(), 0x1000, u16::MAX, MAX).is_empty());
     }
 }

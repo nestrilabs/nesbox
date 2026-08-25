@@ -30,10 +30,28 @@ fn is_write_only(desc: &Descriptor) -> bool {
 // Error type
 // ---------------------------------------------------------------------------
 
+/// Most bytes the readable half of one command's chain may total.
+///
+/// `Reader` copies eagerly and `resize` zero-fills, so every byte a chain claims
+/// is host memory committed on the guest's say-so before anything has been
+/// validated. Without a ceiling the only bound is the ring size times 4 GiB per
+/// descriptor -- a terabyte from a guest that has to fill in nothing but length
+/// fields, and an abort or a host OOM that reaches other tenants long before
+/// that.
+///
+/// The largest legitimate reader on this queue is a `SUBMIT_3D` command stream,
+/// orders of magnitude under this. 64 MiB is chosen to be unreachable by a
+/// working guest rather than tuned to one: the point is to have a ceiling, not
+/// to make it tight. (crosvm avoids the question by reading lazily, which is the
+/// better fix and a much larger change.)
+pub const MAX_READABLE_BYTES: usize = 64 << 20;
+
 #[derive(Debug)]
 pub enum Error {
     /// Descriptor chain length overflow.
     DescriptorChainOverflow,
+    /// The readable half of the chain claims more than `MAX_READABLE_BYTES`.
+    DescriptorChainTooLong(usize),
     /// Failed to access guest memory.
     GuestMemory(GuestMemoryError),
     /// Invalid descriptor chain.
@@ -50,6 +68,10 @@ impl fmt::Display for Error {
             Error::DescriptorChainOverflow => write!(
                 f,
                 "combined length of all buffers in DescriptorChain would overflow"
+            ),
+            Error::DescriptorChainTooLong(len) => write!(
+                f,
+                "readable descriptors total {len} bytes, over the {MAX_READABLE_BYTES}-byte limit"
             ),
             Error::GuestMemory(e) => write!(f, "descriptor guest memory error: {e}"),
             Error::InvalidChain => write!(f, "invalid descriptor chain"),
@@ -96,6 +118,11 @@ impl Reader {
             total_len = total_len
                 .checked_add(len)
                 .ok_or(Error::DescriptorChainOverflow)?;
+            // Checked before the resize below, which is the allocation. Doing it
+            // after would be checking a number the host had already committed.
+            if total_len > MAX_READABLE_BYTES {
+                return Err(Error::DescriptorChainTooLong(total_len));
+            }
 
             let start = data.len();
             data.resize(start + len, 0u8);
@@ -239,5 +266,53 @@ impl io::Write for Writer<'_> {
     fn flush(&mut self) -> io::Result<()> {
         // Writes go straight to guest memory.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use vm_memory::GuestAddress as GA;
+
+    fn mem() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GA(0), 0x20000)]).unwrap()
+    }
+
+    /// The whole point of the ceiling. Every descriptor here points at real,
+    /// readable guest memory, so nothing else in the path would refuse it --
+    /// only the total is unreasonable, and the total is what the host pays.
+    #[test]
+    fn a_chain_claiming_more_than_the_ceiling_is_refused() {
+        // Lengths a guest can write freely; the addresses do not even have to
+        // be distinct.
+        let huge = [(0u64, u32::MAX, 0u16); 64];
+        match Reader::new(&mem(), &huge) {
+            Err(Error::DescriptorChainTooLong(n)) => {
+                assert!(n > MAX_READABLE_BYTES, "{n}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// And it is refused *before* the allocation, which is the part that
+    /// matters: checking afterwards would be checking a number the host had
+    /// already committed. A single descriptor over the line is enough.
+    #[test]
+    fn the_refusal_comes_before_anything_is_allocated() {
+        let one_over = [(0u64, (MAX_READABLE_BYTES + 1) as u32, 0u16)];
+        assert!(matches!(
+            Reader::new(&mem(), &one_over),
+            Err(Error::DescriptorChainTooLong(_))
+        ));
+    }
+
+    /// An ordinary chain still reads, and reads what it was given.
+    #[test]
+    fn an_ordinary_chain_is_untouched() {
+        let m = mem();
+        m.write_slice(&[0xab; 32], GA(0x1000)).unwrap();
+        let mut r = Reader::new(&m, &[(0x1000, 32, 0)]).expect("a small chain reads");
+        assert_eq!(r.available_bytes(), 32);
+        assert_eq!(r.read_obj::<u32>().unwrap(), 0xabab_abab);
     }
 }

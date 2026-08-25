@@ -195,7 +195,7 @@ impl ConsoleDevice {
             CFG_MSIX_CONFIG => i.cfg_vec = v2,
             CFG_STATUS => { i.com.st = v1; if v1 == 0 { i.rx = QState { size: QUEUE_SIZE, ..Default::default() }; i.tx = QState { size: QUEUE_SIZE, vec: 1, ..Default::default() }; i.qs = 0; } if v1 & STATUS_DRIVER_OK != 0 { log::info!("virtio-console: DRIVER_OK"); } }
             CFG_QUEUE_SEL => i.qs = v2,
-            CFG_QUEUE_SIZE => i.sqm().size = v2,
+            CFG_QUEUE_SIZE => set_queue_size(i.sqm(), v2, QUEUE_SIZE),
             CFG_QUEUE_MSIX => i.sqm().vec = v2,
             CFG_QUEUE_ENABLE => i.sqm().enabled = v2 != 0,
             _ => write_queue_addr(i.sqm(), off, v3),

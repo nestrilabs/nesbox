@@ -135,8 +135,11 @@ What is missing is as important:
 
 ## Isolation
 
-Guests are isolated by KVM hardware virtualisation. That is the whole of it
-today — there is no seccomp sandbox around the VMM process and no jailer chroot.
+Guests are isolated by KVM hardware virtualisation. The VMM process is also
+confined by a seccomp-bpf allowlist, on by default — see [SECURITY.md](docs/SECURITY.md)
+for what that does and, more usefully, what it does not. There is no jailer
+chroot, no uid per guest and no namespaces, so boxes sharing a user account are
+separated by the VM boundary and not much else.
 
 Multiple nesbox VMs share the host GPU through its DRM render node, each with
 its own renderer context and fence timeline, isolated by the kernel's DRM

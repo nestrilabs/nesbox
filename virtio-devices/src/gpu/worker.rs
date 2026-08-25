@@ -346,6 +346,20 @@ impl Worker {
                     error!("virtio-gpu: ResourceAttachBacking missing backing entries");
                     return Err(GpuResponse::ErrUnspec);
                 }
+                // `nr_entries` is a guest u32 and it used to size a host Vec
+                // directly, so a guest could reserve 64 GiB before a single
+                // entry was read. An entry cannot exist unless there are bytes
+                // to read it from, so the chain is the bound -- exact, and no
+                // constant to guess at.
+                let fits = reader.available_bytes() / size_of::<virtio_gpu_mem_entry>();
+                if info.nr_entries as usize > fits {
+                    error!(
+                        "virtio-gpu: ResourceAttachBacking claims {} entries, but only \
+                         {fits} fit the descriptor chain",
+                        info.nr_entries
+                    );
+                    return Err(GpuResponse::ErrUnspec);
+                }
                 let mut vecs = Vec::with_capacity(info.nr_entries as usize);
                 for _ in 0..info.nr_entries {
                     let entry = match reader.read_obj::<virtio_gpu_mem_entry>() {
@@ -449,6 +463,21 @@ impl Worker {
                 }
                 let num_fences = info.num_in_fences as usize;
                 let cmd_size = info.size as usize;
+                // Both are guest u32s that sized host allocations before
+                // anything was read: 32 GiB of fence ids and 4 GiB of command
+                // buffer, from one command. As above, what the chain actually
+                // carries is the bound.
+                let claimed = num_fences
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|fences| fences.checked_add(cmd_size));
+                if claimed.is_none_or(|n| n > reader.available_bytes()) {
+                    error!(
+                        "virtio-gpu: SUBMIT_3D claims {num_fences} fences and {cmd_size} \
+                         command bytes, more than the {} the chain carries",
+                        reader.available_bytes()
+                    );
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
                 let mut fence_ids: Vec<u64> = Vec::with_capacity(num_fences);
                 for _ in 0..num_fences {
                     match reader.read_obj::<u64>() {

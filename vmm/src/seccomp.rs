@@ -275,6 +275,14 @@ fn baseline() -> Vec<libc::c_long> {
         // Signals.
         libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask, libc::SYS_rt_sigreturn,
         libc::SYS_sigaltstack, libc::SYS_tgkill, libc::SYS_kill,
+        // Reaping virtiofsd. `Virtiofsd::drop` kills each daemon and waits for
+        // it, and that happens on the way out -- long after this filter is
+        // installed. Without it every clean shutdown of a VM with a shared
+        // directory dies of SIGSYS instead: the sockets are never removed, the
+        // exit code is a signal rather than the reason the VM stopped, and the
+        // one signal that should mean "a device model was compromised" fires on
+        // every ordinary teardown. `Child::wait` reaches `wait4`, not `waitid`.
+        libc::SYS_wait4,
         // Memory. Guest RAM, the BAR2 window and every Mesa allocation.
         libc::SYS_mmap, libc::SYS_munmap, libc::SYS_mremap, libc::SYS_mprotect,
         libc::SYS_madvise, libc::SYS_brk, libc::SYS_mincore, libc::SYS_msync,
@@ -488,6 +496,54 @@ mod tests {
         // And a thread that has tightened cannot tighten again, so the
         // capability does not propagate.
         assert!(!vcpu().contains(&libc::SYS_seccomp));
+    }
+
+    /// Reaping a child has to survive the filter, because `Virtiofsd::drop`
+    /// does it on the way out -- after `apply_baseline`.
+    ///
+    /// A fork rather than `assert!(baseline().contains(&SYS_wait4))`, because
+    /// the list is not the claim. The claim is that the shutdown path works,
+    /// and which syscall `Child::wait` reaches is a std implementation detail
+    /// (measured: `wait4`, not `waitid`). `wait4` is called directly here only
+    /// so the child stays async-signal-safe after `fork`.
+    #[test]
+    fn a_child_can_still_be_reaped_under_the_baseline() {
+        // SAFETY: the child calls only async-signal-safe functions.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // SAFETY: as above; the grandchild exits immediately.
+            unsafe {
+                let kid = libc::fork();
+                if kid == 0 {
+                    libc::syscall(libc::SYS_exit_group, 7);
+                    unreachable!();
+                }
+                let prog = build(&baseline(), SECCOMP_RET_KILL_PROCESS);
+                if install(&prog, false).is_err() {
+                    libc::syscall(libc::SYS_exit_group, 42);
+                }
+                let mut st: libc::c_int = 0;
+                let seen = libc::syscall(
+                    libc::SYS_wait4,
+                    kid as libc::c_long,
+                    &mut st as *mut libc::c_int,
+                    0 as libc::c_long,
+                    std::ptr::null_mut::<libc::c_void>(),
+                );
+                let ok = seen == kid as i64 && libc::WEXITSTATUS(st) == 7;
+                libc::syscall(libc::SYS_exit_group, if ok { 0 } else { 43 });
+                unreachable!();
+            }
+        }
+        let mut status = 0;
+        // SAFETY: waiting on our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "a VM with a shared directory must be able to reap virtiofsd at \
+             shutdown; status {status:#x}"
+        );
     }
 
     #[test]

@@ -225,7 +225,7 @@ impl BlkDevice {
             CFG_MSIX_CONFIG => i.cfg_vec = v2,
             CFG_STATUS => { let old = i.com.st; i.com.st = v1; if old & 4 == 0 && v1 & STATUS_DRIVER_OK != 0 { log::info!("virtio-blk: Driver OK"); } },
             CFG_QUEUE_SEL => i.qs = v2,
-            CFG_QUEUE_SIZE => if i.qs == 0 { i.q.size = v2; },
+            CFG_QUEUE_SIZE => if i.qs == 0 { set_queue_size(&mut i.q, v2, QUEUE_SIZE) },
             CFG_QUEUE_MSIX => i.q.vec = v2,
             CFG_QUEUE_ENABLE => if i.qs == 0 { i.q.enabled = v2 != 0; },
             _ => write_queue_addr(&mut i.q, off, v3),
