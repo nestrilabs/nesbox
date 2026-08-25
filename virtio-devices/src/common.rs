@@ -146,6 +146,9 @@ pub fn collect_descs(
         if fl & VRING_DESC_F_NEXT == 0 {
             break;
         }
+        // The same spec rule as the entry check above, applied to every link
+        // rather than only the head: a `next` at or past the queue size would
+        // walk outside the ring the guest published.
         if nx >= max {
             break;
         }

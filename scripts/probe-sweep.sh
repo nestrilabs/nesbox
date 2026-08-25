@@ -9,7 +9,6 @@
 # probe arrives over virtiofs and /tmp is a tmpfs. So a sweep costs no disk and
 # cannot corrupt an image.
 set -uo pipefail
-cd "$(dirname "$0")/.."
 
 N=2; COST=400; SECS=30; MEM=1536; WARMUP=8
 while getopts "n:c:s:m:w:h" o; do case $o in
@@ -17,21 +16,23 @@ while getopts "n:c:s:m:w:h" o; do case $o in
   h) sed -n '2,12p' "$0"; exit 0;;
 esac; done
 
-ART=$PWD/artifacts
+ART=$PWD
 KERNEL=$ART/vmlinux
 ROOTFS=$ART/rootfs.ext4
 PROBE=$ART/probe-share
-RENDERER=$ART/virgl-nvalid/lib
+VIRGLRENDERER=/usr/lib
+NESBOX=$ART/nesbox
 RUN=$(mktemp -d)
 trap 'rm -rf "$RUN"' EXIT
 
-for f in "$KERNEL" "$ROOTFS" "$PROBE/nesprobe" "$RENDERER/libvirglrenderer.so.1"; do
+for f in "$KERNEL" "$ROOTFS" "$PROBE/nesprobe" "$VIRGLRENDERER/libvirglrenderer.so.1"; do
   [[ -e $f ]] || { echo "missing: $f" >&2; exit 1; }
 done
-[[ -x ./target/release/nesbox ]] || { echo "build nesbox first: cargo build --release" >&2; exit 1; }
+[[ -x "$NESBOX" ]] || { echo "build nesbox first: cargo build --release" >&2; exit 1; }
 
 echo "sweep: N=$N cost=$COST seconds=$SECS warmup=${WARMUP}s mem=${MEM}MiB"
-echo "renderer: $(cd ~/forks/virglrenderer 2>/dev/null && git rev-parse --short HEAD || echo unknown) (patched)"
+# (dathorse): Below is not a good way to make scripts, pointing to something that "works on my machine" isn't valid
+#echo "renderer: $(cd ~/forks/virglrenderer 2>/dev/null && git rev-parse --short HEAD || echo unknown) (patched)"
 echo
 
 # One physical core per guest, leaving core 0 for the host. Siblings pair as
@@ -68,8 +69,8 @@ JSON
     sleep 3
     echo "/mnt/nesprobe --cost $COST --seconds $SECS --warmup $WARMUP"
     sleep $((SECS + WARMUP + 12))
-  } | LD_LIBRARY_PATH=$RENDERER timeout $((SECS + WARMUP + 65)) \
-        script -qec "env RUST_LOG=warn ./target/release/nesbox $RUN/guest$i.json" /dev/null \
+  } | LD_LIBRARY_PATH=$VIRGLRENDERER timeout $((SECS + WARMUP + 65)) \
+        script -qec "env RUST_LOG=warn "$NESBOX" $RUN/guest$i.json" /dev/null \
         > "$RUN/guest$i.log" 2>&1 &
   sleep 1
 done
