@@ -294,7 +294,85 @@ failure worth recognising faster next time.
 
 ---
 
-## 9. Repeatable workflows
+## 9. Run all of it: `scripts/bench.sh`
+
+```sh
+scripts/bench.sh                 # everything, ~15 minutes, writes benchmarks/<host>.json
+scripts/bench.sh --only gpu
+scripts/bench.sh --list
+```
+
+No arguments required, and **committing the output is the point**: a committed
+result turns "it feels slower" into a diff, and makes re-measuring on new hardware
+an afternoon rather than a week.
+
+### What it is, and what it is not
+
+**It runs no measurement of its own.** Every number comes from a harness that
+already existed and can still be run by hand — `nesprobe`, `probe-sweep.sh`,
+`envelope.sh`. `bench.sh` runs them, attaches provenance, and writes JSON. If a new
+probe is needed, it belongs in its own harness first, where it can be run and
+argued with on its own.
+
+Four sections: `gpu` (one guest), `scaling` (1, 2 and 4 guests), `seccomp`
+(confined against unconfined), `envelope` (does a cgroup bound the guest).
+
+### Provenance is not optional
+
+`scripts/bench-provenance.sh` runs alone too. It records CPU model and governor,
+**energy-performance preference**, rated against observed clocks, `amd_pstate`
+mode, the GPU's PCI id and **DPM states**, **whether the machine is on mains or
+battery**, swap devices, the filesystem and device behind the disk image, and the
+commit of both nesbox and the renderer.
+
+Half of those fields exist because they invalidated a finding: the governor and
+the DPM states in §4, and the battery in §12.1. Every field degrades to `null`
+rather than failing, because this has to run on a machine nobody has seen yet.
+
+### What it says it did not measure
+
+Four gaps are named in the output rather than quietly omitted, because a results
+file people quote should say what is missing:
+
+| | Why |
+|---|---|
+| Network | No `iperf3` in the guest image. Adding one is *image* work, not benchmark work |
+| Random I/O | No `fio` in the guest image; only sequential `dd` through `envelope.sh` |
+| Boot time | Not implemented. It would be a new measurement rather than an orchestration |
+| Other hypervisors | None run — and this is exactly what a comparative claim would need |
+
+That last row is the one that matters commercially. **Nothing in this repository
+supports a claim of being faster than another hypervisor**, because the same
+workload has never been run under one.
+
+### The scaling section needs a long run, and this is why
+
+`probe-sweep.sh` starts its guests a second apart, and each boots for ~13 s before
+the probe starts. So a short run measures **different degrees of concurrency in
+each guest** and reports them side by side. Measured at `--seconds 6`, four guests
+gave per-guest p50s of 38.9, 37.5, 28.2 and 18.4 ms — the last guest spent most of
+its run alone on the card, and its number is a solo number wearing a co-tenancy
+label.
+
+At the default 20 s the guests overlap for most of the run and the spread closes.
+**If the per-guest figures in a `scaling` result differ by more than a few percent,
+suspect the run length before believing the card is unfair.**
+
+### Reading a result
+
+`completed` is the field to check first. A run that dies early still produces
+numbers, and they are the numbers of a partial run — everything else in the
+section is meaningless if it is `false`.
+
+`ratios`, not absolutes. §12.1's warning generalises: this reference host is a
+laptop on battery sustaining under half its rated clock, so a guest-to-host ratio
+is a property of the software and a millisecond figure is a property of the
+machine.
+
+### The individual workflows
+
+`bench.sh` orchestrates these. Each is still worth running by hand when chasing a
+specific question, which is why they remain separate.
 
 Prerequisites: `cargo build --release`; an `artifacts/` directory holding `vmlinux`,
 `rootfs.ext4` and `probe-share/nesprobe`; a patched virglrenderer built to a prefix.

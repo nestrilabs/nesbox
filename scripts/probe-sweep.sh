@@ -16,12 +16,17 @@ while getopts "n:c:s:m:w:h" o; do case $o in
   h) sed -n '2,12p' "$0"; exit 0;;
 esac; done
 
-ART=$PWD
+# Defaults assume the assembled-directory layout: run this from a directory
+# holding vmlinux, rootfs.ext4, probe-share/ and the nesbox binary, with a patched
+# virglrenderer installed system-wide. Overridable so a caller that keeps those
+# somewhere else -- bench.sh stages a directory of symlinks -- does not have to
+# copy the tree or install a library to run a sweep.
+ART=${NESBOX_ARTIFACTS:-$PWD}
 KERNEL=$ART/vmlinux
 ROOTFS=$ART/rootfs.ext4
 PROBE=$ART/probe-share
-VIRGLRENDERER=/usr/lib
-NESBOX=$ART/nesbox
+VIRGLRENDERER=${NESBOX_VIRGLRENDERER:-/usr/lib}
+NESBOX=${NESBOX_BIN:-$ART/nesbox}
 RUN=$(mktemp -d)
 trap 'rm -rf "$RUN"' EXIT
 
