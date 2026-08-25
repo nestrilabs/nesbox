@@ -1,0 +1,138 @@
+{
+  "schema": 1,
+  "disclaimer": "One host, one GPU, one synthetic workload. Ratios compare a guest to this same host and are the durable results; absolute figures are this machine's and not the hardware's. No comparison against another hypervisor was run, so nothing here supports a claim of being faster than one.",
+  "provenance": {
+    "host": "ns3",
+    "kernel": "7.1.8-1-cachyos",
+    "cpu": {
+      "model": "AMD Ryzen 5 7530U with Radeon Graphics",
+      "online": 12,
+      "governor": "powersave",
+      "energy_performance_preference": "balance_power",
+      "scaling_max_khz": 4547946,
+      "scaling_min_khz": 1095891,
+      "amd_pstate": "active"
+    },
+    "gpu": {
+      "render_node": "/dev/dri/renderD128",
+      "pci_id": "1002:15e7",
+      "driver": "amdgpu",
+      "dpm_sclk_mhz": "200Mhz 400Mhz 2000Mhz"
+    },
+    "power": {
+      "on_ac": false,
+      "battery_status": "Discharging",
+      "platform_profile": "balanced"
+    },
+    "memory": {
+      "total_kb": 14152216,
+      "swap_total_kb": 14151676,
+      "swap_devices": "/dev/zram0"
+    },
+    "storage": {
+      "artifacts_fs": "btrfs",
+      "artifacts_device": "nvme0n1"
+    },
+    "versions": {
+      "nesbox": "0285f7f",
+      "nesbox_dirty": true,
+      "virglrenderer": "7fcfce4",
+      "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
+    }
+  },
+  "not_measured": {
+    "network": "no iperf3 in the guest image; adding one is image work",
+    "storage_random_io": "no fio in the guest image; only sequential dd via envelope.sh",
+    "boot_time": "not implemented; would be a new measurement rather than an orchestration",
+    "other_hypervisors": "none run; this is what a comparative claim would need"
+  },
+  "results": {
+    "gpu": {
+      "cost": 400,
+      "seconds": 20,
+      "warmup_seconds": 8,
+      "completed": true,
+      "frames": 1184,
+      "fps": 98.64,
+      "frame_ms": {
+        "mean": 10.139,
+        "p50": 10.057,
+        "p99": 11.364,
+        "max": 11.745
+      }
+    },
+    "scaling": {
+      "completed": true,
+      "by_guest_count": {
+        "1": {
+          "completed": true,
+          "sum_fps": 98.13,
+          "p50_ms": [
+            10.076
+          ],
+          "p99_ms": [
+            11.562
+          ]
+        },
+        "2": {
+          "completed": true,
+          "sum_fps": 109.13,
+          "p50_ms": [
+            18.715,
+            18.688
+          ],
+          "p99_ms": [
+            20.444,
+            20.466
+          ]
+        },
+        "4": {
+          "completed": true,
+          "sum_fps": 118.3,
+          "p50_ms": [
+            37.718,
+            37.55,
+            37.368,
+            37.187
+          ],
+          "p99_ms": [
+            39.202,
+            39.092,
+            39.053,
+            39.054
+          ]
+        }
+      }
+    },
+    "seccomp": {
+      "off": {
+        "fps": 99.37,
+        "p50_ms": 10.041,
+        "p99_ms": 10.787
+      },
+      "enforce": {
+        "fps": 98.55,
+        "p50_ms": 10.098,
+        "p99_ms": 10.942
+      },
+      "completed": true,
+      "refusals": 0
+    },
+    "envelope": {
+      "io_mb_per_s": {
+        "uncapped_cold": 899,
+        "capped_20mb_cold": 54,
+        "capped_20mb_warm_host_cache": 1700
+      },
+      "note": "cpu and memory results are prose in envelope.sh output; see docs/BENCHMARKS.md 12"
+    }
+  },
+  "carried_from_earlier_run": [
+    "envelope",
+    "gpu",
+    "seccomp"
+  ],
+  "sections_run": [
+    "scaling"
+  ]
+}
