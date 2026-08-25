@@ -140,16 +140,51 @@ fn build(allowed: &[libc::c_long], mismatch: u32) -> Vec<SockFilter> {
     // Refuse anything that is not the architecture we compiled these numbers
     // for. Syscall numbers are per-ABI, so a 32-bit call arriving here would be
     // matched against the wrong table -- the classic seccomp bypass.
-    p.push(SockFilter { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_ARCH });
-    p.push(SockFilter { code: BPF_JMP_JEQ_K, jt: 1, jf: 0, k: AUDIT_ARCH_X86_64 });
-    p.push(SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: mismatch });
+    p.push(SockFilter {
+        code: BPF_LD_W_ABS,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_DATA_ARCH,
+    });
+    p.push(SockFilter {
+        code: BPF_JMP_JEQ_K,
+        jt: 1,
+        jf: 0,
+        k: AUDIT_ARCH_X86_64,
+    });
+    p.push(SockFilter {
+        code: BPF_RET_K,
+        jt: 0,
+        jf: 0,
+        k: mismatch,
+    });
 
-    p.push(SockFilter { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_NR });
+    p.push(SockFilter {
+        code: BPF_LD_W_ABS,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_DATA_NR,
+    });
     for &nr in allowed {
-        p.push(SockFilter { code: BPF_JMP_JEQ_K, jt: 0, jf: 1, k: nr as u32 });
-        p.push(SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW });
+        p.push(SockFilter {
+            code: BPF_JMP_JEQ_K,
+            jt: 0,
+            jf: 1,
+            k: nr as u32,
+        });
+        p.push(SockFilter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        });
     }
-    p.push(SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: mismatch });
+    p.push(SockFilter {
+        code: BPF_RET_K,
+        jt: 0,
+        jf: 0,
+        k: mismatch,
+    });
     p
 }
 
@@ -168,8 +203,15 @@ fn install(prog: &[SockFilter], all_threads: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    let fprog = SockFprog { len, filter: prog.as_ptr() };
-    let flags = if all_threads { SECCOMP_FILTER_FLAG_TSYNC } else { 0 };
+    let fprog = SockFprog {
+        len,
+        filter: prog.as_ptr(),
+    };
+    let flags = if all_threads {
+        SECCOMP_FILTER_FLAG_TSYNC
+    } else {
+        0
+    };
 
     // SAFETY: `fprog` points at `prog`, which outlives this call, and `len`
     // matches its length. The kernel copies the program.
@@ -268,13 +310,25 @@ fn baseline() -> Vec<libc::c_long> {
     let mut v = vec![
         // Process and thread lifetime. `clone` is needed because device workers
         // and the metrics thread start after this filter is installed.
-        libc::SYS_clone, libc::SYS_clone3, libc::SYS_exit, libc::SYS_exit_group,
-        libc::SYS_futex, libc::SYS_set_robust_list, libc::SYS_rseq,
-        libc::SYS_gettid, libc::SYS_getpid, libc::SYS_sched_yield,
-        libc::SYS_membarrier, libc::SYS_restart_syscall,
+        libc::SYS_clone,
+        libc::SYS_clone3,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        libc::SYS_futex,
+        libc::SYS_set_robust_list,
+        libc::SYS_rseq,
+        libc::SYS_gettid,
+        libc::SYS_getpid,
+        libc::SYS_sched_yield,
+        libc::SYS_membarrier,
+        libc::SYS_restart_syscall,
         // Signals.
-        libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask, libc::SYS_rt_sigreturn,
-        libc::SYS_sigaltstack, libc::SYS_tgkill, libc::SYS_kill,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+        libc::SYS_tgkill,
+        libc::SYS_kill,
         // Reaping virtiofsd. `Virtiofsd::drop` kills each daemon and waits for
         // it, and that happens on the way out -- long after this filter is
         // installed. Without it every clean shutdown of a VM with a shared
@@ -284,54 +338,116 @@ fn baseline() -> Vec<libc::c_long> {
         // every ordinary teardown. `Child::wait` reaches `wait4`, not `waitid`.
         libc::SYS_wait4,
         // Memory. Guest RAM, the BAR2 window and every Mesa allocation.
-        libc::SYS_mmap, libc::SYS_munmap, libc::SYS_mremap, libc::SYS_mprotect,
-        libc::SYS_madvise, libc::SYS_brk, libc::SYS_mincore, libc::SYS_msync,
-        libc::SYS_memfd_create, libc::SYS_ftruncate, libc::SYS_fallocate,
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_mremap,
+        libc::SYS_mprotect,
+        libc::SYS_madvise,
+        libc::SYS_brk,
+        libc::SYS_mincore,
+        libc::SYS_msync,
+        libc::SYS_memfd_create,
+        libc::SYS_ftruncate,
+        libc::SYS_fallocate,
         // Descriptors.
-        libc::SYS_close, libc::SYS_dup, libc::SYS_dup2, libc::SYS_dup3,
-        libc::SYS_fcntl, libc::SYS_lseek, libc::SYS_pipe2, libc::SYS_flock,
+        libc::SYS_close,
+        libc::SYS_dup,
+        libc::SYS_dup2,
+        libc::SYS_dup3,
+        libc::SYS_fcntl,
+        libc::SYS_lseek,
+        libc::SYS_pipe2,
+        libc::SYS_flock,
         // I/O. Disk images, the console, the guest's virtio queues.
-        libc::SYS_read, libc::SYS_write, libc::SYS_readv, libc::SYS_writev,
-        libc::SYS_pread64, libc::SYS_pwrite64, libc::SYS_fsync, libc::SYS_fdatasync,
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_fsync,
+        libc::SYS_fdatasync,
         // Waiting.
-        libc::SYS_epoll_create1, libc::SYS_epoll_ctl, libc::SYS_epoll_wait,
-        libc::SYS_epoll_pwait, libc::SYS_ppoll, libc::SYS_poll,
-        libc::SYS_eventfd2, libc::SYS_timerfd_create, libc::SYS_timerfd_settime,
-        libc::SYS_nanosleep, libc::SYS_clock_nanosleep,
+        libc::SYS_epoll_create1,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_wait,
+        libc::SYS_epoll_pwait,
+        libc::SYS_ppoll,
+        libc::SYS_poll,
+        libc::SYS_eventfd2,
+        libc::SYS_timerfd_create,
+        libc::SYS_timerfd_settime,
+        libc::SYS_nanosleep,
+        libc::SYS_clock_nanosleep,
         // The one that matters most, and the one we cannot yet constrain: KVM,
         // DRM, DMA-BUF and every virtio queue notification arrive as ioctl.
         libc::SYS_ioctl,
         // Paths. The DRM render node, /proc/self/fdinfo for occupancy, Mesa's
         // shader cache, the disk image. Opening is allowed; note that this is
         // exactly what the vCPU filter below takes away.
-        libc::SYS_openat, libc::SYS_open, libc::SYS_statx, libc::SYS_newfstatat,
-        libc::SYS_fstat, libc::SYS_stat, libc::SYS_lstat, libc::SYS_fstatfs,
-        libc::SYS_getdents64, libc::SYS_readlink, libc::SYS_readlinkat,
-        libc::SYS_access, libc::SYS_getcwd, libc::SYS_unlink, libc::SYS_unlinkat,
-        libc::SYS_rename, libc::SYS_mkdir, libc::SYS_fchmod, libc::SYS_fchmodat,
+        libc::SYS_openat,
+        libc::SYS_open,
+        libc::SYS_statx,
+        libc::SYS_newfstatat,
+        libc::SYS_fstat,
+        libc::SYS_stat,
+        libc::SYS_lstat,
+        libc::SYS_fstatfs,
+        libc::SYS_getdents64,
+        libc::SYS_readlink,
+        libc::SYS_readlinkat,
+        libc::SYS_access,
+        libc::SYS_getcwd,
+        libc::SYS_unlink,
+        libc::SYS_unlinkat,
+        libc::SYS_rename,
+        libc::SYS_mkdir,
+        libc::SYS_fchmod,
+        libc::SYS_fchmodat,
         // Removing the per-VM runtime directory at shutdown. `std::fs::remove_dir`
         // reaches `rmdir`, not `unlinkat(AT_REMOVEDIR)`, so having the latter is
         // not enough -- found by running the teardown under `audit`, which named
         // syscall 84 rather than leaving a bare SIGSYS to guess at.
         libc::SYS_rmdir,
         // Mesa's shader cache watches its directory.
-        libc::SYS_inotify_init1, libc::SYS_inotify_add_watch, libc::SYS_inotify_rm_watch,
+        libc::SYS_inotify_init1,
+        libc::SYS_inotify_add_watch,
+        libc::SYS_inotify_rm_watch,
         // The metrics socket, and Mesa talking to a compositor.
-        libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind,
-        libc::SYS_listen, libc::SYS_accept4, libc::SYS_getsockopt,
-        libc::SYS_setsockopt, libc::SYS_sendmsg, libc::SYS_recvmsg,
-        libc::SYS_sendto, libc::SYS_recvfrom, libc::SYS_shutdown,
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_connect,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept4,
+        libc::SYS_getsockopt,
+        libc::SYS_setsockopt,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
+        libc::SYS_shutdown,
         // Time and identity.
-        libc::SYS_clock_gettime, libc::SYS_gettimeofday, libc::SYS_getrandom,
-        libc::SYS_uname, libc::SYS_sysinfo,
-        libc::SYS_getuid, libc::SYS_geteuid, libc::SYS_getgid, libc::SYS_getegid,
+        libc::SYS_clock_gettime,
+        libc::SYS_gettimeofday,
+        libc::SYS_getrandom,
+        libc::SYS_uname,
+        libc::SYS_sysinfo,
+        libc::SYS_getuid,
+        libc::SYS_geteuid,
+        libc::SYS_getgid,
+        libc::SYS_getegid,
         // Placement. vCPU pinning, and -- specifically on AMD, per crosvm --
         // Mesa's own scheduling calls.
-        libc::SYS_sched_getaffinity, libc::SYS_sched_setaffinity,
-        libc::SYS_sched_setscheduler, libc::SYS_setpriority, libc::SYS_kcmp,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_sched_setaffinity,
+        libc::SYS_sched_setscheduler,
+        libc::SYS_setpriority,
+        libc::SYS_kcmp,
         // prctl is needed for PR_SET_NAME on our own threads. Unconstrained for
         // now, which is one of the arguments this filter should grow.
-        libc::SYS_prctl, libc::SYS_arch_prctl,
+        libc::SYS_prctl,
+        libc::SYS_arch_prctl,
         // Allowing `seccomp` looks wrong in a hardening policy and is not.
         // Filters are **monotonic**: a thread can add one, and every filter on a
         // thread must allow a syscall for it to proceed, so an added filter can
@@ -360,23 +476,49 @@ fn baseline() -> Vec<libc::c_long> {
 fn vcpu() -> Vec<libc::c_long> {
     let mut v = vec![
         libc::SYS_ioctl,
-        libc::SYS_read, libc::SYS_write, libc::SYS_readv, libc::SYS_writev,
-        libc::SYS_pread64, libc::SYS_pwrite64,
-        libc::SYS_futex, libc::SYS_sched_yield, libc::SYS_membarrier,
-        libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask, libc::SYS_rt_sigreturn,
-        libc::SYS_sigaltstack, libc::SYS_tgkill, libc::SYS_gettid,
-        libc::SYS_mmap, libc::SYS_munmap, libc::SYS_mprotect, libc::SYS_madvise,
-        libc::SYS_brk, libc::SYS_mremap,
-        libc::SYS_close, libc::SYS_fcntl, libc::SYS_eventfd2,
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_futex,
+        libc::SYS_sched_yield,
+        libc::SYS_membarrier,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+        libc::SYS_tgkill,
+        libc::SYS_gettid,
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_mprotect,
+        libc::SYS_madvise,
+        libc::SYS_brk,
+        libc::SYS_mremap,
+        libc::SYS_close,
+        libc::SYS_fcntl,
+        libc::SYS_eventfd2,
         // Firecracker's vcpu filter carries these too: a vCPU servicing an MMIO
         // write can end up notifying a device backend over a socket.
-        libc::SYS_sendmsg, libc::SYS_recvmsg,
-        libc::SYS_epoll_ctl, libc::SYS_epoll_pwait, libc::SYS_epoll_wait,
-        libc::SYS_ppoll, libc::SYS_poll,
-        libc::SYS_clock_gettime, libc::SYS_clock_nanosleep, libc::SYS_nanosleep,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_pwait,
+        libc::SYS_epoll_wait,
+        libc::SYS_ppoll,
+        libc::SYS_poll,
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_nanosleep,
         libc::SYS_timerfd_settime,
-        libc::SYS_exit, libc::SYS_exit_group, libc::SYS_restart_syscall,
-        libc::SYS_rseq, libc::SYS_set_robust_list, libc::SYS_sched_setaffinity,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        libc::SYS_restart_syscall,
+        libc::SYS_rseq,
+        libc::SYS_set_robust_list,
+        libc::SYS_sched_setaffinity,
         libc::SYS_prctl,
     ];
     v.sort_unstable();
@@ -460,7 +602,10 @@ mod tests {
         // denies is dead weight and a lie about what a vCPU can do.
         let base = baseline();
         for nr in vcpu() {
-            assert!(base.contains(&nr), "vcpu allows {nr} which the baseline denies");
+            assert!(
+                base.contains(&nr),
+                "vcpu allows {nr} which the baseline denies"
+            );
         }
     }
 
@@ -470,8 +615,13 @@ mod tests {
         // work onto the vCPU thread that does not belong there.
         let v = vcpu();
         for nr in [
-            libc::SYS_openat, libc::SYS_open, libc::SYS_socket, libc::SYS_connect,
-            libc::SYS_clone, libc::SYS_execve, libc::SYS_getdents64,
+            libc::SYS_openat,
+            libc::SYS_open,
+            libc::SYS_socket,
+            libc::SYS_connect,
+            libc::SYS_clone,
+            libc::SYS_execve,
+            libc::SYS_getdents64,
         ] {
             assert!(!v.contains(&nr), "vcpu should not allow {nr}");
         }
@@ -481,12 +631,24 @@ mod tests {
     fn nothing_that_reconfigures_the_host_is_allowed_anywhere() {
         let base = baseline();
         for nr in [
-            libc::SYS_execve, libc::SYS_execveat, libc::SYS_ptrace, libc::SYS_mount,
-            libc::SYS_umount2, libc::SYS_bpf, libc::SYS_kexec_load,
-            libc::SYS_init_module, libc::SYS_finit_module, libc::SYS_delete_module,
-            libc::SYS_pivot_root, libc::SYS_chroot, libc::SYS_setuid,
-            libc::SYS_setgid, libc::SYS_reboot, libc::SYS_swapon,
-            libc::SYS_process_vm_readv, libc::SYS_process_vm_writev,
+            libc::SYS_execve,
+            libc::SYS_execveat,
+            libc::SYS_ptrace,
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_bpf,
+            libc::SYS_kexec_load,
+            libc::SYS_init_module,
+            libc::SYS_finit_module,
+            libc::SYS_delete_module,
+            libc::SYS_pivot_root,
+            libc::SYS_chroot,
+            libc::SYS_setuid,
+            libc::SYS_setgid,
+            libc::SYS_reboot,
+            libc::SYS_swapon,
+            libc::SYS_process_vm_readv,
+            libc::SYS_process_vm_writev,
             libc::SYS_userfaultfd,
         ] {
             assert!(!base.contains(&nr), "baseline must not allow {nr}");

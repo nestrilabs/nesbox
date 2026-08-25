@@ -152,7 +152,10 @@ mod tests {
         let json = StatsSource::new(None).snapshot_json();
         assert!(json.contains("\"gpu\":null"), "{json}");
         assert!(json.contains("\"schema\":1"));
-        assert!(json.ends_with('\n'), "a reader should be able to read a line");
+        assert!(
+            json.ends_with('\n'),
+            "a reader should be able to read a line"
+        );
     }
 
     #[test]

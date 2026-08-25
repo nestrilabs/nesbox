@@ -62,17 +62,18 @@ impl IfReq {
     fn new(name: &str) -> Result<Self> {
         // The kernel needs room for a terminating NUL.
         if name.len() >= IFNAMSIZ {
-            bail!("interface name {name:?} is too long, max {} bytes", IFNAMSIZ - 1);
+            bail!(
+                "interface name {name:?} is too long, max {} bytes",
+                IFNAMSIZ - 1
+            );
         }
-        let mut req = Self { name: [0; IFNAMSIZ], payload: [0; 3] };
+        let mut req = Self {
+            name: [0; IFNAMSIZ],
+            payload: [0; 3],
+        };
         req.name[..name.len()].copy_from_slice(name.as_bytes());
         Ok(req)
     }
-
-
-
-
-
 }
 
 /// A tap interface. Dropping this destroys the interface.
@@ -173,7 +174,8 @@ impl Tap {
     /// Enable the offloads the guest said it can cope with.
     pub fn set_offload(&self, flags: u32) -> Result<()> {
         // SAFETY: the fd is open; TUNSETOFFLOAD takes the value directly.
-        let ret = unsafe { libc::ioctl(self.file.as_raw_fd(), TUNSETOFFLOAD, flags as libc::c_ulong) };
+        let ret =
+            unsafe { libc::ioctl(self.file.as_raw_fd(), TUNSETOFFLOAD, flags as libc::c_ulong) };
         if ret < 0 {
             return Err(std::io::Error::last_os_error()).context("TUNSETOFFLOAD");
         }
@@ -186,4 +188,3 @@ impl AsRawFd for Tap {
         self.file.as_raw_fd()
     }
 }
-

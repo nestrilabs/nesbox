@@ -12,8 +12,8 @@ pub mod power;
 pub mod regs;
 pub mod renderer;
 pub mod seccomp;
-pub mod stats;
 pub mod serial;
+pub mod stats;
 pub mod virtiofsd;
 pub mod vm;
 

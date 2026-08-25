@@ -56,29 +56,48 @@ impl BlkInner {
 
     /// Serve everything the guest has made available, then interrupt it once.
     fn process(&mut self) {
-        let mem = match self.mem.clone() { Some(m) => m, None => return };
-        if !self.q.enabled || self.q.desc == 0 { return; }
+        let mem = match self.mem.clone() {
+            Some(m) => m,
+            None => return,
+        };
+        if !self.q.enabled || self.q.desc == 0 {
+            return;
+        }
         let mut served = 0usize;
         loop {
-            let Some((head, descs)) = pop_avail(&mem, &mut self.q) else { break };
+            let Some((head, descs)) = pop_avail(&mem, &mut self.q) else {
+                break;
+            };
             let n = self.do_request(&mem, head, &descs);
             push_used(&mem, &self.q, head, n);
             served += 1;
         }
         // An empty ring means the kick raced a batch we already drained.
         // Interrupting anyway would be a spurious wakeup for the guest.
-        if served == 0 { return; }
+        if served == 0 {
+            return;
+        }
         self.isr |= 1;
         let vec = self.q.vec;
         self.msix.trigger(vec);
     }
 
     fn do_request(&mut self, mem: &GuestMemoryMmap, _head: u16, descs: &[(u64, u32, u16)]) -> u32 {
-        if descs.len() < 2 { return 0; }
+        if descs.len() < 2 {
+            return 0;
+        }
         let (ha, hl, _) = descs[0];
-        if hl < 16 { return 0; }
-        let t: u32 = match mem.read_obj(vm_memory::GuestAddress(ha)) { Ok(v) => u32::from_le(v), Err(_) => return 0 };
-        let sec: u64 = match mem.read_obj(vm_memory::GuestAddress(ha + 8)) { Ok(v) => u64::from_le(v), Err(_) => return 0 };
+        if hl < 16 {
+            return 0;
+        }
+        let t: u32 = match mem.read_obj(vm_memory::GuestAddress(ha)) {
+            Ok(v) => u32::from_le(v),
+            Err(_) => return 0,
+        };
+        let sec: u64 = match mem.read_obj(vm_memory::GuestAddress(ha + 8)) {
+            Ok(v) => u64::from_le(v),
+            Err(_) => return 0,
+        };
         let (sa, _, _) = *descs.last().unwrap();
         let dd = &descs[1..descs.len() - 1];
         let st = self.io(mem, t, sec, dd);
@@ -89,21 +108,41 @@ impl BlkInner {
     fn io(&mut self, mem: &GuestMemoryMmap, t: u32, sec: u64, dd: &[(u64, u32, u16)]) -> u8 {
         match t {
             BLK_T_IN => {
-                if self.file.seek(SeekFrom::Start(sec * SECTOR_SIZE)).is_err() { return BLK_S_IOERR; }
+                if self.file.seek(SeekFrom::Start(sec * SECTOR_SIZE)).is_err() {
+                    return BLK_S_IOERR;
+                }
                 for &(addr, len, _) in dd {
                     let mut buf = vec![0u8; len as usize];
-                    if self.file.read_exact(&mut buf).is_err() { return BLK_S_IOERR; }
-                    if mem.write_slice(&buf, vm_memory::GuestAddress(addr)).is_err() { return BLK_S_IOERR; }
+                    if self.file.read_exact(&mut buf).is_err() {
+                        return BLK_S_IOERR;
+                    }
+                    if mem
+                        .write_slice(&buf, vm_memory::GuestAddress(addr))
+                        .is_err()
+                    {
+                        return BLK_S_IOERR;
+                    }
                 }
                 BLK_S_OK
             }
             BLK_T_OUT => {
-                if self.read_only { return BLK_S_IOERR; }
-                if self.file.seek(SeekFrom::Start(sec * SECTOR_SIZE)).is_err() { return BLK_S_IOERR; }
+                if self.read_only {
+                    return BLK_S_IOERR;
+                }
+                if self.file.seek(SeekFrom::Start(sec * SECTOR_SIZE)).is_err() {
+                    return BLK_S_IOERR;
+                }
                 for &(addr, len, _) in dd {
                     let mut buf = vec![0u8; len as usize];
-                    if mem.read_slice(&mut buf, vm_memory::GuestAddress(addr)).is_err() { return BLK_S_IOERR; }
-                    if self.file.write_all(&buf).is_err() { return BLK_S_IOERR; }
+                    if mem
+                        .read_slice(&mut buf, vm_memory::GuestAddress(addr))
+                        .is_err()
+                    {
+                        return BLK_S_IOERR;
+                    }
+                    if self.file.write_all(&buf).is_err() {
+                        return BLK_S_IOERR;
+                    }
                 }
                 BLK_S_OK
             }
@@ -153,15 +192,36 @@ pub struct BlkDevice {
 
 impl BlkDevice {
     pub fn new(path: &std::path::Path, read_only: bool) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(!read_only).open(path)
+        let file = OpenOptions::new()
+            .read(true)
+            .write(!read_only)
+            .open(path)
             .with_context(|| format!("Failed to open block device: {:?}", path))?;
-        let disk_sectors = file.metadata().context("Failed to stat disk image")?.len() / SECTOR_SIZE;
-        log::info!("virtio-blk: {:?}  {} sectors  read_only={}", path, disk_sectors, read_only);
+        let disk_sectors =
+            file.metadata().context("Failed to stat disk image")?.len() / SECTOR_SIZE;
+        log::info!(
+            "virtio-blk: {:?}  {} sectors  read_only={}",
+            path,
+            disk_sectors,
+            read_only
+        );
         let (cfg, msix_cap) = Self::build_pci_config();
         let inner = Arc::new(Mutex::new(BlkInner {
-            file, read_only, disk_sectors, com: ComCfg::default(), qs: 0,
-            q: QState { size: QUEUE_SIZE, ..Default::default() }, isr: 0,
-            cfg_vec: VIRTQ_MSI_NO_VECTOR, mem: None, msix: MsixTable::default(), cfg, msix_cap,
+            file,
+            read_only,
+            disk_sectors,
+            com: ComCfg::default(),
+            qs: 0,
+            q: QState {
+                size: QUEUE_SIZE,
+                ..Default::default()
+            },
+            isr: 0,
+            cfg_vec: VIRTQ_MSI_NO_VECTOR,
+            mem: None,
+            msix: MsixTable::default(),
+            cfg,
+            msix_cap,
         }));
         let kick = Arc::new(EventFd::new(0).context("failed to create the blk kick eventfd")?);
         let stop = Arc::new(AtomicBool::new(false));
@@ -176,20 +236,34 @@ impl BlkDevice {
                     // Blocks here until the guest kicks, so an idle disk costs
                     // nothing.
                     while kick.read().is_ok() {
-                        if stop.load(Ordering::Acquire) { break; }
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
                         inner.lock().unwrap().process();
                     }
                 })
                 .context("failed to start the virtio-blk worker")?
         };
 
-        Ok(Self { inner, kick, stop, worker: Mutex::new(Some(worker)) })
+        Ok(Self {
+            inner,
+            kick,
+            stop,
+            worker: Mutex::new(Some(worker)),
+        })
     }
-    pub fn set_mem(&self, m: Arc<GuestMemoryMmap>) { self.inner.lock().unwrap().mem = Some(m); }
+    pub fn set_mem(&self, m: Arc<GuestMemoryMmap>) {
+        self.inner.lock().unwrap().mem = Some(m);
+    }
 
     /// Attach the host interrupt resources: one MSI-X vector per table entry
     /// and the legacy INTx line used before the guest enables MSI-X.
-    pub fn bind_interrupts(&self, vectors: Vec<MsiVector>, router: Arc<dyn MsiRouter>, intx: Arc<EventFd>) {
+    pub fn bind_interrupts(
+        &self,
+        vectors: Vec<MsiVector>,
+        router: Arc<dyn MsiRouter>,
+        intx: Arc<EventFd>,
+    ) {
         self.inner.lock().unwrap().msix.bind(vectors, router, intx);
     }
 
@@ -202,16 +276,32 @@ impl BlkDevice {
         cfg.add_virtio_notify_cap(0, OFF_NOTIFY as u32, 0x100, NOTIFY_MULT);
         cfg.add_virtio_cap(3, 0, OFF_ISR as u32, 1);
         cfg.add_virtio_cap(4, 0, OFF_DEVICE as u32, 0x3C);
-        let msix_cap = cfg.add_msix_cap(MSIX_VECTORS - 1, OFF_MSIX_TABLE as u32, OFF_MSIX_PBA as u32);
+        let msix_cap =
+            cfg.add_msix_cap(MSIX_VECTORS - 1, OFF_MSIX_TABLE as u32, OFF_MSIX_PBA as u32);
         cfg.add_pcie_cap(PCIE_TYPE_RC_INTEGRATED);
         (cfg.build(), msix_cap)
     }
 
     fn com_read(&self, off: u64, d: &mut [u8]) {
         let i = self.inner.lock().unwrap();
-        let v = com_read(&i.com, off, i.features(), 1, i.cfg_vec as u64,
-            i.qs as u64, i.q.size as u64, i.q.vec as u64, i.q.enabled as u64, 0,
-            i.q.desc & 0xFFFF_FFFF, i.q.desc >> 32, i.q.avail & 0xFFFF_FFFF, i.q.avail >> 32, i.q.used & 0xFFFF_FFFF, i.q.used >> 32);
+        let v = com_read(
+            &i.com,
+            off,
+            i.features(),
+            1,
+            i.cfg_vec as u64,
+            i.qs as u64,
+            i.q.size as u64,
+            i.q.vec as u64,
+            i.q.enabled as u64,
+            0,
+            i.q.desc & 0xFFFF_FFFF,
+            i.q.desc >> 32,
+            i.q.avail & 0xFFFF_FFFF,
+            i.q.avail >> 32,
+            i.q.used & 0xFFFF_FFFF,
+            i.q.used >> 32,
+        );
         write_val(d, v);
     }
 
@@ -221,48 +311,89 @@ impl BlkDevice {
         match off {
             CFG_DEVICE_FEAT_SEL => i.com.dfs = v3,
             CFG_DRIVER_FEAT_SEL => i.com.dff = v3,
-            CFG_DRIVER_FEAT => if i.com.dff == 0 { i.com.df = (i.com.df & 0xFFFF_FFFF_0000_0000) | (v3 as u64) } else { i.com.df = (i.com.df & 0xFFFF_FFFF) | ((v3 as u64) << 32) },
+            CFG_DRIVER_FEAT => {
+                if i.com.dff == 0 {
+                    i.com.df = (i.com.df & 0xFFFF_FFFF_0000_0000) | (v3 as u64)
+                } else {
+                    i.com.df = (i.com.df & 0xFFFF_FFFF) | ((v3 as u64) << 32)
+                }
+            }
             CFG_MSIX_CONFIG => i.cfg_vec = v2,
-            CFG_STATUS => { let old = i.com.st; i.com.st = v1; if old & 4 == 0 && v1 & STATUS_DRIVER_OK != 0 { log::info!("virtio-blk: Driver OK"); } },
+            CFG_STATUS => {
+                let old = i.com.st;
+                i.com.st = v1;
+                if old & 4 == 0 && v1 & STATUS_DRIVER_OK != 0 {
+                    log::info!("virtio-blk: Driver OK");
+                }
+            }
             CFG_QUEUE_SEL => i.qs = v2,
-            CFG_QUEUE_SIZE => if i.qs == 0 { set_queue_size(&mut i.q, v2, QUEUE_SIZE) },
+            CFG_QUEUE_SIZE => {
+                if i.qs == 0 {
+                    set_queue_size(&mut i.q, v2, QUEUE_SIZE)
+                }
+            }
             CFG_QUEUE_MSIX => i.q.vec = v2,
-            CFG_QUEUE_ENABLE => if i.qs == 0 { i.q.enabled = v2 != 0; },
+            CFG_QUEUE_ENABLE => {
+                if i.qs == 0 {
+                    i.q.enabled = v2 != 0;
+                }
+            }
             _ => write_queue_addr(&mut i.q, off, v3),
         }
     }
 
     fn bar0_read(&self, o: u64, d: &mut [u8]) {
-        if o < OFF_ISR { self.com_read(o - OFF_COMMON, d); }
-        else if o < OFF_DEVICE { let mut i = self.inner.lock().unwrap(); if !d.is_empty() { d[0] = i.isr; i.isr = 0; } }
-        else if o < OFF_NOTIFY {
+        if o < OFF_ISR {
+            self.com_read(o - OFF_COMMON, d);
+        } else if o < OFF_DEVICE {
+            let mut i = self.inner.lock().unwrap();
+            if !d.is_empty() {
+                d[0] = i.isr;
+                i.isr = 0;
+            }
+        } else if o < OFF_NOTIFY {
             let i = self.inner.lock().unwrap();
             let mut dd = [0u8; 56];
             dd[0..8].copy_from_slice(&i.disk_sectors.to_le_bytes());
             let seg_max = (QUEUE_SIZE as u32).saturating_sub(2);
             dd[12..16].copy_from_slice(&seg_max.to_le_bytes());
             dd[20..24].copy_from_slice(&(SECTOR_SIZE as u32).to_le_bytes());
-            let s = (o - OFF_DEVICE) as usize; let e = (s + d.len()).min(56);
-            if s < 56 { d[..e-s].copy_from_slice(&dd[s..e]); d[e-s..].fill(0); } else { d.fill(0); }
+            let s = (o - OFF_DEVICE) as usize;
+            let e = (s + d.len()).min(56);
+            if s < 56 {
+                d[..e - s].copy_from_slice(&dd[s..e]);
+                d[e - s..].fill(0);
+            } else {
+                d.fill(0);
+            }
+        } else if o < OFF_MSIX_TABLE {
+            d.fill(0);
+        } else if o < OFF_MSIX_PBA {
+            self.inner.lock().unwrap().msix.read(o - OFF_MSIX_TABLE, d);
+        } else if o < BAR0_SIZE {
+            self.inner
+                .lock()
+                .unwrap()
+                .msix
+                .read_pba(o - OFF_MSIX_PBA, d);
+        } else {
+            d.fill(0);
         }
-        else if o < OFF_MSIX_TABLE { d.fill(0); }
-        else if o < OFF_MSIX_PBA { self.inner.lock().unwrap().msix.read(o - OFF_MSIX_TABLE, d); }
-        else if o < BAR0_SIZE { self.inner.lock().unwrap().msix.read_pba(o - OFF_MSIX_PBA, d); }
-        else { d.fill(0); }
     }
 
     fn bar0_write(&self, o: u64, d: &[u8]) {
-        if o < OFF_ISR { self.com_write(o - OFF_COMMON, d); }
-        else if o < OFF_DEVICE {}
-        else if o < OFF_NOTIFY {}
-        else if o < OFF_MSIX_TABLE {
+        if o < OFF_ISR {
+            self.com_write(o - OFF_COMMON, d);
+        } else if o < OFF_DEVICE {
+        } else if o < OFF_NOTIFY {
+        } else if o < OFF_MSIX_TABLE {
             // Hand the work to the worker and return to the guest at once.
             let _ = self.kick.write(1);
-        }
-        else if o < OFF_MSIX_PBA {
+        } else if o < OFF_MSIX_PBA {
             let mut i = self.inner.lock().unwrap();
             if i.msix.write(o - OFF_MSIX_TABLE, d) {
-                i.msix.trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
+                i.msix
+                    .trigger_unmasked(((o - OFF_MSIX_TABLE) / 16) as usize);
             }
         }
     }
@@ -290,7 +421,23 @@ impl PciDevice for BlkDevice {
         write_msix_control(&mut i.cfg, cap, o, d);
         i.msix.enabled = msix_enabled(&i.cfg, cap);
     }
-    fn read_bar(&self, bi: usize, o: u64, d: &mut [u8]) -> bool { if bi == 0 { self.bar0_read(o, d); true } else { false } }
-    fn write_bar(&self, bi: usize, o: u64, d: &[u8]) -> bool { if bi == 0 { self.bar0_write(o, d); true } else { false } }
-    fn bar_size(&self, bi: usize) -> u64 { if bi == 0 { BAR0_SIZE } else { 0 } }
+    fn read_bar(&self, bi: usize, o: u64, d: &mut [u8]) -> bool {
+        if bi == 0 {
+            self.bar0_read(o, d);
+            true
+        } else {
+            false
+        }
+    }
+    fn write_bar(&self, bi: usize, o: u64, d: &[u8]) -> bool {
+        if bi == 0 {
+            self.bar0_write(o, d);
+            true
+        } else {
+            false
+        }
+    }
+    fn bar_size(&self, bi: usize) -> u64 {
+        if bi == 0 { BAR0_SIZE } else { 0 }
+    }
 }

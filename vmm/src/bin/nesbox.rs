@@ -5,13 +5,13 @@ use nesbox_vmm::{acpi_slot_gsi, config, interrupt::IrqManager, virtiofsd::Virtio
 use anyhow::{Context, Result};
 use env_logger::Env;
 use log::info;
+use nesbox_vmm::memslot::MemorySlots;
 use pci::Bus;
 use std::io::stdin;
 use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
 use termios::*;
-use nesbox_vmm::memslot::MemorySlots;
 use virtio_devices::gpu::display::DisplayInfo;
 use virtio_devices::{
     BlkDevice, ConsoleDevice, FsDevice, GpuConfig, GpuDevice, NetConfig, NetDevice, VsockDevice,
@@ -135,23 +135,33 @@ fn main() -> Result<()> {
     let blk_intx = irq.legacy_irqfd(acpi_slot_gsi(1)).context("blk INTx")?;
     blk_device.bind_interrupts(blk_vectors, irq.clone(), blk_intx);
     let blk_bdf = pci_bus.add_device(blk_device)?;
-    info!("virtio-blk at {:02x}:{:02x}.{}", blk_bdf.0, blk_bdf.1, blk_bdf.2);
+    info!(
+        "virtio-blk at {:02x}:{:02x}.{}",
+        blk_bdf.0, blk_bdf.1, blk_bdf.2
+    );
 
     // ── Console device ────────────────────────────────────────────────────
     let console_device = ConsoleDevice::new();
     console_device.set_mem(vm.mem.clone());
-    let con_vectors = irq.allocate_msi_vectors(4).context("console MSI-X vectors")?;
+    let con_vectors = irq
+        .allocate_msi_vectors(4)
+        .context("console MSI-X vectors")?;
     let con_intx = irq.legacy_irqfd(acpi_slot_gsi(2)).context("console INTx")?;
     console_device.bind_interrupts(con_vectors, irq.clone(), con_intx);
     let con_bdf = pci_bus.add_device(console_device)?;
-    info!("virtio-console at {:02x}:{:02x}.{}", con_bdf.0, con_bdf.1, con_bdf.2);
+    info!(
+        "virtio-console at {:02x}:{:02x}.{}",
+        con_bdf.0, con_bdf.1, con_bdf.2
+    );
 
     // ── Vsock device (optional) ───────────────────────────────────────────
     if let Some(vsock_cfg) = &config.vsock {
         let vsock_device = VsockDevice::new(vsock_cfg.guest_cid, vm.mem.clone())?;
         let vsock_vectors = irq.allocate_msi_vectors(4).context("vsock MSI-X vectors")?;
         let slot = 3;
-        let vsock_intx = irq.legacy_irqfd(acpi_slot_gsi(slot)).context("vsock INTx")?;
+        let vsock_intx = irq
+            .legacy_irqfd(acpi_slot_gsi(slot))
+            .context("vsock INTx")?;
         vsock_device.bind_interrupts(vsock_vectors, irq.clone(), vsock_intx);
         let bdf = pci_bus.add_device(vsock_device)?;
         info!("virtio-vsock at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
@@ -198,9 +208,7 @@ fn main() -> Result<()> {
                 render_node: gpu_cfg.render_node.clone(),
                 displays: vec![DisplayInfo::new(gpu_cfg.width, gpu_cfg.height)],
                 vram_limit_bytes: gpu_cfg.vram_limit_mib.map(|m| m * (1 << 20)),
-                window_limit_bytes: gpu_cfg
-                    .host_visible_window_mib
-                    .map_or(0, |m| m * (1 << 20)),
+                window_limit_bytes: gpu_cfg.host_visible_window_mib.map_or(0, |m| m * (1 << 20)),
                 window_max_mappings: gpu_cfg.host_visible_max_mappings.unwrap_or(0),
             },
             vm.mem.clone(),
@@ -254,9 +262,13 @@ fn main() -> Result<()> {
             &runtime_dir,
         )?;
         let fs_device = FsDevice::new(&shared.tag, daemon.socket_path(), vm.mem.clone())?;
-        let vectors = irq.allocate_msi_vectors(4).context("virtio-fs MSI-X vectors")?;
+        let vectors = irq
+            .allocate_msi_vectors(4)
+            .context("virtio-fs MSI-X vectors")?;
         let slot = first_fs_slot + fs_daemons.len() as u32;
-        let intx = irq.legacy_irqfd(acpi_slot_gsi(slot)).context("virtio-fs INTx")?;
+        let intx = irq
+            .legacy_irqfd(acpi_slot_gsi(slot))
+            .context("virtio-fs INTx")?;
         fs_device.bind_interrupts(vectors, irq.clone(), intx);
         let bdf = pci_bus.add_device(fs_device)?;
         info!(
@@ -449,9 +461,7 @@ fn build_cpuset(cpus: &[usize]) -> Option<libc::cpu_set_t> {
 /// seeing but not worth dying over.
 fn set_affinity_or_warn(vcpu_id: usize, set: &libc::cpu_set_t) {
     // SAFETY: FFI call; pid 0 is the calling thread, and the size matches.
-    let ret = unsafe {
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set)
-    };
+    let ret = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set) };
     if ret != 0 {
         eprintln!(
             "vcpu{vcpu_id}: could not set CPU affinity: {}",
@@ -465,11 +475,17 @@ fn install_signal_handlers(shutdown: Arc<Shutdown>) -> Result<()> {
     // SAFETY: both handlers are async-signal-safe.
     unsafe {
         for signal in [libc::SIGTERM, libc::SIGINT] {
-            if libc::signal(signal, stop_handler as *const () as libc::sighandler_t) == libc::SIG_ERR {
+            if libc::signal(signal, stop_handler as *const () as libc::sighandler_t)
+                == libc::SIG_ERR
+            {
                 anyhow::bail!("failed to install handler for signal {signal}");
             }
         }
-        if libc::signal(VCPU_WAKE_SIGNAL, wake_handler as *const () as libc::sighandler_t) == libc::SIG_ERR {
+        if libc::signal(
+            VCPU_WAKE_SIGNAL,
+            wake_handler as *const () as libc::sighandler_t,
+        ) == libc::SIG_ERR
+        {
             anyhow::bail!("failed to install the vCPU wake handler");
         }
     }

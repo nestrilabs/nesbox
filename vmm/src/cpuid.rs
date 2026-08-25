@@ -303,7 +303,11 @@ mod tests {
     fn leaf_1_reports_the_guest_core_count_not_the_host() {
         let mut c = host_like_cpuid();
         patch_topology(&mut c, 0, 7, Vendor::Amd);
-        assert_eq!((reg(&c, 1, 0, Reg::Ebx) >> 16) & 0xff, 7, "host's 32 survived");
+        assert_eq!(
+            (reg(&c, 1, 0, Reg::Ebx) >> 16) & 0xff,
+            7,
+            "host's 32 survived"
+        );
         assert_ne!(reg(&c, 1, 0, Reg::Edx) & (1 << 28), 0, "HTT must be set");
     }
 
@@ -314,7 +318,11 @@ mod tests {
         let mut c = host_like_cpuid();
         patch_topology(&mut c, 0, 7, Vendor::Amd);
         for leaf in [0xb, 0x1f] {
-            assert_eq!(reg(&c, leaf, 0, Reg::Ebx), 1, "leaf {leaf:#x}: threads per core");
+            assert_eq!(
+                reg(&c, leaf, 0, Reg::Ebx),
+                1,
+                "leaf {leaf:#x}: threads per core"
+            );
             assert_eq!(reg(&c, leaf, 0, Reg::Eax), 0, "leaf {leaf:#x}: SMT shift");
             assert_eq!(reg(&c, leaf, 0, Reg::Ecx) >> 8 & 0xff, 1, "level type SMT");
         }
@@ -329,7 +337,11 @@ mod tests {
             // 3 bits hold 0..=7.
             assert_eq!(reg(&c, leaf, 1, Reg::Eax), 3, "core index width");
             assert_eq!(reg(&c, leaf, 1, Reg::Ecx) >> 8 & 0xff, 2, "level type Core");
-            assert_eq!(reg(&c, leaf, 1, Reg::Ecx) & 0xff, 1, "level number matches subleaf");
+            assert_eq!(
+                reg(&c, leaf, 1, Reg::Ecx) & 0xff,
+                1,
+                "level number matches subleaf"
+            );
         }
     }
 
@@ -340,7 +352,11 @@ mod tests {
         let mut c = host_like_cpuid();
         patch_topology(&mut c, 0, 7, Vendor::Amd);
         for leaf in [0xb, 0x1f] {
-            assert_eq!(reg(&c, leaf, 2, Reg::Ecx) >> 8 & 0xff, 0, "leaf {leaf:#x} terminator");
+            assert_eq!(
+                reg(&c, leaf, 2, Reg::Ecx) >> 8 & 0xff,
+                0,
+                "leaf {leaf:#x} terminator"
+            );
             assert_eq!(reg(&c, leaf, 2, Reg::Ebx), 0);
         }
     }
@@ -359,12 +375,24 @@ mod tests {
     fn amd_extended_leaves_are_patched_and_intel_is_left_alone() {
         let mut amd = host_like_cpuid();
         patch_topology(&mut amd, 0, 7, Vendor::Amd);
-        assert_eq!(reg(&amd, 0x8000_0008, 0, Reg::Ecx) & 0xff, 6, "cores minus one");
-        assert_eq!(reg(&amd, 0x8000_001e, 0, Reg::Ebx) >> 8 & 0xff, 0, "one thread per unit");
+        assert_eq!(
+            reg(&amd, 0x8000_0008, 0, Reg::Ecx) & 0xff,
+            6,
+            "cores minus one"
+        );
+        assert_eq!(
+            reg(&amd, 0x8000_001e, 0, Reg::Ebx) >> 8 & 0xff,
+            0,
+            "one thread per unit"
+        );
 
         let mut intel = host_like_cpuid();
         patch_topology(&mut intel, 0, 7, Vendor::Intel);
-        assert_eq!(reg(&intel, 0x8000_0008, 0, Reg::Ecx) & 0xff, 15, "AMD-only leaf touched");
+        assert_eq!(
+            reg(&intel, 0x8000_0008, 0, Reg::Ecx) & 0xff,
+            15,
+            "AMD-only leaf touched"
+        );
     }
 
     /// A single-vCPU guest is the degenerate case the width arithmetic is
@@ -383,9 +411,15 @@ mod tests {
     #[test]
     fn absent_leaves_are_created() {
         let mut c = host_like_cpuid();
-        assert_eq!(c.as_slice().iter().filter(|e| e.function == 0x1f).count(), 0);
+        assert_eq!(
+            c.as_slice().iter().filter(|e| e.function == 0x1f).count(),
+            0
+        );
         patch_topology(&mut c, 0, 7, Vendor::Amd);
-        assert_eq!(c.as_slice().iter().filter(|e| e.function == 0x1f).count(), 3);
+        assert_eq!(
+            c.as_slice().iter().filter(|e| e.function == 0x1f).count(),
+            3
+        );
     }
 }
 

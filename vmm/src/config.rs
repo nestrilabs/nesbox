@@ -117,7 +117,6 @@ pub struct Network {
     pub mac: Option<String>,
 }
 
-
 impl Network {
     /// Parse the configured MAC, if there is one.
     pub fn parsed_mac(&self) -> anyhow::Result<Option<[u8; 6]>> {
@@ -303,8 +302,7 @@ mod whole_config_tests {
     /// config's clothes, and they are the setup script's now.
     #[test]
     fn the_network_section_is_only_a_tap_and_a_mac() {
-        let net: Network =
-            serde_json::from_str(r#"{ "tap-name": "nesbox1" }"#).expect("parses");
+        let net: Network = serde_json::from_str(r#"{ "tap-name": "nesbox1" }"#).expect("parses");
         assert_eq!(net.tap_name, "nesbox1");
         assert!(net.mac.is_none());
     }

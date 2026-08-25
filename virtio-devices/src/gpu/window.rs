@@ -36,8 +36,15 @@ use super::metrics::{GpuCounters, GpuMetrics};
 /// Why a mapping was refused.
 #[derive(Debug)]
 pub enum Refused {
-    Bytes { requested: u64, used: u64, limit: u64 },
-    Count { used: u32, limit: u32 },
+    Bytes {
+        requested: u64,
+        used: u64,
+        limit: u64,
+    },
+    Count {
+        used: u32,
+        limit: u32,
+    },
 }
 
 impl std::fmt::Display for Refused {
@@ -214,10 +221,7 @@ mod tests {
     #[test]
     fn a_size_that_would_overflow_cannot_wrap_past_the_limit() {
         let mut w = q(16, 0);
-        assert!(matches!(
-            w.try_map(u64::MAX),
-            Err(Refused::Bytes { .. })
-        ));
+        assert!(matches!(w.try_map(u64::MAX), Err(Refused::Bytes { .. })));
         assert_eq!(w.used, 0);
     }
 

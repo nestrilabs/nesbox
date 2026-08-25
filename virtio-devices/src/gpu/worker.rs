@@ -10,8 +10,8 @@
 // unimplemented in this headless port.
 
 use std::io::Read;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 use std::sync::mpsc::Receiver;
@@ -26,7 +26,7 @@ use vm_memory::GuestAddress;
 
 use vm_memory::GuestMemoryMmap;
 
-use super::{CTL_INDEX, GpuQueues, HostMemoryMapper};
+use super::VirtioShmRegion;
 use super::descriptor_utils::{Reader, Writer};
 use super::display::DisplayInfo;
 use super::display::Rect;
@@ -35,7 +35,7 @@ use super::protocol::{
     virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
 use super::virtio_gpu::{VirtioGpu, VirtioGpuRing};
-use super::VirtioShmRegion;
+use super::{CTL_INDEX, GpuQueues, HostMemoryMapper};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------

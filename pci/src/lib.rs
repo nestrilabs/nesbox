@@ -68,7 +68,10 @@ pub struct Mmio64Window {
 
 impl Mmio64Window {
     pub fn new(start: u64, size: u64) -> Self {
-        Self { start, end: start + size }
+        Self {
+            start,
+            end: start + size,
+        }
     }
 }
 
@@ -135,8 +138,8 @@ pub trait PciDevice: Send + Sync {
 
 struct Bar {
     bar_idx: usize,
-    addr: u64,   // assigned base address (always page/size aligned)
-    size: u64,   // power-of-two size
+    addr: u64, // assigned base address (always page/size aligned)
+    size: u64, // power-of-two size
     bar_type: BarType,
     /// True between a 0xFFFFFFFF write and the next read. A 64-bit BAR is
     /// probed one register at a time, so this is tracked per half.
@@ -266,10 +269,7 @@ impl Bus {
         let bdf = (bus, dev, func);
         {
             let mut devices = self.devices.write().unwrap();
-            devices.insert(
-                bdf,
-                PciDeviceEntry { device, bars },
-            );
+            devices.insert(bdf, PciDeviceEntry { device, bars });
         }
 
         // Advance: always assign distinct device numbers
@@ -372,11 +372,11 @@ impl Bus {
             cfg[0x02..0x04].copy_from_slice(&0x1237u16.to_le_bytes()); // 440FX host bridge
             cfg[0x04..0x06].copy_from_slice(&0x0006u16.to_le_bytes()); // command: mem+master
             cfg[0x06..0x08].copy_from_slice(&0x0000u16.to_le_bytes()); // status
-            cfg[0x08] = 0x02;                                           // revision
-            cfg[0x09] = 0x00;                                           // prog-if
-            cfg[0x0a] = 0x00;                                           // subclass: host bridge
-            cfg[0x0b] = 0x06;                                           // class: bridge
-            cfg[0x0e] = 0x00;                                           // header type 0
+            cfg[0x08] = 0x02; // revision
+            cfg[0x09] = 0x00; // prog-if
+            cfg[0x0a] = 0x00; // subclass: host bridge
+            cfg[0x0b] = 0x06; // class: bridge
+            cfg[0x0e] = 0x00; // header type 0
             let s = offset as usize;
             let e = (s + data.len()).min(cfg.len());
             if s < cfg.len() {
@@ -488,7 +488,14 @@ impl Bus {
                     // this is expected and not worth warning about.
                     log::trace!(
                         "{:02x}:{:02x}.{} BAR {} write {:#x} lands outside {:#x}..{:#x}, keeping {:#x}",
-                        bdf.0, bdf.1, bdf.2, slot, requested, window.start, window.end, bar.addr
+                        bdf.0,
+                        bdf.1,
+                        bdf.2,
+                        slot,
+                        requested,
+                        window.start,
+                        window.end,
+                        bar.addr
                     );
                     return;
                 }
@@ -519,7 +526,10 @@ impl Bus {
     /// Find the BAR that owns config register `slot`, and whether `slot` is its
     /// high half. A 64-bit BAR answers for two consecutive registers.
     fn find_bar(bars: &mut [Bar], slot: usize) -> Option<(&mut Bar, bool)> {
-        let found = bars.iter().position(|b| b.bar_idx == slot).map(|i| (i, false));
+        let found = bars
+            .iter()
+            .position(|b| b.bar_idx == slot)
+            .map(|i| (i, false));
         let found = found.or_else(|| {
             bars.iter()
                 .position(|b| b.bar_type.is_64bit() && b.bar_idx + 1 == slot)
@@ -582,7 +592,14 @@ impl Bus {
     pub fn handle_mmio_read(&self, addr: u64, data: &mut [u8]) -> bool {
         if Self::in_ecam(addr) {
             let (bdf, reg) = Self::ecam_decode(addr);
-            log::trace!("ECAM read {:02x}:{:02x}.{} reg={:#x} len={}", bdf.0, bdf.1, bdf.2, reg, data.len());
+            log::trace!(
+                "ECAM read {:02x}:{:02x}.{} reg={:#x} len={}",
+                bdf.0,
+                bdf.1,
+                bdf.2,
+                reg,
+                data.len()
+            );
             if reg >= 0x100 {
                 // No extended capabilities: reads must return zero, not 0xFF,
                 // or the guest will walk a bogus capability list.
@@ -661,7 +678,9 @@ mod tests {
     fn a_32_bit_bar_lands_in_the_low_window() {
         let bus = new_bus();
         let bdf = bus
-            .add_device(FakeDevice { bars: vec![(0x1000, BarType::Mem32)] })
+            .add_device(FakeDevice {
+                bars: vec![(0x1000, BarType::Mem32)],
+            })
             .unwrap();
         let val = read_reg(&bus, bdf, BAR0);
         assert_eq!(val & 0xF, 0, "32-bit non-prefetchable has no type bits set");
@@ -673,7 +692,9 @@ mod tests {
     fn a_64_bit_bar_lands_above_ram_and_declares_itself() {
         let bus = new_bus();
         let bdf = bus
-            .add_device(FakeDevice { bars: vec![(0x1000_0000, BarType::Mem64)] })
+            .add_device(FakeDevice {
+                bars: vec![(0x1000_0000, BarType::Mem64)],
+            })
             .unwrap();
         let lo = read_reg(&bus, bdf, BAR0);
         let hi = read_reg(&bus, bdf, BAR1);
@@ -688,7 +709,9 @@ mod tests {
         let bus = new_bus();
         let size = 0x1_0000_0000u64; // 4 GiB, bigger than a 32-bit BAR can express
         let bdf = bus
-            .add_device(FakeDevice { bars: vec![(size, BarType::Mem64)] })
+            .add_device(FakeDevice {
+                bars: vec![(size, BarType::Mem64)],
+            })
             .unwrap();
 
         // Linux sizes each half in turn.
@@ -709,7 +732,9 @@ mod tests {
     fn sizing_does_not_disturb_the_assigned_address() {
         let bus = new_bus();
         let bdf = bus
-            .add_device(FakeDevice { bars: vec![(0x1000, BarType::Mem32)] })
+            .add_device(FakeDevice {
+                bars: vec![(0x1000, BarType::Mem32)],
+            })
             .unwrap();
         let before = read_reg(&bus, bdf, BAR0);
         write_reg(&bus, bdf, BAR0, 0xFFFF_FFFF);
@@ -742,10 +767,14 @@ mod tests {
     fn devices_do_not_overlap_within_a_window() {
         let bus = new_bus();
         let a = bus
-            .add_device(FakeDevice { bars: vec![(0x1000_0000, BarType::Mem64)] })
+            .add_device(FakeDevice {
+                bars: vec![(0x1000_0000, BarType::Mem64)],
+            })
             .unwrap();
         let b = bus
-            .add_device(FakeDevice { bars: vec![(0x1000_0000, BarType::Mem64)] })
+            .add_device(FakeDevice {
+                bars: vec![(0x1000_0000, BarType::Mem64)],
+            })
             .unwrap();
         let addr = |bdf| {
             let lo = read_reg(&bus, bdf, BAR0);
@@ -760,10 +789,14 @@ mod tests {
         let bus = new_bus();
         // A 64-bit BAR must not push the 32-bit high-water mark along, or a
         // handful of large BARs would exhaust the small window without using it.
-        bus.add_device(FakeDevice { bars: vec![(0x8000_0000, BarType::Mem64)] })
-            .unwrap();
+        bus.add_device(FakeDevice {
+            bars: vec![(0x8000_0000, BarType::Mem64)],
+        })
+        .unwrap();
         let bdf = bus
-            .add_device(FakeDevice { bars: vec![(0x1000, BarType::Mem32)] })
+            .add_device(FakeDevice {
+                bars: vec![(0x1000, BarType::Mem32)],
+            })
             .unwrap();
         let addr = (read_reg(&bus, bdf, BAR0) & !0xF) as u64;
         assert_eq!(addr, MMIO_WINDOW_START);
@@ -773,7 +806,9 @@ mod tests {
     fn a_bar_cannot_be_moved_outside_the_window_we_decode() {
         let bus = new_bus();
         let bdf = bus
-            .add_device(FakeDevice { bars: vec![(0x1000, BarType::Mem32)] })
+            .add_device(FakeDevice {
+                bars: vec![(0x1000, BarType::Mem32)],
+            })
             .unwrap();
         let before = read_reg(&bus, bdf, BAR0);
         write_reg(&bus, bdf, BAR0, 0x1000_0000); // below the window
@@ -784,7 +819,9 @@ mod tests {
     fn a_bar_can_be_moved_within_the_window() {
         let bus = new_bus();
         let bdf = bus
-            .add_device(FakeDevice { bars: vec![(0x1000, BarType::Mem32)] })
+            .add_device(FakeDevice {
+                bars: vec![(0x1000, BarType::Mem32)],
+            })
             .unwrap();
         let target = MMIO_WINDOW_START + 0x10_0000;
         write_reg(&bus, bdf, BAR0, target as u32);
@@ -801,8 +838,11 @@ mod tests {
         let err = bus
             .add_device(FakeDevice {
                 bars: vec![
-                    (0, BarType::Mem32), (0, BarType::Mem32), (0, BarType::Mem32),
-                    (0, BarType::Mem32), (0, BarType::Mem32),
+                    (0, BarType::Mem32),
+                    (0, BarType::Mem32),
+                    (0, BarType::Mem32),
+                    (0, BarType::Mem32),
+                    (0, BarType::Mem32),
                     (0x1000, BarType::Mem64),
                 ],
             })
@@ -815,7 +855,9 @@ mod tests {
         let bus = new_bus();
         let too_big = MMIO_WINDOW_END - MMIO_WINDOW_START;
         let err = bus
-            .add_device(FakeDevice { bars: vec![(too_big * 2, BarType::Mem32)] })
+            .add_device(FakeDevice {
+                bars: vec![(too_big * 2, BarType::Mem32)],
+            })
             .unwrap_err();
         assert!(err.to_string().contains("exhausted"));
     }

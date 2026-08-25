@@ -13,7 +13,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::mem::{MaybeUninit, size_of};
 
-use vm_memory::{Bytes, ByteValued, GuestAddress, GuestMemoryError};
+use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryError};
 
 use vm_memory::GuestMemoryMmap;
 
@@ -131,7 +131,9 @@ impl Reader {
                 .map_err(Error::GuestMemory)?;
         }
 
-        Ok(Reader { buf: std::io::Cursor::new(data) })
+        Ok(Reader {
+            buf: std::io::Cursor::new(data),
+        })
     }
 
     /// Read a `ByteValued` object directly from the descriptor stream.

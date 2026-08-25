@@ -106,7 +106,9 @@ fn find_renderer(maps: &str) -> Option<PathBuf> {
 
 fn carries_marker(path: &Path) -> io::Result<bool> {
     let bytes = std::fs::read(path)?;
-    Ok(bytes.windows(BUDGET_MARKER.len()).any(|w| w == BUDGET_MARKER))
+    Ok(bytes
+        .windows(BUDGET_MARKER.len())
+        .any(|w| w == BUDGET_MARKER))
 }
 
 /// Check the renderer against what the config asked for.
@@ -128,7 +130,10 @@ pub fn check(vram_limit_mib: Option<u64>) -> anyhow::Result<()> {
 fn decide(budget: Budget, vram_limit_mib: Option<u64>) -> anyhow::Result<()> {
     match (&budget, vram_limit_mib) {
         (Budget::Enforced(p), Some(mib)) => {
-            log::info!("gpu: VRAM budget of {mib} MiB will be enforced by {}", p.display());
+            log::info!(
+                "gpu: VRAM budget of {mib} MiB will be enforced by {}",
+                p.display()
+            );
         }
         (Budget::NotEnforced(p), Some(mib)) => {
             anyhow::bail!(
@@ -229,8 +234,11 @@ mod tests {
         // Exercised through the same match `check` uses, with the outcome
         // supplied rather than probed, so this does not depend on which
         // renderer happens to be loaded while the tests run.
-        let err = decide(Budget::NotEnforced(PathBuf::from("/usr/lib/libvirglrenderer.so.1")), Some(512))
-            .expect_err("a limit with no enforcement must be fatal");
+        let err = decide(
+            Budget::NotEnforced(PathBuf::from("/usr/lib/libvirglrenderer.so.1")),
+            Some(512),
+        )
+        .expect_err("a limit with no enforcement must be fatal");
         let msg = format!("{err}");
         assert!(msg.contains("512"), "{msg}");
         assert!(msg.contains("vram-limit-mib"), "{msg}");

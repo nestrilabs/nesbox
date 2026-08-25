@@ -51,17 +51,21 @@ impl PciConfig {
         // Status: Capabilities List (bit 4)
         c[6..8].copy_from_slice(&0x0010u16.to_le_bytes());
         // Register 2: revision + class code (PCI big-endian: BCC|SCC|PI|RID)
-        c[8] = revision;                                     // RID
-        c[9] = (class_code & 0xFF) as u8;                    // PI
-        c[10] = ((class_code >> 8) & 0xFF) as u8;            // SCC
-        c[11] = ((class_code >> 16) & 0xFF) as u8;           // BCC
+        c[8] = revision; // RID
+        c[9] = (class_code & 0xFF) as u8; // PI
+        c[10] = ((class_code >> 8) & 0xFF) as u8; // SCC
+        c[11] = ((class_code >> 16) & 0xFF) as u8; // BCC
         // Register 3: header type
         c[0x0e] = HEADER_TYPE_DEVICE;
         // Register 11: subsystem vendor + subsystem ID
         c[0x2c..0x2e].copy_from_slice(&subsystem_vendor.to_le_bytes());
         c[0x2e..0x30].copy_from_slice(&subsystem_id.to_le_bytes());
 
-        Self { data: c, last_cap_offset: None, next_cap_start: FIRST_CAP }
+        Self {
+            data: c,
+            last_cap_offset: None,
+            next_cap_start: FIRST_CAP,
+        }
     }
 
     /// Set interrupt pin (INTA# = 1).
@@ -103,9 +107,15 @@ impl PciConfig {
         let total_cap_len = 2 + payload.len(); // id + next + payload
         let start = self.next_cap_start;
 
-        assert!(start >= FIRST_CAP && start < CAP_MAX, "capability space exhausted");
+        assert!(
+            start >= FIRST_CAP && start < CAP_MAX,
+            "capability space exhausted"
+        );
         let s = start as usize;
-        assert!(s + total_cap_len <= CAP_MAX as usize, "capability too large");
+        assert!(
+            s + total_cap_len <= CAP_MAX as usize,
+            "capability too large"
+        );
 
         // Write the capability
         self.data[s] = cap_id;
@@ -143,10 +153,16 @@ impl PciConfig {
     }
 
     /// Add a virtio notify capability with `notify_off_multiplier`.
-    pub fn add_virtio_notify_cap(&mut self, bar_idx: u8, offset: u32, length: u32, multiplier: u32) {
+    pub fn add_virtio_notify_cap(
+        &mut self,
+        bar_idx: u8,
+        offset: u32,
+        length: u32,
+        multiplier: u32,
+    ) {
         let mut payload = [0u8; 18]; // VirtioPciNotifyCap is 18 bytes
         payload[0] = 0x14; // cap_len = 20
-        payload[1] = 2;    // cfg_type = Notify
+        payload[1] = 2; // cfg_type = Notify
         payload[2] = bar_idx;
         // padding at 4,5
         payload[6..10].copy_from_slice(&offset.to_le_bytes());
@@ -182,8 +198,8 @@ impl PciConfig {
     pub fn add_msix_cap(&mut self, table_size: u16, table_off: u32, pba_off: u32) -> u16 {
         let mut payload = [0u8; 10];
         payload[0..2].copy_from_slice(&table_size.to_le_bytes()); // msg_ctl
-        payload[2..6].copy_from_slice(&table_off.to_le_bytes());  // table offset + BIR
-        payload[6..10].copy_from_slice(&pba_off.to_le_bytes());   // PBA offset + BIR
+        payload[2..6].copy_from_slice(&table_off.to_le_bytes()); // table offset + BIR
+        payload[6..10].copy_from_slice(&pba_off.to_le_bytes()); // PBA offset + BIR
         self.add_cap(0x11, &payload)
     }
 

@@ -217,9 +217,9 @@ impl Report {
         }
 
         match (&self.memory_max, &self.memory_bound_by) {
-            (Limit::Set(v), Some(where_)) => log::info!(
-                "isolation: host memory bounded at {v} by {where_}"
-            ),
+            (Limit::Set(v), Some(where_)) => {
+                log::info!("isolation: host memory bounded at {v} by {where_}")
+            }
             _ => log::warn!(
                 "isolation: no memory.max anywhere above this process. GTT allocations are \
                  counted and never refused (virtio-devices/src/gpu/vram.rs) because host \
@@ -539,7 +539,10 @@ mod tests {
 
         // And a real quota is a limit.
         std::fs::write(dir.join("cpu.max"), "200000 100000\n").unwrap();
-        assert_eq!(Limit::read(d, "cpu.max"), Limit::Set("200000 100000".into()));
+        assert_eq!(
+            Limit::read(d, "cpu.max"),
+            Limit::Set("200000 100000".into())
+        );
         assert!(Limit::read(d, "cpu.max").is_set());
         std::fs::remove_file(dir.join("cpu.max")).unwrap();
 

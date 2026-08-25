@@ -2,9 +2,9 @@ use crate::lifecycle::{ExitReason, Shutdown};
 use crate::power::PowerDevice;
 use crate::{boot, layout};
 use anyhow::{Context, Result};
-use std::os::fd::FromRawFd;
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
+use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use vm_memory::{Address, FileOffset, GuestMemoryBackend, GuestMemoryMmap};
 
@@ -52,7 +52,9 @@ impl Vm {
         let vm_fd = Arc::new(kvm.create_vm().context("Failed to create VM")?);
 
         // Create IRQ chip
-        vm_fd.create_irq_chip().context("Failed to create IRQ chip")?;
+        vm_fd
+            .create_irq_chip()
+            .context("Failed to create IRQ chip")?;
 
         // Memory, split around the 3–4 GiB device hole.
         let mem_size = (mem_size_mib as u64) * 1024 * 1024;
@@ -90,8 +92,8 @@ impl Vm {
                 Ok((start, size, Some(FileOffset::new(file, offset))))
             })
             .collect::<Result<Vec<_>>>()?;
-        let mem =
-            GuestMemoryMmap::from_ranges_with_files(&ranges).context("Failed to create guest memory")?;
+        let mem = GuestMemoryMmap::from_ranges_with_files(&ranges)
+            .context("Failed to create guest memory")?;
         let mem = Arc::new(mem);
 
         for (slot, &(start, size)) in regions.iter().enumerate() {
@@ -188,7 +190,8 @@ fn create_memfd(size: u64) -> Result<std::fs::File> {
     }
     // SAFETY: memfd_create just handed us this fd and nothing else owns it.
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.set_len(size).context("failed to size the guest memory file")?;
+    file.set_len(size)
+        .context("failed to size the guest memory file")?;
     Ok(file)
 }
 
@@ -264,17 +267,67 @@ pub fn run_vcpu_loop(
                     )));
                     log::error!("VM entry failed: reason={:#x} cpu={}", reason, cpu);
                     if let Ok(r) = vcpu_fd.get_regs() {
-                        log::error!("regs: rip={:#x} rsp={:#x} rsi={:#x} rflags={:#x}", r.rip, r.rsp, r.rsi, r.rflags);
+                        log::error!(
+                            "regs: rip={:#x} rsp={:#x} rsi={:#x} rflags={:#x}",
+                            r.rip,
+                            r.rsp,
+                            r.rsi,
+                            r.rflags
+                        );
                     }
                     if let Ok(s) = vcpu_fd.get_sregs() {
-                        log::error!("cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x}", s.cr0, s.cr3, s.cr4, s.efer);
-                        log::error!("cs: sel={:#x} base={:#x} limit={:#x} type={:#x} l={} db={} g={} p={} s={} unusable={}",
-                            s.cs.selector, s.cs.base, s.cs.limit, s.cs.type_, s.cs.l, s.cs.db, s.cs.g, s.cs.present, s.cs.s, s.cs.unusable);
-                        log::error!("ds: sel={:#x} type={:#x} p={} s={} unusable={}", s.ds.selector, s.ds.type_, s.ds.present, s.ds.s, s.ds.unusable);
-                        log::error!("tr: sel={:#x} base={:#x} limit={:#x} type={:#x} p={} s={} unusable={}",
-                            s.tr.selector, s.tr.base, s.tr.limit, s.tr.type_, s.tr.present, s.tr.s, s.tr.unusable);
-                        log::error!("ldt: sel={:#x} type={:#x} p={} unusable={}", s.ldt.selector, s.ldt.type_, s.ldt.present, s.ldt.unusable);
-                        log::error!("gdt: base={:#x} limit={:#x}  idt: base={:#x} limit={:#x}", s.gdt.base, s.gdt.limit, s.idt.base, s.idt.limit);
+                        log::error!(
+                            "cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x}",
+                            s.cr0,
+                            s.cr3,
+                            s.cr4,
+                            s.efer
+                        );
+                        log::error!(
+                            "cs: sel={:#x} base={:#x} limit={:#x} type={:#x} l={} db={} g={} p={} s={} unusable={}",
+                            s.cs.selector,
+                            s.cs.base,
+                            s.cs.limit,
+                            s.cs.type_,
+                            s.cs.l,
+                            s.cs.db,
+                            s.cs.g,
+                            s.cs.present,
+                            s.cs.s,
+                            s.cs.unusable
+                        );
+                        log::error!(
+                            "ds: sel={:#x} type={:#x} p={} s={} unusable={}",
+                            s.ds.selector,
+                            s.ds.type_,
+                            s.ds.present,
+                            s.ds.s,
+                            s.ds.unusable
+                        );
+                        log::error!(
+                            "tr: sel={:#x} base={:#x} limit={:#x} type={:#x} p={} s={} unusable={}",
+                            s.tr.selector,
+                            s.tr.base,
+                            s.tr.limit,
+                            s.tr.type_,
+                            s.tr.present,
+                            s.tr.s,
+                            s.tr.unusable
+                        );
+                        log::error!(
+                            "ldt: sel={:#x} type={:#x} p={} unusable={}",
+                            s.ldt.selector,
+                            s.ldt.type_,
+                            s.ldt.present,
+                            s.ldt.unusable
+                        );
+                        log::error!(
+                            "gdt: base={:#x} limit={:#x}  idt: base={:#x} limit={:#x}",
+                            s.gdt.base,
+                            s.gdt.limit,
+                            s.idt.base,
+                            s.idt.limit
+                        );
                     }
                     break;
                 }
