@@ -2,6 +2,7 @@
 name = "nesprobe"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 # Straight from git as crates.io version is 2 years out-of-date, git is preferable for ash
