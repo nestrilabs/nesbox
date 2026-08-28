@@ -39,8 +39,17 @@ pub const STATUS_DRIVER_OK: u8 = 4;
 
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
+/// The descriptor's buffer is itself a table of descriptors.
+pub const VRING_DESC_F_INDIRECT: u16 = 4;
 pub const VIRTQ_MSI_NO_VECTOR: u16 = 0xFFFF;
 pub const VRING_DESC_SIZE: u64 = 16;
+
+/// In the avail ring's flags: the driver does not want an interrupt.
+pub const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
+/// In the used ring's flags: the device does not want to be notified.
+pub const VRING_USED_F_NO_NOTIFY: u16 = 1;
+
+pub const VIRTIO_F_RING_INDIRECT_DESC: u64 = 1 << 28;
 
 #[derive(Default, Clone)]
 pub struct QState {
@@ -51,6 +60,10 @@ pub struct QState {
     pub enabled: bool,
     pub last: u16,
     pub vec: u16,
+    /// Set once the driver has accepted `VIRTIO_F_RING_INDIRECT_DESC`. A
+    /// descriptor may only be followed into an indirect table when the feature
+    /// was negotiated, so this is per-queue state rather than a constant.
+    pub indirect: bool,
 }
 
 #[derive(Default)]
@@ -107,53 +120,122 @@ pub fn set_queue_size(q: &mut QState, requested: u16, max: u16) {
     }
 }
 
-/// Collect descriptors from a vring chain.
+/// Read one descriptor out of a table. `None` means guest memory did not have
+/// it, which is a broken driver rather than an error we can report anywhere.
+fn read_desc(mem: &GuestMemoryMmap, table: u64, idx: u16) -> Option<(u64, u32, u16, u16)> {
+    let base = vm_memory::GuestAddress(table.checked_add(idx as u64 * VRING_DESC_SIZE)?);
+    let addr: u64 = mem.read_obj(base).ok().map(u64::from_le)?;
+    let len: u32 = mem
+        .read_obj(vm_memory::GuestAddress(base.0.checked_add(8)?))
+        .ok()
+        .map(u32::from_le)?;
+    let flags: u16 = mem
+        .read_obj(vm_memory::GuestAddress(base.0.checked_add(12)?))
+        .ok()
+        .map(u16::from_le)?;
+    let next: u16 = mem
+        .read_obj(vm_memory::GuestAddress(base.0.checked_add(14)?))
+        .ok()
+        .map(u16::from_le)?;
+    Some((addr, len, flags, next))
+}
+
+/// Walk one chain of descriptors, starting at `head`, into `out`.
+///
+/// `table` is the descriptor table to index, `max` its length in entries. The
+/// walk stops at the first descriptor without `NEXT`, at `max` steps, or at a
+/// `next` that points off the table -- the spec's rule, and the bound that keeps
+/// a hostile ring from turning into an unbounded walk.
+fn walk_chain(
+    mem: &GuestMemoryMmap,
+    table: u64,
+    head: u16,
+    max: u16,
+    out: &mut Vec<(u64, u32, u16)>,
+    allow_indirect: bool,
+) {
+    let mut idx = head;
+    if idx >= max {
+        return;
+    }
+    for _ in 0..max {
+        let Some((addr, len, flags, next)) = read_desc(mem, table, idx) else {
+            return;
+        };
+        if flags & VRING_DESC_F_INDIRECT != 0 {
+            // Nested indirection is forbidden by the spec, and following it
+            // would be the one place this walk could recurse without a bound.
+            if !allow_indirect {
+                return;
+            }
+            walk_indirect(mem, addr, len, max, out);
+            return;
+        }
+        out.push((addr, len, flags));
+        // A chain longer than the ring is a driver bug either way, but this is
+        // also what bounds how much host memory a single request commits.
+        if out.len() >= max as usize {
+            return;
+        }
+        if flags & VRING_DESC_F_NEXT == 0 || next >= max {
+            return;
+        }
+        idx = next;
+    }
+}
+
+/// Follow an indirect descriptor into the table it points at.
+///
+/// The table is guest memory the driver filled in, so its length is the
+/// driver's claim and not to be trusted: entries beyond `max` are the same
+/// unbounded walk the direct path refuses, and a length that is not a whole
+/// number of descriptors is a malformed table.
+fn walk_indirect(
+    mem: &GuestMemoryMmap,
+    table: u64,
+    byte_len: u32,
+    max: u16,
+    out: &mut Vec<(u64, u32, u16)>,
+) {
+    let entries = byte_len as u64 / VRING_DESC_SIZE;
+    if entries == 0 {
+        return;
+    }
+    // The ring the guest advertised is the ceiling on a request's segment
+    // count -- it is what `seg_max` is derived from -- so an indirect table
+    // claiming more entries than that is clamped rather than believed.
+    let entries = entries.min(max as u64) as u16;
+    walk_chain(mem, table, 0, entries, out, false);
+}
+
+/// Collect descriptors from a vring chain, without following indirect
+/// descriptors. See [`collect_descs_with`] for the form that can.
 pub fn collect_descs(
     mem: &GuestMemoryMmap,
     desc_base: u64,
     head: u16,
     max: u16,
 ) -> Vec<(u64, u32, u16)> {
+    collect_descs_with(mem, desc_base, head, max, false)
+}
+
+/// Collect descriptors from a vring chain.
+///
+/// With `allow_indirect`, a descriptor carrying `VRING_DESC_F_INDIRECT` is
+/// followed into the table it names and that table's chain is collected
+/// instead. Only pass true when the driver accepted
+/// `VIRTIO_F_RING_INDIRECT_DESC`: a driver that did not negotiate it cannot
+/// have meant the flag, and honouring it anyway would read a buffer as a
+/// descriptor table.
+pub fn collect_descs_with(
+    mem: &GuestMemoryMmap,
+    desc_base: u64,
+    head: u16,
+    max: u16,
+    allow_indirect: bool,
+) -> Vec<(u64, u32, u16)> {
     let mut descs = Vec::new();
-    let mut idx = head;
-    // An index at or past the ring is off the descriptor table the guest
-    // published. Reading it would still be a bounds-checked guest-memory access,
-    // so this is not a host escape -- it is the spec's rule (`next` must be
-    // below the queue size), and honouring it keeps the walk inside the ring
-    // that `max` is counting.
-    if idx >= max {
-        return descs;
-    }
-    for _ in 0..max {
-        let base = vm_memory::GuestAddress(desc_base + idx as u64 * VRING_DESC_SIZE);
-        let addr: u64 = match mem.read_obj(base) {
-            Ok(v) => u64::from_le(v),
-            Err(_) => break,
-        };
-        let len: u32 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 8)) {
-            Ok(v) => u32::from_le(v),
-            Err(_) => break,
-        };
-        let fl: u16 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 12)) {
-            Ok(v) => u16::from_le(v),
-            Err(_) => break,
-        };
-        let nx: u16 = match mem.read_obj(vm_memory::GuestAddress(base.0 + 14)) {
-            Ok(v) => u16::from_le(v),
-            Err(_) => break,
-        };
-        descs.push((addr, len, fl));
-        if fl & VRING_DESC_F_NEXT == 0 {
-            break;
-        }
-        // The same spec rule as the entry check above, applied to every link
-        // rather than only the head: a `next` at or past the queue size would
-        // walk outside the ring the guest published.
-        if nx >= max {
-            break;
-        }
-        idx = nx;
-    }
+    walk_chain(mem, desc_base, head, max, &mut descs, allow_indirect);
     descs
 }
 
@@ -162,7 +244,11 @@ pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64
     // A queue the guest sized to zero has no ring to index into, and the
     // remainder below would panic rather than report anything. See
     // `set_queue_size`.
-    if q.size == 0 {
+    //
+    // A ring address of zero is the other half of the same check: that is where
+    // a queue starts and where a reset puts it back, and treating it as a ring
+    // would read guest address zero as an avail index.
+    if q.size == 0 || q.avail == 0 || q.desc == 0 {
         return None;
     }
     let a = vm_memory::GuestAddress(q.avail + 2);
@@ -173,6 +259,10 @@ pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64
     if idx == q.last {
         return None;
     }
+    // The descriptors this index publishes were written by the guest before it
+    // published the index. Reading them without an acquire here lets this CPU
+    // observe the new index against stale descriptor contents.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     let slot = (q.last % q.size) as u64;
     let r = vm_memory::GuestAddress(q.avail + 4 + slot * 2);
     let h: u16 = match mem.read_obj(r) {
@@ -180,7 +270,7 @@ pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64
         Err(_) => return None,
     };
     q.last = q.last.wrapping_add(1);
-    let descs = collect_descs(mem, q.desc, h, q.size);
+    let descs = collect_descs_with(mem, q.desc, h, q.size, q.indirect);
     Some((h, descs))
 }
 
@@ -188,7 +278,11 @@ pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64
 pub fn push_used(mem: &GuestMemoryMmap, q: &QState, head: u16, len: u32) {
     // Same division, same reason. Nothing was taken from a zero-sized queue, so
     // there is nothing to complete on one.
-    if q.size == 0 {
+    //
+    // And nothing may be written into a used ring at address zero: a request
+    // still in flight when the driver resets the device completes against a
+    // queue that no longer has one, and this is where those bytes would land.
+    if q.size == 0 || q.used == 0 {
         return;
     }
     let ua = vm_memory::GuestAddress(q.used + 2);
@@ -197,7 +291,49 @@ pub fn push_used(mem: &GuestMemoryMmap, q: &QState, head: u16, len: u32) {
     let ue = vm_memory::GuestAddress(q.used + 4 + us * 8);
     let _ = mem.write_obj(u32::to_le(head as u32), ue);
     let _ = mem.write_obj(u32::to_le(len), vm_memory::GuestAddress(ue.0 + 4));
+    // The guest must not see the new used index before the element it points
+    // at, or it reads a slot we have not filled in yet.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     let _ = mem.write_obj(u16::to_le(ui.wrapping_add(1)), ua);
+}
+
+/// Does the driver want an interrupt for what we just completed?
+///
+/// A driver polling its ring -- which Linux does under load, and which is where
+/// the interrupts cost the most -- sets `VRING_AVAIL_F_NO_INTERRUPT` and does
+/// not want to be woken. Reading it wrong in either direction is safe in only
+/// one of them: suppressing an interrupt the driver wanted stalls the queue, so
+/// a ring we cannot read is treated as wanting one.
+pub fn avail_wants_interrupt(mem: &GuestMemoryMmap, q: &QState) -> bool {
+    if q.avail == 0 {
+        return true;
+    }
+    match mem.read_obj::<u16>(vm_memory::GuestAddress(q.avail)) {
+        Ok(flags) => u16::from_le(flags) & VRING_AVAIL_F_NO_INTERRUPT == 0,
+        Err(_) => true,
+    }
+}
+
+/// Ask the driver not to notify us, or withdraw that request.
+///
+/// Every notification is a VM exit. While a worker is draining a queue it is
+/// going to pick up whatever the driver adds anyway, so the exits in that
+/// window buy nothing. The driver is free to ignore this -- it is a hint -- so
+/// a queue must always be re-checked after clearing it, or a request added in
+/// the gap sits there with no kick coming.
+pub fn set_used_no_notify(mem: &GuestMemoryMmap, q: &QState, suppress: bool) {
+    if q.used == 0 {
+        return;
+    }
+    let flags: u16 = if suppress { VRING_USED_F_NO_NOTIFY } else { 0 };
+    let _ = mem.write_obj(u16::to_le(flags), vm_memory::GuestAddress(q.used));
+    // A full barrier, and it has to be one. x86 lets a store sit in the store
+    // buffer past a later load, so without this the caller can clear the flag,
+    // read the avail ring as empty and go to sleep, while the driver adds a
+    // request and reads the flag *before* the clear reaches it and so does not
+    // kick. Both sides then wait for the other. The window is small and the
+    // failure is a hung disk, which is the worst kind of rare.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Write queue address fields.
@@ -431,6 +567,27 @@ impl<const N: usize> MsixTable<N> {
     }
 }
 
+/// Apply a write to `driver_feature`, honouring the selector the driver set.
+///
+/// The selector is a *word* index, and a driver walks it past the two words a
+/// 64-bit feature set occupies: Linux writes selects 0, 1, 2 and 3, because the
+/// spec's feature space is 128 bits wide and it writes all of it. Treating
+/// "not zero" as "the high word" therefore does not mean what it looks like --
+/// select 2 arrives carrying zero and wipes bits 32..63, and bit 32 is
+/// `VIRTIO_F_VERSION_1`.
+///
+/// The symptom is nothing at all until something is gated on a bit up there,
+/// and then a device that believes a modern driver is a legacy one.
+pub fn write_driver_feature(com: &mut ComCfg, value: u32) {
+    match com.dff {
+        0 => com.df = (com.df & 0xFFFF_FFFF_0000_0000) | value as u64,
+        1 => com.df = (com.df & 0x0000_0000_FFFF_FFFF) | ((value as u64) << 32),
+        // Words this device has no features in. A driver acknowledging bits it
+        // was never offered is its own business; storing them is not.
+        _ => {}
+    }
+}
+
 /// Read common-cfg fields.
 pub fn com_read(
     com: &ComCfg,
@@ -460,13 +617,13 @@ pub fn com_read(
             }
         }
         CFG_DRIVER_FEAT_SEL => com.dff as u64,
-        CFG_DRIVER_FEAT => {
-            if com.dff == 0 {
-                com.df & 0xFFFF_FFFF
-            } else {
-                com.df >> 32
-            }
-        }
+        CFG_DRIVER_FEAT => match com.dff {
+            0 => com.df & 0xFFFF_FFFF,
+            1 => com.df >> 32,
+            // Same word indices as `write_driver_feature`: there is nothing to
+            // read back above them.
+            _ => 0,
+        },
         CFG_MSIX_CONFIG => msix_config_vec,
         CFG_NUM_QUEUES => num_queues,
         CFG_STATUS => com.st as u64,
@@ -542,6 +699,179 @@ mod queue_tests {
         assert_eq!(q.size, 128);
         set_queue_size(&mut q, MAX, MAX);
         assert_eq!(q.size, MAX);
+    }
+
+    /// Write one descriptor into a table in guest memory.
+    fn desc(m: &GuestMemoryMmap, table: u64, idx: u16, addr: u64, len: u32, flags: u16, next: u16) {
+        let at = table + idx as u64 * VRING_DESC_SIZE;
+        m.write_obj(u64::to_le(addr), GuestAddress(at)).unwrap();
+        m.write_obj(u32::to_le(len), GuestAddress(at + 8)).unwrap();
+        m.write_obj(u16::to_le(flags), GuestAddress(at + 12))
+            .unwrap();
+        m.write_obj(u16::to_le(next), GuestAddress(at + 14))
+            .unwrap();
+    }
+
+    const TABLE: u64 = 0x1000;
+    const INDIRECT: u64 = 0x4000;
+
+    /// An indirect descriptor is a table of descriptors, and the chain the
+    /// device serves is the one inside it.
+    #[test]
+    fn an_indirect_table_is_followed_when_the_driver_negotiated_it() {
+        let m = mem();
+        desc(&m, TABLE, 0, INDIRECT, 32, VRING_DESC_F_INDIRECT, 0);
+        desc(&m, INDIRECT, 0, 0x8000, 512, VRING_DESC_F_NEXT, 1);
+        desc(&m, INDIRECT, 1, 0x9000, 1, VRING_DESC_F_WRITE, 0);
+
+        let descs = collect_descs_with(&m, TABLE, 0, MAX, true);
+        assert_eq!(descs.len(), 2);
+        assert_eq!(descs[0].0, 0x8000);
+        assert_eq!(descs[1], (0x9000, 1, VRING_DESC_F_WRITE));
+    }
+
+    /// A driver that did not accept `VIRTIO_F_RING_INDIRECT_DESC` cannot have
+    /// meant the flag. Following it anyway would read one of its buffers as a
+    /// descriptor table.
+    #[test]
+    fn an_indirect_descriptor_is_ignored_when_the_feature_was_not_negotiated() {
+        let m = mem();
+        desc(&m, TABLE, 0, INDIRECT, 32, VRING_DESC_F_INDIRECT, 0);
+        desc(&m, INDIRECT, 0, 0x8000, 512, 0, 0);
+
+        assert!(collect_descs_with(&m, TABLE, 0, MAX, false).is_empty());
+        // And the plain entry point never follows one.
+        assert!(collect_descs(&m, TABLE, 0, MAX).is_empty());
+    }
+
+    /// Nesting is forbidden by the spec, and is the one place this walk could
+    /// recurse without a bound.
+    #[test]
+    fn an_indirect_table_may_not_contain_another_one() {
+        let m = mem();
+        desc(&m, TABLE, 0, INDIRECT, 32, VRING_DESC_F_INDIRECT, 0);
+        desc(&m, INDIRECT, 0, 0x6000, 32, VRING_DESC_F_INDIRECT, 0);
+        desc(&m, 0x6000, 0, 0x8000, 512, 0, 0);
+
+        assert!(collect_descs_with(&m, TABLE, 0, MAX, true).is_empty());
+    }
+
+    /// The table's length is the driver's claim about its own memory. A claim
+    /// larger than the ring it advertised is clamped, not believed: it is what
+    /// bounds how much this walk collects.
+    #[test]
+    fn an_indirect_table_longer_than_the_ring_is_clamped() {
+        let m = mem();
+        let small: u16 = 4;
+        desc(&m, TABLE, 0, INDIRECT, u32::MAX, VRING_DESC_F_INDIRECT, 0);
+        for i in 0..8u16 {
+            desc(&m, INDIRECT, i, 0x8000, 16, VRING_DESC_F_NEXT, i + 1);
+        }
+        let descs = collect_descs_with(&m, TABLE, 0, small, true);
+        assert!(descs.len() <= small as usize, "collected {}", descs.len());
+    }
+
+    /// A driver that wants no interrupts must not get one, and a ring we cannot
+    /// read must not cost the guest a stalled queue.
+    #[test]
+    fn the_avail_flags_decide_whether_an_interrupt_is_wanted() {
+        let m = mem();
+        let q = QState {
+            size: MAX,
+            avail: 0x2000,
+            ..Default::default()
+        };
+        m.write_obj(u16::to_le(0), GuestAddress(q.avail)).unwrap();
+        assert!(avail_wants_interrupt(&m, &q));
+        m.write_obj(
+            u16::to_le(VRING_AVAIL_F_NO_INTERRUPT),
+            GuestAddress(q.avail),
+        )
+        .unwrap();
+        assert!(!avail_wants_interrupt(&m, &q));
+
+        let unreadable = QState {
+            size: MAX,
+            avail: 0xFFFF_0000,
+            ..Default::default()
+        };
+        assert!(avail_wants_interrupt(&m, &unreadable));
+    }
+
+    /// Linux writes feature-select words 0 through 3, and the two it has no
+    /// features in carry zero. Treating every non-zero selector as "the high
+    /// word" makes select 2 wipe `VIRTIO_F_VERSION_1` back out again, and the
+    /// device then has a modern driver recorded as a legacy one.
+    #[test]
+    fn a_selector_past_the_feature_words_does_not_wipe_them() {
+        let mut com = ComCfg {
+            dff: 0,
+            ..Default::default()
+        };
+        write_driver_feature(&mut com, 0x1000_1066);
+        com.dff = 1;
+        write_driver_feature(&mut com, 1); // VIRTIO_F_VERSION_1
+        assert_eq!(com.df, 0x1_1000_1066);
+
+        for select in 2..4 {
+            com.dff = select;
+            write_driver_feature(&mut com, 0);
+        }
+        assert_eq!(com.df, 0x1_1000_1066, "a high selector wrote through");
+        assert!(com.df & VIRTIO_F_VERSION_1 != 0);
+    }
+
+    /// What the driver wrote is what it reads back, per word.
+    #[test]
+    fn driver_features_read_back_by_word() {
+        let com = ComCfg {
+            df: 0x1_1000_1066,
+            dff: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            com_read(
+                &com,
+                CFG_DRIVER_FEAT,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ),
+            0x1000_1066
+        );
+        let com = ComCfg { dff: 1, ..com };
+        assert_eq!(
+            com_read(
+                &com,
+                CFG_DRIVER_FEAT,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ),
+            1
+        );
     }
 
     /// `next` must be below the queue size. An index past the ring is off the

@@ -14,7 +14,8 @@ use std::sync::Arc;
 use termios::*;
 use virtio_devices::gpu::display::DisplayInfo;
 use virtio_devices::{
-    BlkDevice, ConsoleDevice, FsDevice, GpuConfig, GpuDevice, NetConfig, NetDevice, VsockDevice,
+    BlkConfig, BlkDevice, ConsoleDevice, FsDevice, GpuConfig, GpuDevice, NetConfig, NetDevice,
+    VsockDevice,
 };
 
 /// BAR index the GPU puts its shared memory window in.
@@ -121,6 +122,9 @@ fn main() -> Result<()> {
         vm.mmio64.size,
     )));
     let irq = IrqManager::new(vm.vm_fd.clone())?;
+    // Before any device is added: a device registers its doorbells as it joins
+    // the bus, so a registrar set afterwards would come too late for it.
+    pci_bus.set_ioevent_registrar(irq.clone());
 
     // ── Block device ──────────────────────────────────────────────────────
     let root_drive = config
@@ -128,10 +132,26 @@ fn main() -> Result<()> {
         .iter()
         .find(|d| d.is_root_device)
         .context("No root drive specified")?;
-    let blk_device = BlkDevice::new(&root_drive.path_on_host, root_drive.is_read_only)?;
+    // A queue per vCPU is what the guest's own multiqueue block layer wants,
+    // bounded because past about four the queues stop being the constraint and
+    // start being threads.
+    let blk_queues = root_drive
+        .num_queues
+        .unwrap_or_else(|| (config.machine_config.vcpu_count as u16).clamp(1, 4));
+    let blk_device = BlkDevice::new(
+        &BlkConfig {
+            path: root_drive.path_on_host.clone(),
+            read_only: root_drive.is_read_only,
+            direct: root_drive.direct,
+            num_queues: blk_queues,
+            poll_us: root_drive.poll_us.unwrap_or(0),
+        },
+        vm.mem.clone(),
+    )?;
 
-    blk_device.set_mem(vm.mem.clone());
-    let blk_vectors = irq.allocate_msi_vectors(2).context("blk MSI-X vectors")?;
+    let blk_vectors = irq
+        .allocate_msi_vectors(blk_device.msix_vectors())
+        .context("blk MSI-X vectors")?;
     let blk_intx = irq.legacy_irqfd(acpi_slot_gsi(1)).context("blk INTx")?;
     blk_device.bind_interrupts(blk_vectors, irq.clone(), blk_intx);
     let blk_bdf = pci_bus.add_device(blk_device)?;

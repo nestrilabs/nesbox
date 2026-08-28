@@ -183,6 +183,34 @@ pub struct Drive {
     pub is_root_device: bool,
     #[serde(default)]
     pub is_read_only: bool,
+    /// Bypass the host page cache.
+    ///
+    /// Absent -- the default -- means direct I/O where the backing file
+    /// supports it and buffered where it does not, which is what a box running
+    /// several guests wants: without it every guest byte is cached twice, once
+    /// by the host and once by the guest, and an `io.max` bound on the VM stops
+    /// applying as soon as the host has the image cached.
+    ///
+    /// `true` refuses to start if the file cannot do direct I/O, for a box
+    /// whose isolation depends on it. `false` keeps the host page cache, which
+    /// is faster for a single guest on a machine with RAM to spare.
+    #[serde(default)]
+    pub direct: Option<bool>,
+    /// Virtqueues for this drive. Absent means one per vCPU, up to the four a
+    /// guest's block layer can keep busy.
+    ///
+    /// One queue means every guest CPU contends on one ring and one worker.
+    #[serde(default)]
+    pub num_queues: Option<u16>,
+    /// Microseconds a queue's worker looks at its ring before sleeping.
+    ///
+    /// Absent or zero sleeps at once, which costs a thread wakeup on every
+    /// request a guest submits singly -- at queue depth one that wakeup is a
+    /// large part of the latency the guest sees. A non-zero value spends a core
+    /// to avoid it. Worth it for a drive under small random I/O on a host with
+    /// cores to spare, and not worth it for a box packed with idle guests.
+    #[serde(default)]
+    pub poll_us: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -256,6 +284,37 @@ mod machine_config_tests {
         let back: MachineConfig =
             serde_json::from_str(&serde_json::to_string(&mc).expect("serialises")).expect("parses");
         assert_eq!(back.cpu_affinity, mc.cpu_affinity);
+    }
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+
+    /// The cache and queue-count fields are new, and every config written
+    /// before them omits them. Their absence has to keep meaning what it meant.
+    #[test]
+    fn a_drive_without_the_new_fields_still_parses() {
+        let d: Drive = serde_json::from_str(
+            r#"{"drive_id": "rootfs", "path_on_host": "/img.ext4", "is_root_device": true}"#,
+        )
+        .expect("parses");
+        assert!(!d.is_read_only);
+        // Absent, not false: absent means "direct where the host supports it",
+        // and false means "do not, whatever the host supports".
+        assert_eq!(d.direct, None);
+        assert_eq!(d.num_queues, None);
+    }
+
+    #[test]
+    fn the_cache_and_queue_fields_are_read_when_given() {
+        let d: Drive = serde_json::from_str(
+            r#"{"drive_id": "rootfs", "path_on_host": "/img.ext4", "is_root_device": true,
+                "is_read_only": true, "direct": false, "num_queues": 2}"#,
+        )
+        .expect("parses");
+        assert_eq!(d.direct, Some(false));
+        assert_eq!(d.num_queues, Some(2));
     }
 }
 

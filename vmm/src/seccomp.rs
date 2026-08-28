@@ -365,8 +365,19 @@ fn baseline() -> Vec<libc::c_long> {
         libc::SYS_writev,
         libc::SYS_pread64,
         libc::SYS_pwrite64,
+        libc::SYS_preadv,
+        libc::SYS_pwritev,
         libc::SYS_fsync,
         libc::SYS_fdatasync,
+        // virtio-blk's datapath. `io_uring_enter` is the one every disk request
+        // goes through, and `io_uring_register` is used once per queue to hand
+        // the ring the disk fd. A host with `kernel.io_uring_disabled=2` makes
+        // `io_uring_setup` fail, which the device handles by falling back to
+        // the positional syscalls above -- so these being allowed here does not
+        // make them required.
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
         // Waiting.
         libc::SYS_epoll_create1,
         libc::SYS_epoll_ctl,

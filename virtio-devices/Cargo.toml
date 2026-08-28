@@ -17,3 +17,4 @@ thiserror = "2.0"
 displaydoc = "0.2"
 libc = "0.2.189"
 vhost = { version = "0.17.0", features = ["vhost-vsock", "vhost-net", "vhost-kern", "vhost-user-frontend"] }
+io-uring = "0.7"

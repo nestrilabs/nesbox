@@ -386,13 +386,7 @@ impl GpuDevice {
         match off {
             CFG_DEVICE_FEAT_SEL => i.com.dfs = v3,
             CFG_DRIVER_FEAT_SEL => i.com.dff = v3,
-            CFG_DRIVER_FEAT => {
-                if i.com.dff == 0 {
-                    i.com.df = (i.com.df & 0xFFFF_FFFF_0000_0000) | (v3 as u64)
-                } else {
-                    i.com.df = (i.com.df & 0xFFFF_FFFF) | ((v3 as u64) << 32)
-                }
-            }
+            CFG_DRIVER_FEAT => write_driver_feature(&mut i.com, v3),
             CFG_MSIX_CONFIG => i.cfg_vec = v2,
             CFG_STATUS => {
                 i.com.st = v1;

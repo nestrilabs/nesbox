@@ -54,7 +54,7 @@ a figure from a different host is a different figure, not a confirmation.
 >
 > **The RDNA 4 host is the validation, not a repeat.** It is a better-configured
 > machine, and re-running this suite there is the point of `scripts/` being one
-> command each — see §13 item 1.
+> command each — see §15 item 1.
 | libdrm | 2.4.134 |
 | virglrenderer | fork at `7fcfce4` **+ the patch in §6** |
 | Guest kernel | 7.2.0+ |
@@ -642,6 +642,45 @@ So an I/O bound on a guest holds only while its working set misses host cache. T
 is the same missing `O_DIRECT` that makes every guest byte cost host memory twice
 (§6): one flag, two problems.
 
+> **Everything above is the measurement of the problem. The fix is measured
+> below, and it closes it.**
+
+#### 12.2.1 With `O_DIRECT`, the same cap holds — and holds exactly
+
+Measured 2026-08-28 on `nestripc-1` (Ryzen 9 5950X; image on xfs, Samsung 850
+EVO, `/dev/sda`). Same cap, same 300 MiB `iflag=direct` guest read, and the host
+page cache **deliberately warmed over that exact region before every run** —
+warm is the case that failed above.
+
+| drive | uncapped | `IOReadBandwidthMax=/dev/sda 20M` |
+|---|---|---|
+| `"direct": false` | 11.3 GB/s | **13.3 GB/s — the cap does nothing** |
+| `"direct": true` | 508 MB/s | **20.0 MB/s — the cap holds** |
+
+Two things to take from this, and the second is the surprise.
+
+**The bound is real now.** Buffered, a warm host cache lets the guest read 665x
+its cap, because reads the page cache satisfies never reach the device `io.max`
+is attached to. Direct, every read reaches the disk, so every read is counted.
+(That the capped buffered figure is *higher* than the uncapped one is noise —
+both are RAM, neither touched `/dev/sda`.)
+
+**It is also accurate, which §12.2 was not.** The original cold-cache run
+overshot its 20 MB/s cap by 2.7x, because host readahead turned the guest's
+1 MiB reads into larger device reads. With `O_DIRECT` there is no readahead to
+inflate them: the measurement lands on 20.0 MB/s. So direct I/O does not merely
+make the cap apply, it makes the number in the config mean what it says.
+
+**What this costs is in §14.1**: about 4% of sequential throughput, and small
+random reads served at 81 MB/s instead of 185 — the latter being the page cache
+doing the work, which is precisely what a bound is supposed to stop.
+
+> Enabling this needed the `io` controller delegated to the user session, which
+> is not the default: `Delegate=pids memory cpu io` in a drop-in for
+> `user@.service`, then a full re-login. Without it `cgroup.controllers` for the
+> session reads `cpu memory pids` and an unprivileged `io.max` silently has
+> nothing to attach to.
+
 > Any storage benchmark that does not state its cache state is measuring the cache.
 > `envelope.sh` evicts the image with `POSIX_FADV_DONTNEED` between runs, which
 > needs no root.
@@ -673,7 +712,7 @@ right at boot.
 | bound | verdict |
 |---|---|
 | CPU | **Holds.** Costs ~2% over native, and quota-to-throughput is nonlinear on the host too |
-| Block I/O | **Holds only against cold cache.** Needs `O_DIRECT` in the VMM to be a real bound |
+| Block I/O | **Holds, with `"direct": true`** — and to the number configured (§12.2.1). Buffered, it is void against a warm cache |
 | Host RAM | **Not a bound on the guest.** Sets what happens when a guest exceeds its allocation, not what it may allocate |
 | VRAM | Holds — but by quota and heap report, not by cgroup (§11) |
 
@@ -746,16 +785,223 @@ depends on a protocol detail we do not control.**
 
 ---
 
-## 14. Open, in the order that matters
+## 14. The block device, before and after `io_uring`
+
+Measured 2026-08-28 with [`scripts/bench-blk.sh`](../scripts/bench-blk.sh), A/B
+against a build of `bdc4192` -- the last commit with the old serial device --
+kept in a worktree so both binaries exist at once.
+
+**A third host, and neither of the two above.** §1's reference host is a
+battery-powered laptop and every GPU number in this file comes from it; this
+section was measured on the **HP Z2 Tower G4 workstation**: Intel Xeon E-2276G,
+6 cores / 12 threads at 3.8 GHz, 62 GiB, kernel 7.2.0-1-cachyos. Mains power, a
+desktop part, so §1's warnings about battery and platform profile do not apply
+here — but its warning about attributing a number to the wrong machine very much
+does. Guest: 4 vCPUs, 2 GiB, Linux 7.2.
+
+**Cache state, stated because §12.2 is about what happens when it is not.** The
+image is a 5 GiB ext4 file on btrfs (`compress=zstd`), and every run is **warm**:
+reads are served from the host page cache. That is deliberate. A cold run
+measures the SSD, which neither binary changes; a warm run measures the device
+model, which is the whole of what changed. Absolute figures here are therefore
+not disk throughput and should never be quoted as such -- **the ratios are the
+result.**
+
+Five repetitions, alternating between the binaries so that clock drift lands on
+both, median reported.
+
+| case | new | old | ratio |
+|---|---|---|---|
+| `seq1m` — 300 MiB in 1 MiB direct reads, one at a time | **8738 MB/s** | 5617 MB/s | **1.56x** |
+| `par8` — eight 32 MiB direct readers at once | **16777 MB/s** | 5368 MB/s | **3.13x** |
+| `rand4k` — 8000 4 KiB direct reads, one at a time | 211 MB/s | 217 MB/s | 0.97x |
+
+Spreads, because a difference inside them is not a difference: `seq1m` 7864–9532
+against 4993–6553, `par8` 15790–17895 against 5162–5592 — neither overlaps.
+`rand4k` is 210–224 against 211–218, which is the same number twice. A second
+independent five-run set gave 1.56x, 3.19x and 0.99x.
+
+**The same comparison on `nestripc-1`**, the target machine -- AMD Ryzen 9
+5950X, 16 cores / 32 threads, image on xfs -- with both binaries forced to
+buffered so that only the datapath differs:
+`seq1m` **12582 against 7315 MB/s, 1.72x**; `par8` **26843 against 8659 MB/s,
+3.10x**; `rand4k` 186 against 189 MB/s, unchanged. An Intel workstation and an
+AMD 16-core, with different disks and thread counts, agree on the shape: about
+3x where depth matters, 1.6–1.7x where the copy does, nothing where neither
+does.
+
+**Each case says something different, and the flat one says the most.**
+
+- **`par8` is the depth.** Eight readers against a device that served one
+  request at a time got one request at a time; against `io_uring` they overlap.
+  Nothing else in the change could produce 3x here, and this is the case a
+  guest loading assets actually looks like.
+- **`seq1m` is the copy and the allocation.** One 1 MiB request at a time, so
+  depth cannot help: what is left is that the old device allocated a host buffer
+  per descriptor, read into it and copied it into guest memory, and the new one
+  hands the guest's own pages to `preadv`. 1.56x for deleting a copy nobody
+  needed.
+- **`rand4k` is unchanged, and that is the honest result.** One 4 KiB read at a
+  time is ~19 µs per request, and none of it is the disk: it is the notify exit,
+  the worker wakeup and the interrupt. Depth cannot help a queue of one, and
+  neither can zero-copy at 4 KiB. **The per-request floor is where the next work
+  is** -- an `ioeventfd` on the notify register, so the kick does not cost a trip
+  through userspace, and `VIRTIO_F_RING_EVENT_IDX`.
+
+**`O_DIRECT` is not in any of these numbers, and could not be, on this host.**
+Every filesystem on it refuses direct I/O in a different way: the ZFS pool wants
+128 KiB alignment (above what a guest can be given as a block size), `/` is
+btrfs with `compress=zstd` and reports no direct-I/O alignment at all, and
+`/tmp` is tmpfs. So the runs above exercise the buffered path. The direct path
+is measured in §14.1, on a host that has filesystems that will do it.
+
+---
+
+## 14.1 `O_DIRECT`, on a host whose filesystems support it
+
+Measured 2026-08-28 on **`nestripc-1`**, which is the machine this is for: AMD
+Ryzen 9 5950X, 16 cores / 32 threads, 62 GiB, kernel 7.2.0-1-cachyos, `/` ext4
+on NVMe and `/mnt/INSTANCES` xfs on a Samsung 850 EVO SATA SSD. Guest: 4 vCPUs,
+2 GiB.
+
+**The two filesystems ask for different things, and both work.**
+
+| backing filesystem | `statx` says | `blk_size` given to the guest | guest sees |
+|---|---|---|---|
+| xfs, `/mnt/INSTANCES` | mem 512, offset **4096** | 4096 | `logical_block_size` 4096 |
+| ext4, `/` | mem 4, offset **512** | 512 | `logical_block_size` 512 |
+
+This is the whole reason the alignment is probed rather than assumed: the same
+image on two filesystems needs two different block sizes, and getting it wrong
+either fails every request with `EINVAL` (too small) or stops the disk probing
+at all (too large — see §5 of `PROGRESS.md` on ZFS).
+
+**Correctness first, because a fast wrong answer is worthless.** Reading through
+the direct path returns the host's bytes exactly: md5 of 64 MiB at a 1 GiB
+offset matches the host's md5 of the same range, on both filesystems, and so
+does a 2000 x 4 KiB read. A read-write guest on xfs wrote 128 MiB with
+`conv=fsync`, read it back through `O_DIRECT` to the same md5, and `fstrim -v /`
+then returned **2.5 GB** of the image's allocation to the host — 5.37 GB down to
+2.82 GB, measured with `du` on the host either side. `dmesg` in the guest
+reported zero I/O errors throughout.
+
+### What it costs, and what it buys
+
+Against buffered I/O with the host cache **evicted before each boot**, so both
+sides start from the disk. Median of five, xfs image:
+
+| case | `O_DIRECT` | buffered, cold | |
+|---|---|---|---|
+| `seq1m` | 501 MB/s | 523 MB/s | buffered 4% ahead |
+| `par8` | 474 MB/s | 426 MB/s | direct 11% ahead, spreads overlap |
+| `rand4k` | 81 MB/s | 185 MB/s | **buffered 2.3x ahead** |
+
+`rand4k` is the honest cost and worth understanding rather than explaining away:
+8000 4 KiB reads are served far faster through the page cache because the host
+reads ahead and keeps what it faulted in. That is not the buffered path being
+better — it is the double-caching, showing up as speed.
+
+**Which is exactly what the next measurement is for.** Evict the image, boot,
+have the guest read 300 MiB of it, and ask the host how much of that file it is
+now holding (`fincore`, no privilege needed):
+
+| drive | guest read 300 MiB at | host page cache held for the image, after |
+|---|---|---|
+| `"direct": false` | 518 MB/s | **312.2 MiB** |
+| `"direct": true` | 499 MB/s | **0.0 MiB** |
+
+**That is the whole argument for the flag, measured.** A guest's working set
+costs host RAM a second time under buffered I/O and nothing at all under direct,
+for about 4% of sequential throughput on this disk. With N guests streaming, the
+buffered row is what multiplies.
+
+The absolute figures here are the SATA SSD's, not the device model's — with
+`O_DIRECT` every guest read reaches the disk, so the disk is what is measured.
+The warm-cache figures in §14 are 10–30x higher for precisely the reason they
+must not be read as I/O: they never left host RAM.
+
+> **A trap this run walked into.** The three cases originally read overlapping
+> regions of the image, so in a `--cold` run only the first was cold — the
+> earlier case faulted the region in and every case after it was served warm,
+> reporting an eight-reader "cold" result of 26 GB/s. Each case now reads its own
+> region, 1 GiB apart. Any cold measurement where the cases share offsets is
+> measuring the first case and then measuring the cache.
+
+## 14.2 Where queue-depth-1 latency goes
+
+§14 found the one case the rewrite did not improve: 4 KiB reads issued one at a
+time, unchanged at ~19-24 us per request. Depth cannot help a queue of one and
+zero-copy cannot help 4 KiB, so what is left is the fixed cost of getting a
+request from the guest to a worker and an answer back — a notify that traps to
+userspace, an eventfd write, a thread wakeup, and an interrupt.
+
+**Measured by removing the wakeup.** A worker can spin on its ring for a
+moment before sleeping (`"poll_us"` on a drive), which turns that wakeup into a
+memory read and can see a request before its notify has finished trapping. The
+difference between the two is what the path costs. `nestripc-1`, 8000 x 4 KiB
+reads, one at a time:
+
+| what the read hits | `poll_us: 0` | polling | recovered |
+|---|---|---|---|
+| host page cache, no disk | 23.6 us | **12.6 us** (50 us) | 11.0 us, +87% throughput |
+| NVMe, `O_DIRECT` | 38.0 us | **28.5 us** (200 us) | 9.5 us, +33% |
+| SATA SSD, `O_DIRECT` | 55.0 us | 51.9 us (50 us) | 3.1 us |
+
+**About 10 us per request is the VMM's own doorbell-to-worker path**, and it is
+the same 10 us on all three — what changes is how much of the total it is. On
+the SATA SSD it hides behind ~45 us of device; on the NVMe it is a quarter of
+the request; served from cache it is half. **The faster the storage, the more it
+matters** — which is the wrong way round for a box whose next disk is faster
+than its last.
+
+The SATA row also shows the window has to outlast the device: at `poll_us: 50`
+against a ~50 us device the completion lands just after the worker gave up, and
+200 us recovers more (the NVMe row is 50 us -> 31.2 us, 200 us -> 28.5 us).
+
+### The split, measured: it was almost all the exit
+
+Polling removes the trap, the dispatch and the wakeup at once, so the table
+above bounds the prize without saying where it is. An `ioeventfd` separates
+them: KVM matches the notify write in the kernel and signals the queue's
+eventfd, so the trap and the bus dispatch disappear while the thread wakeup
+stays. Alternating the two binaries, buffered and warm, 4 KiB reads one at a
+time:
+
+| | us per request |
+|---|---|
+| notify as an MMIO exit | 23.5, 23.5, 23.7 |
+| notify as an `ioeventfd` | 12.3, 10.7, 13.7 |
+| `ioeventfd` + `poll_us: 50` | 7.6 |
+
+**The VM exit was ~11 us of the ~11 us.** Handing the doorbell to the kernel
+recovers essentially everything polling was recovering, and costs nothing at
+runtime — no spinning, no core. Polling still buys another ~5 us on top, which
+is the thread wakeup it was always going to be, and that is the part paid for in
+CPU.
+
+End to end on this host, 4 KiB at depth one: **23.5 → 7.6 us, 3.1x**, of which
+1.9x is free.
+
+**So polling stays off by default, and is now the smaller lever.** Turn it on
+for a drive whose latency matters more than a core — a game loading assets is
+exactly that. But the first thing to check on a slow guest is whether its
+doorbells were registered at all: at `RUST_LOG=debug` the bus says
+`doorbell at 0x… answered by the kernel` once per queue, and virtio-blk says so
+the first time a notify arrives the long way instead.
+
+---
+
+## 15. Open, in the order that matters
 
 1. **RDNA 4.** Untested. Everything above is Vega.
 2. **Frame counts from a real application.** `nesprobe` counts its own; an
    application cannot. A Vulkan layer that reports present timing would generalise.
 3. **Where the ~1.4 ms fixed per-frame cost goes** — virtio round-trips, host
    submission, or the render pass itself. It bounds the cheapest possible frame.
-4. **Block I/O under GPU load.** `PROGRESS.md` §6 records an 8.5 ms worst case over a
-   400 MiB read — over half a 60 Hz frame budget — and it has never been measured
-   *with* GPU work in flight.
+4. **Block I/O under GPU load.** The 8.5 ms worst case over a 400 MiB read that
+   motivated §14's rewrite was measured with nothing else running. Neither it nor
+   §14 has been repeated *with* GPU work in flight, which is the case that
+   matters: over half a 60 Hz frame budget, spent where a frame is being drawn.
 5. **Whether a real engine honours the clamped heap.** §11.2 rests on guests reading
    `VkPhysicalDeviceMemoryBudgetPropertiesEXT` and sizing themselves accordingly.
    `nesprobe` does not, so nothing here demonstrates it. Until something that does
@@ -764,3 +1010,7 @@ depends on a protocol detail we do not control.**
 6. **What a VRAM limit costs when it is not exceeded.** §11.3 shows the limit binds
    and contains, not what the accounting costs a guest that stays inside it. The
    per-submit ccmd parse is on the hot path.
+7. **The block device under GPU load, and on the NVMe.** §14.1 and §12.2.1 are
+   both the SATA SSD with nothing else running. The `/` NVMe was only used for a
+   correctness check, and no storage number here has ever been taken with a
+   guest rendering.
