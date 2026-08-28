@@ -183,6 +183,14 @@ struct Bar {
     probing_hi: bool,
 }
 
+/// A doorbell the kernel is currently answering, and where.
+struct RegisteredDoorbell {
+    bdf: (u8, u8, u8),
+    bar_idx: usize,
+    addr: u64,
+    fd: Arc<vmm_sys_util::eventfd::EventFd>,
+}
+
 struct PciDeviceEntry {
     device: Arc<dyn PciDevice>,
     bars: Vec<Bar>,
@@ -206,14 +214,7 @@ pub struct Bus {
     /// its own address -- and a registration that is not moved with its BAR
     /// leaves the kernel matching an address the device no longer answers at,
     /// while the address it *does* answer at exits to userspace.
-    registered: RwLock<
-        Vec<(
-            (u8, u8, u8),
-            usize,
-            u64,
-            Arc<vmm_sys_util::eventfd::EventFd>,
-        )>,
-    >,
+    registered: RwLock<Vec<RegisteredDoorbell>>,
     /// Where 64-bit BARs are placed. Depends on the guest CPU's address width.
     mmio64: Mmio64Window,
 }
@@ -267,7 +268,12 @@ impl Bus {
                         bdf.1,
                         bdf.2
                     );
-                    registered.push((bdf, door.bar_idx, addr, door.fd.clone()))
+                    registered.push(RegisteredDoorbell {
+                        bdf,
+                        bar_idx: door.bar_idx,
+                        addr,
+                        fd: door.fd.clone(),
+                    })
                 }
                 Err(err) => log::warn!(
                     "{:02x}:{:02x}.{} doorbell at {addr:#x} could not be handed to the kernel \
@@ -290,26 +296,29 @@ impl Bus {
         };
         let mut registered = self.registered.write().unwrap();
         for entry in registered.iter_mut() {
-            if entry.0 != bdf || entry.1 != bar_idx {
+            if entry.bdf != bdf || entry.bar_idx != bar_idx {
                 continue;
             }
             // A doorbell is defined by its offset within the BAR, so that is
             // what survives the move.
-            let offset = entry.2.saturating_sub(old_base);
+            let offset = entry.addr.saturating_sub(old_base);
             let addr = new_base + offset;
-            if addr == entry.2 {
+            if addr == entry.addr {
                 continue;
             }
             // Deassign first: KVM will not hold the same fd at two addresses,
             // and leaving the old registration would have the kernel answering
             // writes to an address the device no longer decodes.
-            if let Err(err) = registrar.unregister(entry.2, &entry.3) {
-                log::warn!("could not unregister a doorbell at {:#x}: {err:#}", entry.2);
+            if let Err(err) = registrar.unregister(entry.addr, &entry.fd) {
+                log::warn!(
+                    "could not unregister a doorbell at {:#x}: {err:#}",
+                    entry.addr
+                );
             }
-            match registrar.register(addr, &entry.3) {
+            match registrar.register(addr, &entry.fd) {
                 Ok(()) => {
-                    log::debug!("doorbell moved {:#x} -> {addr:#x}", entry.2);
-                    entry.2 = addr;
+                    log::debug!("doorbell moved {:#x} -> {addr:#x}", entry.addr);
+                    entry.addr = addr;
                 }
                 Err(err) => log::warn!(
                     "doorbell could not follow its BAR to {addr:#x} ({err:#}); its writes will \

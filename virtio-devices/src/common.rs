@@ -50,6 +50,7 @@ pub const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
 pub const VRING_USED_F_NO_NOTIFY: u16 = 1;
 
 pub const VIRTIO_F_RING_INDIRECT_DESC: u64 = 1 << 28;
+pub const VIRTIO_F_RING_EVENT_IDX: u64 = 1 << 29;
 
 #[derive(Default, Clone)]
 pub struct QState {
@@ -64,6 +65,14 @@ pub struct QState {
     /// descriptor may only be followed into an indirect table when the feature
     /// was negotiated, so this is per-queue state rather than a constant.
     pub indirect: bool,
+    /// Set once the driver has accepted `VIRTIO_F_RING_EVENT_IDX`.
+    ///
+    /// It changes what both sides read: with it, the `flags` fields of both
+    /// rings are ignored and each side publishes the index at which it wants to
+    /// hear from the other instead. Half-applying it -- writing the event
+    /// fields while still reading the flags, or the reverse -- is a queue that
+    /// stalls, so everything gated on it is gated on this one bit.
+    pub event_idx: bool,
 }
 
 #[derive(Default)]
@@ -275,7 +284,10 @@ pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64
 }
 
 /// Write a used element and advance the used index.
-pub fn push_used(mem: &GuestMemoryMmap, q: &QState, head: u16, len: u32) {
+///
+/// Returns the used index after the write, which is what the `EVENT_IDX`
+/// interrupt decision compares against.
+pub fn push_used(mem: &GuestMemoryMmap, q: &QState, head: u16, len: u32) -> u16 {
     // Same division, same reason. Nothing was taken from a zero-sized queue, so
     // there is nothing to complete on one.
     //
@@ -283,7 +295,7 @@ pub fn push_used(mem: &GuestMemoryMmap, q: &QState, head: u16, len: u32) {
     // still in flight when the driver resets the device completes against a
     // queue that no longer has one, and this is where those bytes would land.
     if q.size == 0 || q.used == 0 {
-        return;
+        return 0;
     }
     let ua = vm_memory::GuestAddress(q.used + 2);
     let ui: u16 = mem.read_obj(ua).map(u16::from_le).unwrap_or(0);
@@ -294,7 +306,67 @@ pub fn push_used(mem: &GuestMemoryMmap, q: &QState, head: u16, len: u32) {
     // The guest must not see the new used index before the element it points
     // at, or it reads a slot we have not filled in yet.
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    let _ = mem.write_obj(u16::to_le(ui.wrapping_add(1)), ua);
+    let next = ui.wrapping_add(1);
+    let _ = mem.write_obj(u16::to_le(next), ua);
+    next
+}
+
+/// Where the driver publishes the used index it wants an interrupt at: past
+/// the avail ring's entries.
+fn used_event_addr(q: &QState) -> u64 {
+    q.avail + 4 + q.size as u64 * 2
+}
+
+/// Where the device publishes the avail index it wants a notification at: past
+/// the used ring's entries.
+fn avail_event_addr(q: &QState) -> u64 {
+    q.used + 4 + q.size as u64 * 8
+}
+
+/// The spec's `vring_need_event`: has the index the other side is waiting for
+/// been passed by this batch?
+///
+/// All three are free-running 16-bit counters that wrap, so this is written in
+/// wrapping differences rather than comparisons -- `new > event` is wrong the
+/// moment the ring wraps, and wrong once every 65536 requests is a queue that
+/// stalls for no reason anyone will reproduce.
+pub fn vring_need_event(event: u16, new: u16, old: u16) -> bool {
+    new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
+}
+
+/// Ask the driver to notify us when its avail index reaches `idx`.
+///
+/// The `EVENT_IDX` counterpart to [`set_used_no_notify`], and finer: rather
+/// than all-or-nothing, it names the point at which we want to hear again.
+pub fn set_avail_event(mem: &GuestMemoryMmap, q: &QState, idx: u16) {
+    if q.used == 0 || q.size == 0 {
+        return;
+    }
+    let _ = mem.write_obj(
+        u16::to_le(idx),
+        vm_memory::GuestAddress(avail_event_addr(q)),
+    );
+    // The same store-load barrier as `set_used_no_notify`, for the same race:
+    // this is a hint the driver reads before deciding whether to kick.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Does the driver want an interrupt for the used entries just published?
+///
+/// `old` and `new` are the used index either side of the batch. With
+/// `EVENT_IDX` the driver names the index it wants to be woken at and this
+/// answers whether the batch passed it; without it, the answer is the avail
+/// ring's flag.
+pub fn used_needs_interrupt(mem: &GuestMemoryMmap, q: &QState, old: u16, new: u16) -> bool {
+    if !q.event_idx {
+        return avail_wants_interrupt(mem, q);
+    }
+    match mem.read_obj::<u16>(vm_memory::GuestAddress(used_event_addr(q))) {
+        Ok(event) => vring_need_event(u16::from_le(event), new, old),
+        // Unreadable means we cannot tell, and a suppressed interrupt the
+        // driver wanted is a stalled queue. Wake it.
+        Err(_) => true,
+    }
 }
 
 /// Does the driver want an interrupt for what we just completed?
@@ -609,13 +681,16 @@ pub fn com_read(
 ) -> u64 {
     match off {
         CFG_DEVICE_FEAT_SEL => com.dfs as u64,
-        CFG_DEVICE_FEAT => {
-            if com.dfs == 0 {
-                device_features & 0xFFFF_FFFF
-            } else {
-                device_features >> 32
-            }
-        }
+        // The same word indices as `write_driver_feature`, and the same trap:
+        // a driver walks the selector past the two words a 64-bit feature set
+        // occupies, and "not word zero" as "the high word" would answer word 2
+        // with word 1's contents -- offering feature bits 64 and beyond that
+        // this device has never heard of.
+        CFG_DEVICE_FEAT => match com.dfs {
+            0 => device_features & 0xFFFF_FFFF,
+            1 => device_features >> 32,
+            _ => 0,
+        },
         CFG_DRIVER_FEAT_SEL => com.dff as u64,
         CFG_DRIVER_FEAT => match com.dff {
             0 => com.df & 0xFFFF_FFFF,
@@ -821,6 +896,43 @@ mod queue_tests {
         assert!(com.df & VIRTIO_F_VERSION_1 != 0);
     }
 
+    /// A driver reads device features word by word, and walks past the two a
+    /// 64-bit set occupies. Answering word 2 with word 1's contents offers
+    /// feature bits 64 and up -- bits no device here has, and no driver can
+    /// make sense of.
+    #[test]
+    fn device_features_past_the_second_word_are_empty() {
+        let features = VIRTIO_F_VERSION_1 | VIRTIO_F_RING_EVENT_IDX;
+        let read = |dfs: u32| {
+            let com = ComCfg {
+                dfs,
+                ..Default::default()
+            };
+            com_read(
+                &com,
+                CFG_DEVICE_FEAT,
+                features,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        assert_eq!(read(0), 1 << 29, "EVENT_IDX lives in the low word");
+        assert_eq!(read(1), 1, "VERSION_1 is bit 32, so bit 0 of the high word");
+        assert_eq!(read(2), 0);
+        assert_eq!(read(3), 0);
+    }
+
     /// What the driver wrote is what it reads back, per word.
     #[test]
     fn driver_features_read_back_by_word() {
@@ -872,6 +984,86 @@ mod queue_tests {
             ),
             1
         );
+    }
+
+    /// The three indices are free-running 16-bit counters that wrap. Written
+    /// as comparisons this is right for 65535 requests out of every 65536, and
+    /// the one it is wrong for is a queue that stalls with nothing to see.
+    #[test]
+    fn the_event_check_survives_the_counter_wrapping() {
+        // The ordinary case: the batch carried the used index past the point
+        // the driver asked to be woken at.
+        assert!(vring_need_event(5, 6, 4));
+        // The driver wants a later index than this batch reached.
+        assert!(!vring_need_event(9, 6, 4));
+        // `event` is the index the driver has consumed up to, so reaching it
+        // is not enough -- the batch has to carry past it. Getting this the
+        // other way round means an interrupt per request, which is the cost
+        // the feature exists to remove.
+        assert!(!vring_need_event(6, 6, 5));
+        assert!(vring_need_event(6, 7, 6));
+
+        // Across the wrap: old 65534, new 1, driver waiting at 65535.
+        assert!(vring_need_event(u16::MAX, 1, u16::MAX - 1));
+        // And not yet, across the wrap: waiting at 3, batch reached 1.
+        assert!(!vring_need_event(3, 1, u16::MAX - 1));
+    }
+
+    /// With `EVENT_IDX` the driver names the used index it wants an interrupt
+    /// at, and the ring's flags stop meaning anything to either side.
+    #[test]
+    fn event_idx_replaces_the_interrupt_flag() {
+        let m = mem();
+        let q = QState {
+            size: 8,
+            avail: 0x2000,
+            used: 0x3000,
+            event_idx: true,
+            ..Default::default()
+        };
+        // `used_event` sits past the avail ring's entries.
+        let used_event = GuestAddress(q.avail + 4 + 8 * 2);
+        m.write_obj(u16::to_le(4), used_event).unwrap();
+        // The flag says "no interrupt", and with the feature negotiated that
+        // must not be what decides.
+        m.write_obj(
+            u16::to_le(VRING_AVAIL_F_NO_INTERRUPT),
+            GuestAddress(q.avail),
+        )
+        .unwrap();
+
+        assert!(
+            used_needs_interrupt(&m, &q, 3, 5),
+            "batch passed used_event"
+        );
+        assert!(
+            !used_needs_interrupt(&m, &q, 1, 2),
+            "batch did not reach it"
+        );
+
+        // Without the feature, the flag is exactly what decides.
+        let q = QState {
+            event_idx: false,
+            ..q
+        };
+        assert!(!used_needs_interrupt(&m, &q, 3, 5));
+    }
+
+    /// The device's half: it publishes the avail index it wants to hear about
+    /// next, past the used ring's entries.
+    #[test]
+    fn the_device_publishes_where_it_wants_the_next_notification() {
+        let m = mem();
+        let q = QState {
+            size: 8,
+            avail: 0x2000,
+            used: 0x3000,
+            event_idx: true,
+            ..Default::default()
+        };
+        set_avail_event(&m, &q, 12);
+        let at = GuestAddress(q.used + 4 + 8 * 8);
+        assert_eq!(u16::from_le(m.read_obj::<u16>(at).unwrap()), 12);
     }
 
     /// `next` must be below the queue size. An index past the ring is off the

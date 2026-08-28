@@ -110,6 +110,14 @@ pub trait Engine: Send {
     fn run(&mut self, block: bool, out: &mut Vec<Done>) -> io::Result<bool>;
 
     fn name(&self) -> &'static str;
+
+    /// How many notifications the guest has sent, in total.
+    ///
+    /// An eventfd counts: a read returns how many times it was written since
+    /// the last one, so this is the guest's notify count and not ours. Used to
+    /// answer whether suppressing notifications more finely would be worth
+    /// anything.
+    fn notifies(&self) -> u64;
 }
 
 // ── io_uring ────────────────────────────────────────────────────────────────
@@ -130,6 +138,7 @@ pub struct UringEngine {
     /// Submitted but not yet handed to the kernel, so that a batch of requests
     /// costs one `io_uring_enter` rather than one each.
     unsubmitted: usize,
+    notifies: u64,
 }
 
 impl UringEngine {
@@ -172,6 +181,7 @@ impl UringEngine {
             depth,
             in_flight: 0,
             unsubmitted: 0,
+            notifies: 0,
         })
     }
 
@@ -263,6 +273,11 @@ impl Engine for UringEngine {
             if cqe.user_data() == KICK_TOKEN {
                 kicked = true;
                 self.kick_armed = false;
+                // The eventfd's counter: how many notifies the guest sent
+                // while we were not looking.
+                if cqe.result() == 8 {
+                    self.notifies += *self.kick_buf;
+                }
                 continue;
             }
             self.in_flight -= 1;
@@ -277,6 +292,10 @@ impl Engine for UringEngine {
     fn name(&self) -> &'static str {
         "io_uring"
     }
+
+    fn notifies(&self) -> u64 {
+        self.notifies
+    }
 }
 
 // ── Synchronous fallback ────────────────────────────────────────────────────
@@ -285,6 +304,7 @@ pub struct SyncEngine {
     fd: i32,
     kick: Arc<EventFd>,
     done: Vec<Done>,
+    notifies: u64,
 }
 
 impl SyncEngine {
@@ -293,6 +313,7 @@ impl SyncEngine {
             fd,
             kick,
             done: Vec::new(),
+            notifies: 0,
         }
     }
 }
@@ -347,11 +368,18 @@ impl Engine for SyncEngine {
         }
         // Nothing in flight -- everything here completes inline -- so the only
         // thing left to wait for is the guest.
-        self.kick.read().map(|_| true)
+        self.kick.read().map(|count| {
+            self.notifies += count;
+            true
+        })
     }
 
     fn name(&self) -> &'static str {
         "synchronous"
+    }
+
+    fn notifies(&self) -> u64 {
+        self.notifies
     }
 }
 

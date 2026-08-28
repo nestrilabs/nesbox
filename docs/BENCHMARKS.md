@@ -991,6 +991,50 @@ the first time a notify arrives the long way instead.
 
 ---
 
+## 14.3 `VIRTIO_F_RING_EVENT_IDX`: implemented, and worth almost nothing here
+
+The feature lets each side name the index at which it wants to hear from the
+other, instead of the all-or-nothing flags. It was measured before being built,
+by counting what a workload actually spends on doorbells and interrupts, and
+then again after.
+
+**Before.** 4 KiB reads, eight concurrent, across four queues, per request:
+0.61-0.70 notifies and 0.55-0.63 interrupts. The coarse flags were already
+taking roughly a third of the notifies and two fifths of the interrupts, so what
+was left to win was the remainder of that.
+
+**After**, alternating binaries on the same workload:
+
+| | notifies/request | interrupts/request | 48000 x 4 KiB |
+|---|---|---|---|
+| flags only | 0.64-0.70 | 0.57-0.63 | 82, 83 ms |
+| `EVENT_IDX` | 0.61-0.64 | 0.57-0.59 | 80, 85 ms |
+
+**It does what it says and it does not show up.** Notifications fall by roughly
+5-8%, interrupts by 2-5%, and the elapsed time is the same either way — 80 and
+85 against 82 and 83 is noise, not a result.
+
+The reason is in the workload, not the feature: eight `dd`s at queue depth one
+spread over four queues is about two requests in flight per queue, and two
+requests is nothing to coalesce. `EVENT_IDX` earns its keep at depths where a
+batch is worth suppressing, which needs a guest-side tool that can hold a queue
+deep — `fio --iodepth=32` — and the test rootfs has none. **Until that is
+measured, this is a feature that is implemented, negotiated, and unproven.**
+
+It is kept because it is standard, correct, tested against the wrapping cases
+that make it subtle, and moves both counters the right way. It is not kept
+because it made anything here faster.
+
+> Finding it took fixing a bug of its own: the device-features *read* had the
+> same word-index error §5 of `PROGRESS.md` records for the write side, and
+> answered feature-select words 2 and 3 with word 1's contents — offering the
+> guest feature bits 64 and up. Separately, the feature was for a while not
+> being offered at all, because a `cargo fmt` reflow silently defeated the edit
+> that added it. The `event_idx=` field in the `Driver OK` log line exists so
+> that "did the driver take it?" is never again a question to guess at.
+
+---
+
 ## 15. Open, in the order that matters
 
 1. **RDNA 4.** Untested. Everything above is Vega.

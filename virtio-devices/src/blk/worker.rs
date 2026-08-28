@@ -16,7 +16,9 @@ use super::engine::{self, Done, Engine, IoVec, Job};
 use super::request::{self, BLK_S_IOERR, BLK_S_OK, DISK_ID, Op, ParseError, Request};
 use super::{Irq, Queue};
 use crate::common::QState;
-use crate::common::{avail_wants_interrupt, pop_avail, push_used, set_used_no_notify};
+use crate::common::{
+    pop_avail, push_used, set_avail_event, set_used_no_notify, used_needs_interrupt,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -152,11 +154,23 @@ pub struct Worker {
     stop: Arc<AtomicBool>,
     /// There is, or may be, more in the avail ring than we have taken.
     want_drain: bool,
+    /// The used index as the guest last saw it, carried across a batch so the
+    /// `EVENT_IDX` interrupt decision has both ends of it.
+    used_idx: u16,
     /// Whether the driver has been asked to stop kicking. Tracked so the flag
     /// is written only when it changes.
     notify_suppressed: bool,
     /// One line, once, when the host turns out not to support hole punching.
     discard_unsupported: bool,
+    /// Requests taken from the ring, and interrupts raised for them. Reported
+    /// on the way out: the ratio between them, and between them and the
+    /// guest's notify count, is what says whether suppressing either more
+    /// finely -- `VIRTIO_F_RING_EVENT_IDX` -- would be worth anything.
+    requests: u64,
+    interrupts: u64,
+    /// Request count at the last summary line, so a long-running guest gets
+    /// one occasionally rather than one per drain.
+    reported: u64,
     /// How many requests have had to be staged through a bounce buffer, and
     /// whether that has been reported yet.
     ///
@@ -195,8 +209,12 @@ impl Worker {
             free: (0..depth as u32).rev().collect(),
             stop,
             want_drain: true,
+            used_idx: 0,
             notify_suppressed: false,
             discard_unsupported: false,
+            requests: 0,
+            interrupts: 0,
+            reported: 0,
             staged: 0,
             staged_reported: false,
         }
@@ -253,6 +271,7 @@ impl Worker {
                 continue;
             }
 
+            let batch_start = self.used_idx;
             let mut used = 0usize;
             for done in completions.drain(..) {
                 used += self.complete(&q, done);
@@ -260,10 +279,11 @@ impl Worker {
             if self.want_drain {
                 used += self.drain(&mut q);
             }
-            if used > 0 && avail_wants_interrupt(&self.mem, &q) {
+            if used > 0 && used_needs_interrupt(&self.mem, &q, batch_start, self.used_idx) {
                 let mut irq = self.irq.lock().unwrap();
                 irq.isr |= 1;
                 irq.msix.trigger(q.vec);
+                self.interrupts += 1;
             }
         }
     }
@@ -360,6 +380,7 @@ impl Worker {
                 let Some((head, descs)) = pop_avail(&self.mem, q) else {
                     break;
                 };
+                self.requests += 1;
                 used += self.start(q, head, &descs);
             }
             if !self.can_accept() {
@@ -374,12 +395,64 @@ impl Worker {
             // going to sleep, or that request sits there with no kick coming.
             if !has_avail(&self.mem, q) {
                 self.want_drain = false;
+                self.report();
                 return used;
             }
         }
     }
 
+    /// A line about what this queue has been doing, on going idle, and not
+    /// more than once per `REPORT_EVERY` requests.
+    ///
+    /// The two ratios are the point. Notifies per request says what the guest
+    /// is spending on doorbells, interrupts per request what it is spending on
+    /// being woken -- and both are what `VIRTIO_F_RING_EVENT_IDX` exists to
+    /// reduce, so they say whether offering it would buy anything here.
+    ///
+    /// Reported here rather than on the way out because the VMM exits with
+    /// `process::exit` and destructors do not run, and because a guest that
+    /// runs for days never exits at all.
+    fn report(&mut self) {
+        const REPORT_EVERY: u64 = 4096;
+        if self.requests < self.reported + REPORT_EVERY {
+            return;
+        }
+        self.reported = self.requests;
+        let notifies = self.engine.as_deref().map(|e| e.notifies()).unwrap_or(0);
+        log::debug!(
+            "virtio-blk: queue {}: {} requests, {} notifies ({:.2}/req), {} interrupts \
+             ({:.2}/req)",
+            self.queue.index,
+            self.requests,
+            notifies,
+            notifies as f64 / self.requests as f64,
+            self.interrupts,
+            self.interrupts as f64 / self.requests as f64,
+        );
+    }
+
+    /// Ask the driver to stop kicking, or to start again.
+    ///
+    /// With `EVENT_IDX` the two sides trade indices rather than flags, so
+    /// "stop" is a point far enough ahead that the driver will not reach it
+    /// while we are draining, and "start" is the next entry we have not taken.
+    /// The flag is not touched in that case: with the feature negotiated the
+    /// driver does not read it, and writing both would be describing the queue
+    /// two ways at once.
     fn suppress_notify(&mut self, q: &QState, on: bool) {
+        if q.event_idx {
+            // `q.last` is the next avail entry we would take, so naming it is
+            // "tell me about the very next one"; half a ring ahead is "not for
+            // a while", and it is re-armed the moment we go idle.
+            let want = if on {
+                q.last.wrapping_add(q.size / 2).wrapping_add(1)
+            } else {
+                q.last
+            };
+            set_avail_event(&self.mem, q, want);
+            self.notify_suppressed = on;
+            return;
+        }
         if self.notify_suppressed != on {
             set_used_no_notify(&self.mem, q, on);
             self.notify_suppressed = on;
@@ -392,12 +465,12 @@ impl Worker {
             Ok(r) => r,
             Err(ParseError::Malformed(why)) => {
                 log::warn!("virtio-blk: dropping a malformed request: {why}");
-                push_used(&self.mem, q, head, 0);
+                self.used_idx = push_used(&self.mem, q, head, 0);
                 return 1;
             }
             Err(ParseError::Rejected(addr, status)) => {
                 self.write_status(addr, status);
-                push_used(&self.mem, q, head, 1);
+                self.used_idx = push_used(&self.mem, q, head, 1);
                 return 1;
             }
         };
@@ -417,7 +490,7 @@ impl Worker {
                 written += n as u32;
             }
             self.write_status(req.status_addr, BLK_S_OK);
-            push_used(&self.mem, q, head, written + 1);
+            self.used_idx = push_used(&self.mem, q, head, written + 1);
             return 1;
         }
 
@@ -430,7 +503,7 @@ impl Worker {
             // `can_accept` is checked before every pop, so this cannot happen;
             // completing the chain beats leaving the guest waiting forever.
             self.write_status(req.status_addr, BLK_S_IOERR);
-            push_used(&self.mem, q, req.head, 1);
+            self.used_idx = push_used(&self.mem, q, req.head, 1);
             return 1;
         };
 
@@ -439,7 +512,7 @@ impl Worker {
             Err((head, status_addr, status)) => {
                 self.free.push(token);
                 self.write_status(status_addr, status);
-                push_used(&self.mem, q, head, 1);
+                self.used_idx = push_used(&self.mem, q, head, 1);
                 return 1;
             }
         };
@@ -453,7 +526,7 @@ impl Worker {
                 log::error!("virtio-blk: could not submit a request: {e}");
                 self.free.push(token);
                 self.write_status(slot.status_addr, BLK_S_IOERR);
-                push_used(&self.mem, q, slot.head, 1);
+                self.used_idx = push_used(&self.mem, q, slot.head, 1);
                 1
             }
         }
@@ -651,7 +724,7 @@ impl Worker {
                 _ => 1,
             };
             w.write_status(slot.status_addr, status);
-            push_used(&w.mem, q, slot.head, len);
+            w.used_idx = push_used(&w.mem, q, slot.head, len);
             w.free.push(token);
             1
         };
@@ -756,7 +829,7 @@ impl Worker {
             Err(e) => {
                 log::error!("virtio-blk: could not resubmit a request: {e}");
                 self.write_status(slot.status_addr, BLK_S_IOERR);
-                push_used(&self.mem, q, slot.head, 1);
+                self.used_idx = push_used(&self.mem, q, slot.head, 1);
                 self.free.push(token);
                 1
             }

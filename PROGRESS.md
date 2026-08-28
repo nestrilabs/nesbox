@@ -210,14 +210,16 @@ Do not re-derive these.
   dead, and anything with no trailing newline — a shell prompt, `clear` — shows
   up only when the *next* command produces output. `serial.rs` already got this
   right; `console.rs` did not.
-- **A driver writes more feature-select words than there are features.** Linux
-  walks `driver_feature_select` 0, 1, 2, 3 -- the spec's feature space is 128
-  bits -- and the last two carry zero. Every device here read that as "not word
-  zero, so it must be the high word" and let select 2 wipe bits 32..63 back out,
-  `VIRTIO_F_VERSION_1` with them. Nothing was gated on those bits, so the only
-  symptom was a modern driver recorded as a legacy one; it is now
-  `write_driver_feature` in `common.rs`, matching on the word index, with the
-  same fix in the read path.
+- **A driver walks the feature selector past the features.** Linux writes and
+  reads `feature_select` 0, 1, 2, 3 -- the spec's feature space is 128 bits --
+  and the last two carry zero. Every device here read that as "not word zero, so
+  it must be the high word", which broke it in *both* directions: on the write
+  side select 2 wiped bits 32..63, `VIRTIO_F_VERSION_1` with them, and on the
+  read side selects 2 and 3 answered with word 1's contents, offering the guest
+  feature bits 64 and up. Both now match on the word index --
+  `write_driver_feature` and `com_read` in `common.rs`. The write half was found
+  first and the read half sat there another day, looking like a driver that had
+  declined a feature.
 - **`IORING_SETUP_SINGLE_ISSUER` binds a ring to the task that first touches
   it.** Building a worker's ring where the worker is *constructed* and then
   moving it to the thread that runs it fails every submission with `EEXIST` --
@@ -410,10 +412,16 @@ Do not re-derive these.
       have the kernel answering an address the device no longer decodes. Three
       tests in `pci/src/lib.rs` cover assignment, the move, and
       sizing-is-not-a-move.
-    - **`VIRTIO_F_RING_EVENT_IDX` (open).** Suppresses notifications and
-      interrupts more precisely than the flags do -- but it does nothing for a
-      queue of depth one, where every request needs its notify and its interrupt
-      anyway. A throughput lever, not a latency one.
+    - **`VIRTIO_F_RING_EVENT_IDX` (implemented, unproven).** Each side names
+      the index at which it wants to hear from the other, rather than the
+      all-or-nothing flags. Offered, negotiated, and measured: notifications per
+      request fall from ~0.67 to ~0.62 and interrupts from ~0.60 to ~0.58, and
+      **the elapsed time does not move**. The workload is why -- eight readers
+      at depth one over four queues is ~2 requests in flight per queue, and two
+      is nothing to coalesce. Proving it needs a guest that can hold a queue
+      deep (`fio --iodepth=32`), which the test rootfs cannot. Benchmarks §14.3.
+      It does nothing for depth one in any case, where each request needs its
+      own notify and its own interrupt.
 
 - **Egress works**: guest to 1.1.1.1, 0% loss, 11.5ms, with the host set up as
   the only privileged step. Verified from a blocked host: setup detected the

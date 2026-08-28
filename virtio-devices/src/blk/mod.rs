@@ -139,8 +139,12 @@ impl BlkDevice {
             );
         }
 
-        let mut features =
-            VIRTIO_F_VERSION_1 | VIRTIO_F_RING_INDIRECT_DESC | F_SIZE_MAX | F_SEG_MAX | F_BLK_SIZE;
+        let mut features = VIRTIO_F_VERSION_1
+            | VIRTIO_F_RING_INDIRECT_DESC
+            | VIRTIO_F_RING_EVENT_IDX
+            | F_SIZE_MAX
+            | F_SEG_MAX
+            | F_BLK_SIZE;
         if config.read_only {
             features |= F_RO;
         } else {
@@ -191,7 +195,8 @@ impl BlkDevice {
         }
 
         log::info!(
-            "virtio-blk: {num_queues} queue(s) of {QUEUE_SIZE}, indirect descriptors offered{}",
+            "virtio-blk: {num_queues} queue(s) of {QUEUE_SIZE}, indirect descriptors and \
+             event-index offered{}",
             if config.poll_us > 0 {
                 format!(", {}us ring polling", config.poll_us)
             } else {
@@ -320,12 +325,16 @@ impl BlkDevice {
                 // that a driver cannot change the answer mid-flight.
                 let negotiated = i.com.df & self.features;
                 let indirect = negotiated & VIRTIO_F_RING_INDIRECT_DESC != 0;
+                let event_idx = negotiated & VIRTIO_F_RING_EVENT_IDX != 0;
                 for queue in &self.queues {
-                    queue.state.lock().unwrap().indirect = indirect;
+                    let mut q = queue.state.lock().unwrap();
+                    q.indirect = indirect;
+                    q.event_idx = event_idx;
                 }
                 if old & STATUS_DRIVER_OK == 0 && v1 & STATUS_DRIVER_OK != 0 {
                     log::info!(
-                        "virtio-blk: Driver OK, features {negotiated:#x}, indirect={indirect}"
+                        "virtio-blk: Driver OK, features {negotiated:#x}, indirect={indirect}, \
+                         event_idx={event_idx}"
                     );
                 }
                 if v1 == 0 {
