@@ -99,6 +99,10 @@ and nothing it does not.
 
 ```bash
 cargo build --release
+# two binaries: target/release/nesbox, and target/release/jailer beside it.
+# The jailer is a host-side tool, run *before* nesbox and never inside the
+# jail it builds -- see docs/SECURITY.md and build/README.md.
+
 sudo ./scripts/nestri-net-setup.sh
 
 # once per host: IP forwarding and NAT so guests can reach the network.
@@ -163,8 +167,6 @@ scheduler.
 Roughly in priority order:
 
 
-- **Overlapping block I/O** — requests are served off the vCPU thread but still
-  one at a time; io_uring would let a deep queue run concurrently.
 - **Wiring the jailer in.** `tools/jailer` already does the chroot, bind-mount,
   uid/gid drop and exec; nothing yet allocates a uid per guest or calls it
   before nesbox starts. seccomp bounds what a compromised device model can

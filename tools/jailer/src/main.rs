@@ -638,11 +638,17 @@ mod tests {
         assert_eq!(parse(&argv).unwrap().kvm, PathBuf::from("/dev/kvm-alt"));
     }
 
-    /// End to end, in a forked child so a failure or a stray mount cannot
-    /// affect the test process. Skips itself when not root, the same
-    /// pattern `vmm/src/isolation.rs` uses for its own privileged tests.
+    /// End to end up to the exec, in a forked child so a failure or a stray
+    /// mount cannot affect the test process. Skips itself when not root, the
+    /// same pattern `vmm/src/isolation.rs` uses for its own privileged tests.
+    ///
+    /// [`exec_command`] itself is deliberately not called: it replaces the
+    /// process image, so there would be no child left to assert in. What it
+    /// does beyond `execv` -- `PR_SET_NO_NEW_PRIVS` -- is a process-wide,
+    /// irreversible flag, which is exactly why it is not set in a test
+    /// process either.
     #[test]
-    fn a_real_jail_chroots_binds_drops_and_execs() {
+    fn a_real_jail_chroots_binds_and_drops() {
         if !is_root() {
             eprintln!("skipped: not root");
             return;
