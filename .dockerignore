@@ -1,0 +1,13 @@
+# build/Dockerfile's context is the repo root (see build/Makefile). Keeps
+# the daemon-side context transfer to what it actually COPYs: Cargo
+# manifests, the four workspace crates, and patches/.
+.git
+target
+tools/nesprobe/target
+build/output
+docs
+examples
+benchmarks
+*.md
+*.tar.zst
+*.local.json

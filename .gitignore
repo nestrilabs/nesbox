@@ -6,3 +6,6 @@
 *.tar.zst
 tools/nesprobe/target
 *.local.json
+
+# build/'s own output — an unpacked jail image, not source
+/build/output/
