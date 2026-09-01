@@ -62,11 +62,22 @@ by the VMM itself.
   that host memory "is bounded for the whole process by cgroups" as though it were
   a property of the system. It was a property of whoever wrote the unit file, and
   nothing checked.
-- **`chroot` fights the requirements**: the DRM render node, virtiofs source
-  directories, and the metrics socket path all live outside any plausible jail.
+- **`chroot` fights the requirements** *if the jail is built to exclude the
+  host.* `tools/jailer` takes the opposite approach: bind-mount in exactly the
+  DRM render node, `/dev/kvm`, any vhost device nodes, `/sys`, `/proc` and the
+  metrics socket path a box needs, at the same path inside the jail, then
+  chroot. Nothing is discovered or guessed — every path is named on the
+  jailer's own command line by whatever launches it. virtiofs source
+  directories stay out of scope: virtiofsd already runs unsandboxed (below),
+  so it is never inside anything the jailer is responsible for.
 - It assumes Firecracker's API-socket contract, which is not ours.
+  `tools/jailer` has none — it is `chroot` + bind-mount + uid/gid drop +
+  `execve`, and nothing else.
 
-Its **uid/gid dropping is worth taking** and is not implemented here yet.
+Its **uid/gid dropping is worth taking**, and `tools/jailer` now does it. What
+is still missing is everything around it: nothing today allocates a uid per
+guest or calls the jailer before nesbox starts. It exists as a binary with its
+own tests, not yet as part of any box's actual launch path.
 
 No dependency was added either. The runtime install is `prctl(PR_SET_NO_NEW_PRIVS)`
 plus one `seccomp` syscall against a flat array of 8-byte instructions — the whole
@@ -168,12 +179,13 @@ from each other by anything in this file.
 
 Three things fix it, and none of them is a syscall filter:
 
-- **A uid per guest.** The jailer's uid/gid drop, noted below as "worth taking";
-  it is the single highest-value unfinished item in this document. nesbox cannot
-  do this to itself — an unprivileged process cannot change uid — so it belongs to
-  whatever launches the box.
-- **A mount namespace**, so the paths a guest's VMM can name are the ones it was
-  given.
+- **A uid per guest.** `tools/jailer` does the drop — nesbox cannot do this to
+  itself, an unprivileged process cannot change its own uid — but nothing yet
+  allocates a uid per guest or calls the jailer before nesbox starts. That
+  remains whatever launches the box's job.
+- **A mount namespace**, so the paths a guest's VMM can name are the ones it
+  was given. `tools/jailer` unshares one and bind-mounts in exactly what a box
+  needs before chrooting; again, nothing yet calls it.
 - **A network namespace** with no route out — *this one is implemented*, as
   `unshare-network` above, and off by default.
 

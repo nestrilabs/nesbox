@@ -125,9 +125,11 @@ works today, verified by running it:
 
 What is missing is as important:
 
-- **No jailer, no uid per guest, no mount namespace.** The VMM is confined by a
-  seccomp-bpf allowlist (on by default) and can optionally enter a private network
-  namespace, but it runs as whoever launched it. Boxes sharing a user account are
+- **A jailer exists (`tools/jailer`) but nothing calls it yet.** It chroots
+  into a materialized jail image, bind-mounts in exactly the hardware paths a
+  box needs, and drops from root to a per-guest uid before exec'ing nesbox —
+  but nothing today allocates that uid or invokes it, so every box still runs
+  as whoever launched nesbox directly. Boxes sharing a user account are
   separated by the VM boundary and little else — see [SECURITY.md](docs/SECURITY.md).
 - **No management API.** Configuration is a JSON file and the process is the
   interface. A read-only metrics socket exists ([STATS.md](docs/STATS.md)); there
@@ -141,9 +143,10 @@ What is missing is as important:
 
 Guests are isolated by KVM hardware virtualisation. The VMM process is also
 confined by a seccomp-bpf allowlist, on by default — see [SECURITY.md](docs/SECURITY.md)
-for what that does and, more usefully, what it does not. There is no jailer
-chroot, no uid per guest and no namespaces, so boxes sharing a user account are
-separated by the VM boundary and not much else.
+for what that does and, more usefully, what it does not. `tools/jailer` can
+chroot a box into a materialized jail image with its own uid and mount
+namespace, but nothing yet calls it before nesbox starts, so boxes sharing a
+user account are still separated by the VM boundary and not much else.
 
 Multiple nesbox VMs share the host GPU through its DRM render node, each with
 its own renderer context and fence timeline, isolated by the kernel's DRM
@@ -162,9 +165,11 @@ Roughly in priority order:
 
 - **Overlapping block I/O** — requests are served off the vCPU thread but still
   one at a time; io_uring would let a deep queue run concurrently.
-- **A uid per guest and a mount namespace** — seccomp landed and bounds what a
-  compromised device model can *call*; these bound what it can *reach*, which is
-  the larger gap. See [SECURITY.md](docs/SECURITY.md).
+- **Wiring the jailer in.** `tools/jailer` already does the chroot, bind-mount,
+  uid/gid drop and exec; nothing yet allocates a uid per guest or calls it
+  before nesbox starts. seccomp bounds what a compromised device model can
+  *call*; this bounds what it can *reach*, which is the larger gap. See
+  [SECURITY.md](docs/SECURITY.md).
 - **A management API** — the stats socket already reports GPU health and VRAM
   usage; lifecycle control over a socket is what is still missing.
 - **Shader cache mounting** — a persistent host directory for virglrenderer, to
