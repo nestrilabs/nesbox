@@ -5,14 +5,14 @@
 #  execs nesbox: patched virglrenderer (this repo's patches/, applied to the
 #  upstream commit
 #  patches/0002 names as its base), nesbox itself, and Mesa — pulled from
-#  nestrilabs/nestri:base rather than rebuilt here, so the guest and host
+#  ghcr.io/nestrilabs/nestri/base:latest rather than rebuilt here, so the guest and host
 #  sides of the virtio-gpu native-context protocol are always the same
 #  patched Mesa and never quietly drift onto two different ones.
 #
 #  Build from the repo root:
 #    docker build -f build/Dockerfile -t nesbox-jail:latest .
 #  (`make build` in this directory does exactly that.) Needs
-#  nestrilabs/nestri:base to already exist, locally or pullable — see
+#  ghcr.io/nestrilabs/nestri/base:latest to already exist, locally or pullable — see
 #  nestri/build/ in the nestri repo.
 #
 #  Built and verified end to end once already — see build/README.md for
@@ -26,7 +26,7 @@
 # is valid Dockerfile syntax and works under BuildKit, but fails buildah with
 # a misleading "no FROM statement found", confirmed by reproducing it in
 # isolation before moving this.
-ARG NESTRI_BASE_IMAGE=nestrilabs/nestri:base
+ARG NESTRI_BASE_IMAGE=ghcr.io/nestrilabs/nestri/base:latest
 
 FROM docker.io/archlinux:base-devel AS initial
 RUN pacman -Syu --noconfirm
@@ -123,13 +123,13 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 #  The shared Mesa build — pulled, not rebuilt
 #
 #  NESTRI_BASE_IMAGE (declared at the top of this file — see the comment
-#  there for why) defaults to the floating `:base` tag, which is mutable by
-#  design — nestri publishes exactly one, continuously-updated `base` tag. A
+#  there for why) defaults to the floating `:latest` tag, which is mutable
+#  by design — nestri publishes exactly one, continuously-updated tag. A
 #  republish can move it to a different Mesa commit with nothing on either
 #  side of the native-context protocol to detect the mismatch: no version
 #  negotiation exists, so a jail built against a different Mesa than the
 #  guest it pairs with can fail rendering silently rather than refuse to
-#  boot. Pin this to a digest (`nestrilabs/nestri@sha256:...`) for any build
+#  boot. Pin this to a digest (`ghcr.io/nestrilabs/nestri/base@sha256:...`) for any build
 #  meant to pair with a specific, already-built guest rootfs — the floating
 #  default here is for local development, where "whatever base currently is"
 #  is the point.
@@ -160,7 +160,7 @@ RUN cat /tmp/virgl.manifest /tmp/nesbox.manifest > /tmp/.strip-manifest && \
 COPY --from=virgl-build  /artifacts/virgl  /
 COPY --from=nesbox-build /artifacts/nesbox /
 
-# Mesa: the whole /usr/lib and /usr/share/vulkan out of nestrilabs/nestri:base,
+# Mesa: the whole /usr/lib and /usr/share/vulkan out of ghcr.io/nestrilabs/nestri/base:latest,
 # not a curated subset. Imprecise on purpose rather than by oversight — that
 # image has no manifest distinguishing "Mesa's files" from "everything else
 # it installed" once published, so this pulls the tree wholesale rather than

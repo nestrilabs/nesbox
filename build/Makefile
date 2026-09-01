@@ -16,8 +16,8 @@ FORCE_REBUILD ?=
 # Floating by default — see the NESTRI_BASE_IMAGE comment in the Dockerfile
 # for why that's fine for local development and not for anything meant to
 # pair with a specific guest image. Override with a digest for the latter:
-#   make build NESTRI_BASE_IMAGE=nestrilabs/nestri@sha256:...
-NESTRI_BASE_IMAGE ?= nestrilabs/nestri:base
+#   make build NESTRI_BASE_IMAGE=ghcr.io/nestrilabs/nestri/base@sha256:...
+NESTRI_BASE_IMAGE ?= ghcr.io/nestrilabs/nestri/base:latest
 
 # Needs NESTRI_BASE_IMAGE to already exist — locally (built with `make build`
 # in nestri/build/) or pullable from wherever it ends up published. Not

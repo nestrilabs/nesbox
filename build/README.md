@@ -3,7 +3,7 @@
 Builds the directory tree a jailer would chroot into before it execs
 nesbox: patched `virglrenderer` (this repo's
 `patches/`, applied to upstream), `nesbox` itself, and Mesa — reused from
-`nestrilabs/nestri:base`, not rebuilt, so the guest and host sides of the
+`ghcr.io/nestrilabs/nestri/base:latest`, not rebuilt, so the guest and host sides of the
 virtio-gpu native-context protocol are always the same patched Mesa commit.
 
 ```
@@ -20,7 +20,7 @@ make build          # docker build -t nesbox-jail:latest
 make materialize     # + unpack into output/jail/
 ```
 
-Needs `nestrilabs/nestri:base` to already exist — build it from
+Needs `ghcr.io/nestrilabs/nestri/base:latest` to already exist — build it from
 `nestri/build/` in the [`nestri`](https://github.com/nestrilabs/nestri)
 repo first.
 
@@ -35,7 +35,7 @@ no fstab, no getty. Just enough userspace for `nesbox` to run: Mesa, patched
 
 This Dockerfile has been built successfully, start to finish, against a
 real checkout of virglrenderer commit `7fcfce4` and a real
-`nestrilabs/nestri:base`. Four things it started out guessing at, or hadn't
+`ghcr.io/nestrilabs/nestri/base:latest`. Four things it started out guessing at, or hadn't
 reached yet, are settled now, not just asserted:
 
 - **`git apply patches/*.patch` applies cleanly.** The patches read as
@@ -67,7 +67,7 @@ dependency inside it, including the patched `libvirglrenderer.so.1`, and
 ## The Mesa closure is imprecise, on purpose
 
 `jail`'s final stage copies the whole `/usr/lib` and `/usr/share/vulkan` out
-of `nestrilabs/nestri:base`, not a curated list of Mesa's own files. That
+of `ghcr.io/nestrilabs/nestri/base:latest`, not a curated list of Mesa's own files. That
 image carries no manifest distinguishing Mesa's files from everything else
 it installed once published — guessing filenames (`libEGL*`,
 `dri/*_dri.so`, ...) risks silently missing one, which fails as a runtime
