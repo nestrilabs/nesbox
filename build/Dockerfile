@@ -15,9 +15,18 @@
 #  nestrilabs/nestri:base to already exist, locally or pullable — see
 #  nestri/build/ in the nestri repo.
 #
-#  Not build-tested past virgl-build yet — see build/README.md for what's
-#  still unverified downstream of it.
+#  Built and verified end to end once already — see build/README.md for
+#  exactly what that confirmed.
 # ═══════════════════════════════════════════════════════════
+
+# Declared here, at the top of the file, rather than immediately before the
+# FROM that uses it further down — podman's builder (buildah, not BuildKit)
+# only resolves an ARG referenced in a later FROM if it was declared before
+# the *first* FROM. A per-stage ARG placed right above the FROM that uses it
+# is valid Dockerfile syntax and works under BuildKit, but fails buildah with
+# a misleading "no FROM statement found", confirmed by reproducing it in
+# isolation before moving this.
+ARG NESTRI_BASE_IMAGE=nestrilabs/nestri:base
 
 FROM docker.io/archlinux:base-devel AS initial
 RUN pacman -Syu --noconfirm
@@ -97,7 +106,12 @@ COPY --from=virgl-build /artifacts/virgl /virgl-devel
 ENV PKG_CONFIG_PATH=/virgl-devel/usr/lib/pkgconfig
 ENV LIBRARY_PATH=/virgl-devel/usr/lib
 ENV LD_LIBRARY_PATH=/virgl-devel/usr/lib
+# /root/.cargo/git too, not just registry: tools/nesprobe's ash dependency
+# is a git source, which Cargo caches separately from crates.io downloads —
+# missing this meant every build re-fetched it from GitHub regardless of
+# whether it had changed.
 RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/build/nesbox/target \
     cargo build --release --workspace && \
     mkdir -p /artifacts/nesbox/usr/bin && \
@@ -107,8 +121,20 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 
 # ───────────────────────────────────────────────────────────
 #  The shared Mesa build — pulled, not rebuilt
+#
+#  NESTRI_BASE_IMAGE (declared at the top of this file — see the comment
+#  there for why) defaults to the floating `:base` tag, which is mutable by
+#  design — nestri publishes exactly one, continuously-updated `base` tag. A
+#  republish can move it to a different Mesa commit with nothing on either
+#  side of the native-context protocol to detect the mismatch: no version
+#  negotiation exists, so a jail built against a different Mesa than the
+#  guest it pairs with can fail rendering silently rather than refuse to
+#  boot. Pin this to a digest (`nestrilabs/nestri@sha256:...`) for any build
+#  meant to pair with a specific, already-built guest rootfs — the floating
+#  default here is for local development, where "whatever base currently is"
+#  is the point.
 # ───────────────────────────────────────────────────────────
-FROM nestrilabs/nestri:base AS mesa-source
+FROM ${NESTRI_BASE_IMAGE} AS mesa-source
 
 
 # ───────────────────────────────────────────────────────────

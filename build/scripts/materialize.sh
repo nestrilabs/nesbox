@@ -18,12 +18,29 @@ OUT="${2:?usage: materialize.sh <image-tag> <output-dir>}"
 CONTAINER_RT="$(command -v docker || command -v podman || true)"
 [[ -n "$CONTAINER_RT" ]] || { echo "Neither docker nor podman found in PATH" >&2; exit 1; }
 
-rm -rf "$OUT"
-mkdir -p "$OUT"
+# Extract into a sibling temp directory and swap it in only once extraction
+# has actually succeeded, rather than wiping $OUT up front: a create/export/
+# tar failure partway through used to both lose the last good jail and leave
+# a half-populated one in its place. cid is cleaned up on every exit path
+# via the trap, not just the one after a successful `rm -f`.
+TMP_OUT="${OUT}.tmp.$$"
+cid=""
+cleanup() {
+    [[ -n "$cid" ]] && "$CONTAINER_RT" rm -f "$cid" >/dev/null 2>&1
+    rm -rf "$TMP_OUT"
+}
+trap cleanup EXIT
 
-echo "Exporting ${IMAGE} into ${OUT}..."
+rm -rf "$TMP_OUT"
+mkdir -p "$TMP_OUT"
+
+echo "Exporting ${IMAGE}..."
 cid="$("$CONTAINER_RT" create "$IMAGE")"
-"$CONTAINER_RT" export "$cid" | tar -x -C "$OUT" --exclude='.dockerenv' --exclude='dev/*'
+"$CONTAINER_RT" export "$cid" | tar -x -C "$TMP_OUT" --exclude='.dockerenv' --exclude='dev/*'
 "$CONTAINER_RT" rm -f "$cid" >/dev/null
+cid=""
+
+rm -rf "$OUT"
+mv "$TMP_OUT" "$OUT"
 
 echo "Wrote ${OUT}"

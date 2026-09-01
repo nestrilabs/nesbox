@@ -13,13 +13,19 @@ CONTEXT       := ..
 IMAGE_NAME    := nesbox-jail
 OUTPUT_DIR    := output
 FORCE_REBUILD ?=
+# Floating by default — see the NESTRI_BASE_IMAGE comment in the Dockerfile
+# for why that's fine for local development and not for anything meant to
+# pair with a specific guest image. Override with a digest for the latter:
+#   make build NESTRI_BASE_IMAGE=nestrilabs/nestri@sha256:...
+NESTRI_BASE_IMAGE ?= nestrilabs/nestri:base
 
-# Needs nestrilabs/nestri:base to already exist — locally (built with
-# `make build` in nestri/build/) or pullable from wherever it ends up
-# published. Not fetched automatically here: which one you get should be a
-# decision you make, not a side effect of this target.
+# Needs NESTRI_BASE_IMAGE to already exist — locally (built with `make build`
+# in nestri/build/) or pullable from wherever it ends up published. Not
+# fetched automatically here: which one you get should be a decision you
+# make, not a side effect of this target.
 build:
 	DOCKER_BUILDKIT=1 $(CONTAINER_RT) build $(if $(FORCE_REBUILD),--no-cache,) \
+		--build-arg NESTRI_BASE_IMAGE=$(NESTRI_BASE_IMAGE) \
 		-f Dockerfile -t $(IMAGE_NAME):latest $(CONTEXT)
 
 # Unpacks the built image into a plain directory the jailer can chroot into

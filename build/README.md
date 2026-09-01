@@ -31,11 +31,12 @@ it's a chroot target for one process the jailer is about to exec. No OpenRC,
 no fstab, no getty. Just enough userspace for `nesbox` to run: Mesa, patched
 `virglrenderer`, and `nesbox`'s own dynamic link closure.
 
-## What a first build attempt already confirmed
+## What building this end to end actually confirmed
 
-`virgl-build` has actually been run against a real checkout of commit
-`7fcfce4`. Two things this Dockerfile started out guessing at are settled
-now, not just asserted:
+This Dockerfile has been built successfully, start to finish, against a
+real checkout of virglrenderer commit `7fcfce4` and a real
+`nestrilabs/nestri:base`. Four things it started out guessing at, or hadn't
+reached yet, are settled now, not just asserted:
 
 - **`git apply patches/*.patch` applies cleanly.** The patches read as
   plain unified diffs rather than `git format-patch` output, and that read
@@ -49,10 +50,19 @@ now, not just asserted:
   the patches actually need; `i915-experimental` is included because
   nesbox's own README lists Intel as a supported host GPU too, even though
   no patch here touches it yet.
+- **virglrenderer's gallium codegen needs `python-yaml`.** Not in the
+  original package list; meson said so immediately once past the option
+  name.
+- **`nesbox-build`'s final link step needed `LIBRARY_PATH`, not just
+  `LD_LIBRARY_PATH`.** The latter is a runtime dynamic-loader path; the
+  linker itself reads the former (or an explicit `-L`) at build time, and
+  with only `LD_LIBRARY_PATH` set the link failed with `unable to find
+  library -lvirglrenderer` despite `pkg-config` resolving the same library
+  fine for compiling against.
 
-Everything past that point in the Dockerfile — `nesbox-build`, and the
-`jail` stage that pulls Mesa from `nestrilabs/nestri:base` — has not been
-build-tested yet.
+`jail`, the final stage, has also actually been run: `ldd` resolves every
+dependency inside it, including the patched `libvirglrenderer.so.1`, and
+`nesbox --help` executes and prints real usage from inside the built image.
 
 ## The Mesa closure is imprecise, on purpose
 
