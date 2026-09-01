@@ -41,10 +41,21 @@
 //! mount points; it does not give it a private `/proc`. This is not
 //! PID-namespace isolation, and does not claim to be.
 //!
+//! That has a sharper consequence than "reduced isolation" if the caller
+//! ever hands this a uid already in use elsewhere on the host: a process
+//! reading `/proc/<pid>/root` for a same-uid `pid` can reach that process's
+//! filesystem view, unconfined by this jail, subject to the kernel's own
+//! ptrace-read permission check (dumpable flag, Yama's `ptrace_scope`).
+//! [`refuse_if_uid_is_live`] refuses to proceed if a live host process
+//! already holds the target uid at the moment this runs -- a sanity check
+//! against misconfiguration, not a guarantee against one starting a moment
+//! later. Collision-free uid allocation across the whole host is the
+//! caller's contract to keep, not something enforceable from in here.
+//!
 //! Nothing here applies a cgroup. That stays the supervisor's job, exactly
 //! as before -- see `docs/SECURITY.md`, "Why not Firecracker's jailer".
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -343,10 +354,67 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort: refuse if a process already running on the host holds `uid`.
+///
+/// Not a guarantee -- a process can start with this uid the instant after
+/// this returns -- but it catches the misconfiguration that actually
+/// happens, a uid pool that collides with an existing host account. See the
+/// module doc comment for why real collision-free allocation has to be the
+/// caller's job rather than something checked here once and trusted.
+fn refuse_if_uid_is_live(uid: u32) -> Result<()> {
+    for entry in std::fs::read_dir("/proc")
+        .context("reading /proc")?
+        .flatten()
+    {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            // Not a pid directory (task, self, sys, ...).
+            continue;
+        };
+        // The process can exit between the readdir listing it and this
+        // read -- an ordinary race with process lifetime, not a collision.
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        // "Uid:\treal\teffective\tsaved\tfs" -- the first (real) uid is what
+        // owns the process for the /proc/<pid>/root permission check this
+        // guards against.
+        let real_uid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|f| f.split_whitespace().next())
+            .and_then(|s| s.parse::<u32>().ok());
+        if real_uid == Some(uid) {
+            bail!(
+                "uid {uid} is already in use by host pid {pid} -- refusing to drop into it. \
+                 A jailed process sharing a uid with a live host process can read that \
+                 process's /proc/<pid>/root, which reaches outside this jail. Allocate a uid \
+                 that is not already running anything."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `execv`. Inherits this process's environment verbatim -- whoever invokes
 /// the jailer is responsible for handing it a clean one, same as it would be
 /// for any other process it started directly.
 fn exec_command(command: &[String]) -> Result<()> {
+    // Without this, execve honors setuid/setgid bits and file capabilities
+    // on the target binary -- which would hand back exactly the privilege
+    // drop_privileges() just gave up, if the jail image's binary carried any
+    // (by mistake, or by a compromised build). nesbox sets this too
+    // (vmm/src/seccomp.rs), but only after this exec has already completed,
+    // which is too late for this exec's own privilege bits: NO_NEW_PRIVS has
+    // to be set by the process making the exec call, before it makes it.
+    // SAFETY: constant arguments, no pointers.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("prctl(PR_SET_NO_NEW_PRIVS)");
+    }
+
     let prog = CString::new(command[0].as_str())
         .with_context(|| format!("{} contains a NUL byte", command[0]))?;
     let args: Vec<CString> = command
@@ -380,6 +448,11 @@ fn run(args: Args) -> Result<()> {
         "--jail-root {} is not a directory",
         args.jail_root.display()
     );
+    ensure!(
+        args.uid != 0 && args.gid != 0,
+        "--uid/--gid 0 defeats the whole point of dropping out of root"
+    );
+    refuse_if_uid_is_live(args.uid)?;
 
     unshare_mount_namespace()?;
 
@@ -439,6 +512,23 @@ mod tests {
     fn is_root() -> bool {
         // SAFETY: infallible.
         unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn refuses_a_uid_already_in_use_on_the_host() {
+        // The test process itself is a live process with its own uid --
+        // true regardless of anything else running on this host.
+        // SAFETY: infallible.
+        let my_uid = unsafe { libc::getuid() };
+        let err = refuse_if_uid_is_live(my_uid).unwrap_err();
+        assert!(err.to_string().contains("already in use"), "{err}");
+    }
+
+    #[test]
+    fn an_unused_uid_passes() {
+        // One below u32::MAX -- astronomically unlikely to be a real
+        // account on any host this runs on.
+        refuse_if_uid_is_live(4_294_967_294).expect("no process should hold this uid");
     }
 
     #[test]
