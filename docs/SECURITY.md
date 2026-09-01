@@ -72,13 +72,18 @@ by the VMM itself.
   That list is not only hardware, and pretending it was would have produced a
   jailed nesbox that cannot find its own kernel. nesbox opens its config file,
   `kernel_image_path`, every `drives[].path_on_host` and `/dev/net/tun` after
-  the exec, from inside the jail, so those come in through `--bind` — the same
-  named-by-the-caller rule, applied to per-box paths the jailer cannot know.
+  the exec, from inside the jail. So the jailer reads the box config and
+  derives the whole set from it rather than taking a list of flags a caller
+  has to keep in step with that config by hand — one thing naming the paths,
+  not two. `--bind` remains as an escape hatch for whatever a config does not
+  name.
+
   virtiofs source directories are the one case the original objection got
-  right for a different reason: virtiofsd runs unsandboxed as a separate
+  right, for a different reason: virtiofsd runs unsandboxed as a separate
   process (below), so it is not inside anything the jailer is responsible
-  for — but nesbox spawns it, so its binary and each source directory still
-  have to be `--bind`ed for a box that uses one.
+  for. Its source directories are derived from `shared-directories` like
+  anything else; the *binary* is not bound in at all, because nesbox spawns
+  it from inside the jail and the jail image ships it.
 - It assumes Firecracker's API-socket contract, which is not ours.
   `tools/jailer` has none — it is `chroot` + bind-mount + uid/gid drop +
   `execve`, and nothing else.

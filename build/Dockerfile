@@ -165,9 +165,16 @@ LABEL org.opencontainers.image.source="https://github.com/nestrilabs/nesbox"
 # as nestri/build's own os-base: the distro package lands first so every
 # transitive runtime dependency is present and correctly versioned before
 # our own builds overlay their files on top of it.
+# virtiofsd is here rather than bound in from the host because nesbox
+# *spawns* it (vmm/src/virtiofsd.rs) from inside the jail, so the binary and
+# its own link closure have to exist in here. Arch installs it to
+# /usr/lib/virtiofsd, which is on nesbox's FALLBACK_DIRS, so it is found
+# without NESBOX_VIRTIOFSD being set. A box with no shared-directories never
+# looks for it.
 RUN pacman -Syu --noconfirm --needed \
         libdrm libepoxy libglvnd libx11 libxext libxfixes libxxf86vm \
         wayland vulkan-icd-loader mesa \
+        virtiofsd \
     && pacman -Scc --noconfirm
 
 COPY --from=virgl-build  /artifacts/virgl/.manifest  /tmp/virgl.manifest

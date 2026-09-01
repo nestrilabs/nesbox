@@ -126,38 +126,41 @@ cd build && make materialize    # output/jail/ + output/jailer
 
 ```bash
 sudo ./build/output/jailer \
-    --jail-root  /path/to/build/output/jail \
-    --uid 60000 --gid 60000 \
-    --render-node /dev/dri/renderD128 \
-    --vhost /dev/vhost-vsock \
-    --bind /dev/net/tun \
-    --bind /path/to/boxes/1 \
-    --metrics-dir /run/nesbox/1 \
-    -- /usr/bin/nesbox /path/to/boxes/1/box.json
+    --config    my-vm.json \
+    --jail-root /path/to/build/output/jail \
+    --uid 60000 --gid 60000
 ```
 
-`/usr/bin/nesbox` is the copy *inside the jail image*, not the one in
-`target/release`. Everything else on that line is a host path, bound in at
-the same path inside the jail — which is why the config file, the kernel
-image and the disk images have to be reachable at the path the config names.
-Putting a box's config, kernel and rootfs in one directory and binding that
-directory is the least fiddly way to do it; `--bind` is repeatable if they
-are scattered.
+That is the whole command line. The jailer reads `my-vm.json` and works out
+what that box needs — the kernel from `boot-source`, every
+`drives[].path_on_host`, the render node from `gpu`, `/dev/net/tun` and
+`/dev/vhost-net` if it has a `network`, `/dev/vhost-vsock` if it has a
+`vsock`, the directory a `stats-socket` goes in, each
+`shared-directories[].path-on-host` — and brings exactly those in, plus
+`/dev/kvm`, `/proc`, `/sys` and the config file itself. There is no command
+to name and no list of `--bind` flags to keep in step with the config: it
+execs nesbox, which is the only thing it ever execs.
 
-Two things are still yours to get right, and neither is checked for you:
+Everything comes in at the *same path* it has on the host, so the paths
+inside the config keep working unchanged. They do all have to be absolute —
+the jailer chroots before nesbox opens any of them, so a relative path would
+resolve against a directory that is no longer there, and it says which field
+is wrong rather than letting nesbox fail on it later.
 
-- **A uid nothing else on the host is using.** The jailer refuses a uid held
-  by a live process, because a jailed process sharing a uid with a host
-  process can read that process's `/proc/<pid>/root` and reach straight back
-  out of the jail. That check is a guard against a colliding uid pool, not a
-  substitute for allocating uids properly.
-- **A tap device, and the shared directories if you use any.** Bind in
-  `/dev/net/tun` for networking, and for `shared-directories` both
-  virtiofsd's binary and each `path-on-host` — nesbox spawns virtiofsd
-  itself, and an unreachable binary or source directory fails at start.
+Two knobs, both with defaults you will rarely change:
 
-Nothing automates any of this yet: `neslet` is what should allocate the uid
-and build this command line per box, and it does not exist. See
+| | |
+|---|---|
+| `--nesbox-bin <path>` | nesbox *inside the jail image*. Default `/usr/bin/nesbox` |
+| `--bind <path>` | an extra host path, repeatable. An escape hatch for something a config does not name |
+
+**A uid nothing else on the host is using is still yours to get right.** The
+jailer refuses one held by a live process, because a jailed process sharing a
+uid with a host process can read that process's `/proc/<pid>/root` and reach
+straight back out of the jail — but that is a guard against a colliding uid
+pool, not a substitute for allocating uids properly. `neslet` is what should
+allocate one per box and run this command; it does not exist yet, which is
+the only reason this is a command you type. See
 [SECURITY.md](docs/SECURITY.md) for what the jail does and does not bound.
 
 ---

@@ -1,43 +1,62 @@
-//! jailer -- chroots one process into a materialized jail image, then hands
-//! off to it.
+//! jailer -- runs one nesbox box inside a jail.
+//!
+//! This is nesbox's jailer, not a general-purpose one, and the difference is
+//! the point. It takes the box's own config file, works out from it which
+//! host paths that box will need, brings exactly those in, and execs nesbox
+//! with the same config. There is no `-- <command>` to hand it: the program
+//! it starts is nesbox, and knowing that is what lets it do the work a
+//! caller would otherwise have to do by hand and keep in step by hand.
+//! Firecracker's jailer is the model -- `--exec-file`, and a jail set up for
+//! the one program it knows it is starting.
 //!
 //! nesbox cannot do any of this to itself. `chroot`, `mount` and `setuid` are
 //! all on its own seccomp denylist (`vmm/src/seccomp.rs`,
 //! `nothing_that_reconfigures_the_host_is_allowed_anywhere`), and an
 //! unprivileged process cannot change its own uid regardless of what its
 //! filter permits. So this is a separate binary, run before nesbox exists,
-//! that does five things and then is gone:
+//! that does six things and then is gone:
 //!
-//!   1. unshare a mount namespace, and cut propagation to the host's, so
+//!   1. read the box config, and derive every host path that box needs.
+//!   2. unshare a mount namespace, and cut propagation to the host's, so
 //!      nothing done here leaks back out.
-//!   2. bind-mount exactly the paths the target process needs to reach
-//!      hardware and report state, at the same path inside the jail.
-//!   3. `chroot` into the jail root -- already built and materialized
+//!   3. bind-mount those paths, at the same path inside the jail.
+//!   4. `chroot` into the jail root -- already built and materialized
 //!      elsewhere. This binary does not build, fetch or version it.
-//!   4. drop from root to the uid/gid the caller names.
-//!   5. `execve` the command it was told to run.
+//!   5. drop from root to the uid/gid the caller names.
+//!   6. `execve` nesbox, with the same config file.
 //!
-//! # Why bind-mount rather than exclude
+//! # The config decides what comes in
 //!
 //! `docs/SECURITY.md` considered a jailer once and rejected it because "the
 //! DRM render node, virtiofs source directories, and the metrics socket path
 //! all live outside any plausible jail." That is true of a jail built to
 //! *exclude* the host; it is not true of one built to *include* exactly what
-//! is needed. Every path this binary brings in is named on its own command
-//! line by whatever launches it -- nothing is discovered or guessed here.
+//! is needed. And the list is neither guesswork nor a pile of flags the
+//! caller has to keep in step with the config -- it is read out of it:
 //!
-//! That list is longer than the hardware, and `--bind` is why it exists.
-//! nesbox opens its own config file, `kernel_image_path`, every
-//! `drives[].path_on_host` and `/dev/net/tun` *after* the exec, from inside
-//! the jail, so a jailer that brought in only devices and a metrics socket
-//! would produce a nesbox that cannot find its own kernel. Those paths are
-//! per-box and known only to the caller, which is why they are an option
-//! rather than a list in here.
+//!   * `boot-source.kernel_image_path`     the kernel nesbox loads
+//!   * `drives[].path_on_host`             every disk image
+//!   * `gpu.render-node`                   the DRM render node
+//!   * `network`, if present               /dev/net/tun and /dev/vhost-net
+//!   * `vsock`, if present                 /dev/vhost-vsock
+//!   * `stats-socket`, if present          the directory it is created in
+//!   * `shared-directories[].path-on-host` each virtiofs source
 //!
-//! virtiofs source directories stay out of scope: virtiofsd already runs
-//! unsandboxed, spawned by nesbox itself with `--sandbox none`
-//! (`vmm/src/virtiofsd.rs`), and never runs inside anything this binary is
-//! responsible for.
+//! plus `/dev/kvm`, `/proc` and `/sys`, which every box needs, and the config
+//! file itself. [`Args::bind`] is the escape hatch for anything a config does
+//! not name; needing it routinely means something belongs in the list above.
+//!
+//! Every path has to be absolute, and this refuses a config that gives a
+//! relative one. nesbox opens them *after* this binary has chrooted and
+//! `chdir`ed to `/`, so a relative path would resolve against a directory
+//! that no longer exists -- better a refusal here, naming the field, than a
+//! confusing ENOENT out of nesbox later.
+//!
+//! virtiofsd is the one thing nesbox opens that is deliberately *not* bound
+//! in: nesbox spawns it, so the binary has to exist inside the jail, and the
+//! jail image ships it (`build/Dockerfile`). Only the directories it serves
+//! come from the host. It still runs `--sandbox none`, unsandboxed, exactly
+//! as `docs/SECURITY.md` already records.
 //!
 //! # What this does not claim
 //!
@@ -64,6 +83,7 @@
 //! as before -- see `docs/SECURITY.md`, "Why not Firecracker's jailer".
 
 use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -78,52 +98,64 @@ const MS_REC: libc::c_ulong = 0x0000_4000;
 const MS_PRIVATE: libc::c_ulong = 0x0004_0000;
 const MS_BIND: libc::c_ulong = 0x0000_1000;
 
-const USAGE: &str = "Usage:
-  jailer --jail-root <path> --uid <uid> --gid <gid> [options] -- <command> [args...]
+/// Where nesbox lives inside the jail image `build/` produces. Overridable,
+/// because an image built somewhere else may lay it out differently, but not
+/// something a caller should have to say.
+const DEFAULT_NESBOX_BIN: &str = "/usr/bin/nesbox";
 
-Bind-mounts exactly the paths named below into <jail-root>, chroots into it,
-drops from root to <uid>:<gid>, then execs <command> (an absolute path,
-resolved inside the jail, e.g. /usr/bin/nesbox). Must run as root -- that is
-the whole point: it does the things nesbox's own seccomp filter refuses to
-let nesbox do to itself.
+/// Needed by every box, named by no config, and not worth an option: a VMM
+/// without `/dev/kvm` is not a VMM.
+const KVM: &str = "/dev/kvm";
+/// `virtio-devices/src/tap.rs`'s `TUN_PATH`. nesbox opens an existing tap
+/// through it; creating one is the host setup script's job.
+const TUN: &str = "/dev/net/tun";
+/// `virtio-devices/src/net.rs` opens this whenever a box has a network.
+const VHOST_NET: &str = "/dev/vhost-net";
+/// `virtio-devices/src/vsock.rs` opens this whenever a box has a vsock.
+const VHOST_VSOCK: &str = "/dev/vhost-vsock";
+
+const USAGE: &str = "Usage:
+  jailer --config <box.json> --jail-root <path> --uid <uid> --gid <gid> [options]
+
+Runs nesbox inside a jail. Reads <box.json> to work out which host paths that
+box needs -- its kernel, its disk images, its render node, its tap and vhost
+devices, its virtiofs sources, its metrics directory -- bind-mounts them into
+<jail-root> at the same path, chroots, drops from root to <uid>:<gid>, and
+execs nesbox with the same config.
+
+Must run as root -- that is the whole point: it does the things nesbox's own
+seccomp filter refuses to let nesbox do to itself. Nothing it does stays
+privileged past the drop.
 
 Options:
-  --render-node <path>   DRM render node, e.g. /dev/dri/renderD128
-  --kvm <path>            default: /dev/kvm
-  --vhost <path>          a vhost device node in use; repeatable
-  --metrics-dir <path>    directory the metrics socket will be created in
-  --bind <path>           any other file or directory the target process must
-                          reach: its config file, the kernel image, a disk
-                          image, /dev/net/tun, virtiofsd's binary and source
-                          directories. Repeatable. Bound at the same path
-                          inside the jail, and non-recursively -- a submount
-                          *underneath* one of these does not come with it.
+  --nesbox-bin <path>   nesbox inside the jail image. Default /usr/bin/nesbox.
+  --bind <path>          an extra host path to bring in, at the same path
+                         inside the jail; repeatable. An escape hatch for
+                         something a config does not name -- everything a
+                         config does name comes in without being asked for.
 
-/proc and /sys are always bound in, read-write, exactly as they are on the
-host -- see the module doc comment for why, and for what that does and does
-not mean.";
+Every path in the config must be absolute: this chroots before nesbox opens
+any of them, so a relative path would resolve against a directory that is no
+longer there. /dev/kvm, /proc and /sys always come in. /proc and /sys are the
+host's own, read-write -- see the module doc comment for what that does and
+does not mean.";
 
 #[derive(Debug)]
 struct Args {
+    config: PathBuf,
     jail_root: PathBuf,
     uid: u32,
     gid: u32,
-    render_node: Option<PathBuf>,
-    kvm: PathBuf,
-    vhost: Vec<PathBuf>,
-    metrics_dir: Option<PathBuf>,
+    nesbox_bin: PathBuf,
     bind: Vec<PathBuf>,
-    command: Vec<String>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
+    let mut config = None;
     let mut jail_root = None;
     let mut uid = None;
     let mut gid = None;
-    let mut render_node = None;
-    let mut kvm = PathBuf::from("/dev/kvm");
-    let mut vhost = Vec::new();
-    let mut metrics_dir = None;
+    let mut nesbox_bin = PathBuf::from(DEFAULT_NESBOX_BIN);
     let mut bind = Vec::new();
 
     fn val(argv: &[String], i: usize) -> Result<&str, String> {
@@ -135,6 +167,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
+            "--config" => {
+                config = Some(PathBuf::from(val(argv, i)?));
+                i += 2
+            }
             "--jail-root" => {
                 jail_root = Some(PathBuf::from(val(argv, i)?));
                 i += 2
@@ -155,51 +191,193 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 );
                 i += 2
             }
-            "--render-node" => {
-                render_node = Some(PathBuf::from(val(argv, i)?));
-                i += 2
-            }
-            "--kvm" => {
-                kvm = PathBuf::from(val(argv, i)?);
-                i += 2
-            }
-            "--vhost" => {
-                vhost.push(PathBuf::from(val(argv, i)?));
-                i += 2
-            }
-            "--metrics-dir" => {
-                metrics_dir = Some(PathBuf::from(val(argv, i)?));
+            "--nesbox-bin" => {
+                nesbox_bin = PathBuf::from(val(argv, i)?);
                 i += 2
             }
             "--bind" => {
                 bind.push(PathBuf::from(val(argv, i)?));
                 i += 2
             }
-            "--" => {
-                i += 1;
-                break;
-            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    let command: Vec<String> = argv[i..].to_vec();
 
     Ok(Args {
+        config: config.ok_or("--config is required")?,
         jail_root: jail_root.ok_or("--jail-root is required")?,
         uid: uid.ok_or("--uid is required")?,
         gid: gid.ok_or("--gid is required")?,
-        render_node,
-        kvm,
-        vhost,
-        metrics_dir,
+        nesbox_bin,
         bind,
-        command: {
-            if command.is_empty() {
-                return Err("no command given -- pass one after `--`".to_string());
-            }
-            command
-        },
     })
+}
+
+// ── The config, as far as it names host paths ────────────────────────────
+//
+// A deliberately partial mirror of `vmm/src/config.rs`'s `VmConfig`, not a
+// dependency on it: pulling the vmm crate in would put kvm-ioctls, vm-memory
+// and the whole device model into a binary that runs as root, to read seven
+// fields. Serde ignores everything not named here, so a new config field
+// costs nothing until it is a path this has to bring in.
+//
+// The cost of the copy is drift, and `derives_every_host_path_in_the_example`
+// is what catches it: it parses `examples/vm.json` and asserts the whole
+// derived set, so renaming a field in one place without the other fails a
+// test rather than producing a box that cannot find its kernel.
+//
+// Note the mixed case convention, which is nesbox's, not a mistake here:
+// `VmConfig`, `Gpu`, `Network`, `Vsock` and `SharedDirectory` are
+// `rename_all = "kebab-case"`, while `BootSource` and `Drive` are not and so
+// keep their snake_case field names.
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct BoxConfig {
+    boot_source: BootSource,
+    #[serde(default)]
+    drives: Vec<Drive>,
+    #[serde(default)]
+    gpu: Option<Gpu>,
+    /// Presence is all that matters: a box with a network opens `/dev/net/tun`
+    /// and `/dev/vhost-net`, whatever the tap is called.
+    #[serde(default)]
+    network: Option<serde_json::Value>,
+    /// Likewise -- a box with a vsock opens `/dev/vhost-vsock`.
+    #[serde(default)]
+    vsock: Option<serde_json::Value>,
+    #[serde(default)]
+    shared_directories: Vec<SharedDirectory>,
+    #[serde(default)]
+    stats_socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BootSource {
+    kernel_image_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct Drive {
+    drive_id: String,
+    path_on_host: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct Gpu {
+    #[serde(default = "default_render_node")]
+    render_node: PathBuf,
+}
+
+fn default_render_node() -> PathBuf {
+    // Kept in step with `vmm/src/config.rs`'s own default: a config with a
+    // `gpu` section and no `render-node` gets this one there too, and a jail
+    // missing the node nesbox will actually open is a black screen, not an
+    // error.
+    PathBuf::from("/dev/dri/renderD128")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct SharedDirectory {
+    tag: String,
+    path_on_host: PathBuf,
+}
+
+/// One path to bring in, and the config field that asked for it -- the
+/// reason travels with the path so a failure can say which field is wrong
+/// rather than just which path did not exist.
+#[derive(Debug, PartialEq, Eq)]
+struct Needed {
+    path: PathBuf,
+    why: String,
+}
+
+fn needed(path: impl Into<PathBuf>, why: impl Into<String>) -> Needed {
+    Needed {
+        path: path.into(),
+        why: why.into(),
+    }
+}
+
+/// Every host path this box needs, in the order they are mounted.
+///
+/// Order is insertion order and matters when one path nests inside another:
+/// a directory has to be bound before something bound underneath it, or the
+/// outer mount hides the inner one.
+fn host_paths(config_path: &Path, cfg: &BoxConfig, extra: &[PathBuf]) -> Result<Vec<Needed>> {
+    let mut out = vec![
+        // nesbox re-reads its own config after the exec, from inside the jail.
+        needed(config_path, "the config file itself"),
+        needed(KVM, "every box needs /dev/kvm"),
+        needed(
+            &cfg.boot_source.kernel_image_path,
+            "boot-source.kernel_image_path",
+        ),
+    ];
+
+    for d in &cfg.drives {
+        out.push(needed(
+            &d.path_on_host,
+            format!("drives[\"{}\"].path_on_host", d.drive_id),
+        ));
+    }
+    if let Some(gpu) = &cfg.gpu {
+        out.push(needed(&gpu.render_node, "gpu.render-node"));
+    }
+    if cfg.network.is_some() {
+        out.push(needed(TUN, "network is set, so nesbox opens a tap"));
+        out.push(needed(VHOST_NET, "network is set"));
+    }
+    if cfg.vsock.is_some() {
+        out.push(needed(VHOST_VSOCK, "vsock is set"));
+    }
+    if let Some(socket) = &cfg.stats_socket {
+        // The directory, not the socket: nesbox creates the socket itself, so
+        // the file does not exist yet and there would be nothing to bind.
+        let dir = socket
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .with_context(|| {
+                format!(
+                    "stats-socket {} has no directory to create it in",
+                    socket.display()
+                )
+            })?;
+        out.push(needed(dir, "the directory stats-socket lives in"));
+    }
+    for s in &cfg.shared_directories {
+        out.push(needed(
+            &s.path_on_host,
+            format!("shared-directories[\"{}\"].path-on-host", s.tag),
+        ));
+    }
+    for p in extra {
+        out.push(needed(p, "--bind"));
+    }
+
+    // Absolute or nothing, and named as the field that broke it. Checked
+    // here, over the whole set at once, so a config with three relative
+    // paths does not take three runs to fix.
+    let relative: Vec<String> = out
+        .iter()
+        .filter(|n| !n.path.is_absolute())
+        .map(|n| format!("  {} ({})", n.path.display(), n.why))
+        .collect();
+    ensure!(
+        relative.is_empty(),
+        "these paths are relative, and this jailer chroots before nesbox \
+         opens any of them -- make them absolute:\n{}",
+        relative.join("\n")
+    );
+    Ok(out)
+}
+
+fn read_config(path: &Path) -> Result<BoxConfig> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the box config at {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
 // ── Mounting ─────────────────────────────────────────────────────────────
@@ -464,58 +642,67 @@ fn run(args: Args) -> Result<()> {
          afterwards. Nothing it does stays privileged past drop_privileges()."
     );
     ensure!(
-        args.jail_root.is_dir(),
-        "--jail-root {} is not a directory",
-        args.jail_root.display()
-    );
-    ensure!(
         args.uid != 0 && args.gid != 0,
         "--uid/--gid 0 defeats the whole point of dropping out of root"
     );
+
+    // Both canonicalized before anything is derived from them. A relative
+    // --config would otherwise be bound at a path that does not mirror the
+    // host's, and a relative --jail-root would be resolved against a working
+    // directory that chroot is about to make meaningless.
+    let config_path = std::fs::canonicalize(&args.config)
+        .with_context(|| format!("--config {}", args.config.display()))?;
+    let jail_root = std::fs::canonicalize(&args.jail_root)
+        .with_context(|| format!("--jail-root {}", args.jail_root.display()))?;
+    ensure!(
+        jail_root.is_dir(),
+        "--jail-root {} is not a directory",
+        jail_root.display()
+    );
+
+    let cfg = read_config(&config_path)?;
+    let paths = host_paths(&config_path, &cfg, &args.bind)?;
+
     refuse_if_uid_is_live(args.uid)?;
 
     unshare_mount_namespace()?;
 
-    // Always -- cgroup self-reporting and Mesa's own /proc reads both need
-    // them, and they are not meaningfully optional the way a GPU or a vhost
-    // device is. See the module doc comment for what a host-sourced /proc
-    // and /sys inside the jail does and does not mean.
-    bind_mount(&args.jail_root, Path::new("/proc"), true)?;
-    bind_mount(&args.jail_root, Path::new("/sys"), true)?;
+    // Always, and before the derived set: cgroup self-reporting and Mesa's
+    // own /proc reads both need them, and they are not meaningfully optional
+    // the way a GPU or a vhost device is. Recursive, because /sys/fs/cgroup
+    // is its own mount. See the module doc comment for what a host-sourced
+    // /proc and /sys inside the jail does and does not mean.
+    bind_mount(&jail_root, Path::new("/proc"), true)?;
+    bind_mount(&jail_root, Path::new("/sys"), true)?;
 
-    if let Some(render_node) = &args.render_node {
-        bind_mount(&args.jail_root, render_node, false)?;
-    }
-    bind_mount(&args.jail_root, &args.kvm, false)?;
-    for vhost in &args.vhost {
-        bind_mount(&args.jail_root, vhost, false)?;
-    }
-    if let Some(metrics_dir) = &args.metrics_dir {
-        bind_mount(&args.jail_root, metrics_dir, false)?;
-    }
-    // Last, and in the order given: everything the target process opens that
-    // is neither hardware nor a metrics path. nesbox needs several -- its own
-    // config file, `kernel_image_path`, every `drives[].path_on_host`,
-    // /dev/net/tun for a tap, and virtiofsd's binary plus the directories it
-    // serves -- none of which the options above describe, and all of which it
-    // opens *after* the exec, from inside the jail. Naming them is still the
-    // caller's job; this only refuses to pretend the hardware paths are the
-    // whole list. See `docs/SECURITY.md`.
-    for path in &args.bind {
-        bind_mount(&args.jail_root, path, false)?;
+    for n in &paths {
+        bind_mount(&jail_root, &n.path, false)
+            .with_context(|| format!("{} is needed because of {}", n.path.display(), n.why))?;
     }
 
     log::info!(
-        "jailer: chrooting into {}, dropping to uid={} gid={}, exec'ing {:?}",
-        args.jail_root.display(),
+        "jailer: {} paths bound, chrooting into {}, dropping to uid={} gid={}, exec'ing {} {}",
+        paths.len(),
+        jail_root.display(),
         args.uid,
         args.gid,
-        args.command
+        args.nesbox_bin.display(),
+        config_path.display(),
     );
 
-    enter_jail(&args.jail_root)?;
+    enter_jail(&jail_root)?;
     drop_privileges(args.uid, args.gid)?;
-    exec_command(&args.command)
+
+    // nesbox's whole command line: the binary inside the jail, and the config
+    // at the same path it had on the host, because that is where it was bound.
+    // nesbox takes the first non-flag argument as its config
+    // (`vmm/src/bin/nesbox.rs`) and has no other flags, which is why there is
+    // nothing to forward here and no `--` to forward it with.
+    let command = vec![
+        args.nesbox_bin.to_string_lossy().into_owned(),
+        config_path.to_string_lossy().into_owned(),
+    ];
+    exec_command(&command)
 }
 
 fn main() {
@@ -523,10 +710,8 @@ fn main() {
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // Before `parse`, not inside it: asking for help is not a usage error, so
-    // it prints once and exits 0. Routed through the error path it printed
-    // USAGE twice -- once as the "message", once as the usage appended to it
-    // -- and exited 2.
-    if argv.iter().any(|a| a == "-h" || a == "--help") {
+    // it prints once and exits 0.
+    if argv.is_empty() || argv.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}");
         return;
     }
@@ -552,6 +737,250 @@ mod tests {
         // SAFETY: infallible.
         unsafe { libc::geteuid() == 0 }
     }
+
+    fn args(pairs: &[&str]) -> Vec<String> {
+        pairs.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn parsed(cfg: &BoxConfig) -> Vec<PathBuf> {
+        host_paths(Path::new("/boxes/1/box.json"), cfg, &[])
+            .expect("derives")
+            .into_iter()
+            .map(|n| n.path)
+            .collect()
+    }
+
+    // ── the CLI ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn config_jail_root_uid_and_gid_are_all_required() {
+        for missing in [
+            args(&["--jail-root", "/jail", "--uid", "1", "--gid", "1"]),
+            args(&["--config", "/b.json", "--uid", "1", "--gid", "1"]),
+            args(&["--config", "/b.json", "--jail-root", "/jail", "--gid", "1"]),
+            args(&["--config", "/b.json", "--jail-root", "/jail", "--uid", "1"]),
+        ] {
+            assert!(parse(&missing).is_err(), "{missing:?} should not parse");
+        }
+        assert!(
+            parse(&args(&["--jail-root", "/jail"]))
+                .unwrap_err()
+                .contains("--config")
+        );
+    }
+
+    #[test]
+    fn nesbox_is_the_default_and_needs_no_command() {
+        let a = parse(&args(&[
+            "--config",
+            "/boxes/1/box.json",
+            "--jail-root",
+            "/jail",
+            "--uid",
+            "60000",
+            "--gid",
+            "60000",
+        ]))
+        .unwrap();
+        assert_eq!(a.config, PathBuf::from("/boxes/1/box.json"));
+        assert_eq!(a.jail_root, PathBuf::from("/jail"));
+        assert_eq!(a.uid, 60000);
+        assert_eq!(a.gid, 60000);
+        // The whole reason this is nesbox's jailer and not a generic one:
+        // there is no command to name.
+        assert_eq!(a.nesbox_bin, PathBuf::from("/usr/bin/nesbox"));
+        assert!(a.bind.is_empty());
+    }
+
+    #[test]
+    fn a_jail_image_can_put_nesbox_somewhere_else() {
+        let a = parse(&args(&[
+            "--config",
+            "/b.json",
+            "--jail-root",
+            "/jail",
+            "--uid",
+            "1",
+            "--gid",
+            "1",
+            "--nesbox-bin",
+            "/opt/nesbox/bin/nesbox",
+        ]))
+        .unwrap();
+        assert_eq!(a.nesbox_bin, PathBuf::from("/opt/nesbox/bin/nesbox"));
+    }
+
+    #[test]
+    fn bind_is_repeatable_and_keeps_its_order() {
+        let a = parse(&args(&[
+            "--config",
+            "/b.json",
+            "--jail-root",
+            "/jail",
+            "--uid",
+            "1",
+            "--gid",
+            "1",
+            "--bind",
+            "/opt/first",
+            "--bind",
+            "/opt/second",
+        ]))
+        .unwrap();
+        assert_eq!(
+            a.bind,
+            vec![PathBuf::from("/opt/first"), PathBuf::from("/opt/second")]
+        );
+    }
+
+    #[test]
+    fn a_stray_command_is_a_usage_error_rather_than_something_to_exec() {
+        // What the old generic interface would have accepted. There is no
+        // `--` any more, so this is a mistake and says so.
+        let err = parse(&args(&[
+            "--config",
+            "/b.json",
+            "--jail-root",
+            "/jail",
+            "--uid",
+            "1",
+            "--gid",
+            "1",
+            "--",
+            "/usr/bin/nesbox",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("unknown argument: --"), "{err}");
+    }
+
+    // ── deriving the mount set from a config ────────────────────────────
+
+    #[test]
+    fn derives_every_host_path_in_the_example() {
+        // examples/vm.json is the documented config format, so it is also the
+        // drift check: if a field is renamed in vmm/src/config.rs and here,
+        // this keeps passing; if it is renamed in only one of them, serde
+        // stops finding it and this fails.
+        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/vm.json");
+        let cfg = read_config(&example).expect("the example config parses");
+        assert_eq!(
+            parsed(&cfg),
+            vec![
+                PathBuf::from("/boxes/1/box.json"),
+                PathBuf::from("/dev/kvm"),
+                PathBuf::from("/path/to/vmlinux"),
+                PathBuf::from("/path/to/rootfs.ext4"),
+                PathBuf::from("/dev/dri/renderD128"),
+                PathBuf::from("/dev/net/tun"),
+                PathBuf::from("/dev/vhost-net"),
+                PathBuf::from("/dev/vhost-vsock"),
+                PathBuf::from("/path/to/compat/prefix"),
+                PathBuf::from("/path/to/game/install"),
+            ],
+            "the example's paths, in mount order"
+        );
+    }
+
+    #[test]
+    fn a_box_with_no_devices_brings_in_no_device_nodes() {
+        let cfg: BoxConfig =
+            serde_json::from_str(r#"{ "boot-source": { "kernel_image_path": "/k/vmlinux" } }"#)
+                .expect("parses");
+        assert_eq!(
+            parsed(&cfg),
+            vec![
+                PathBuf::from("/boxes/1/box.json"),
+                PathBuf::from("/dev/kvm"),
+                PathBuf::from("/k/vmlinux"),
+            ],
+            "no gpu, network or vsock means no render node, tap or vhost node"
+        );
+    }
+
+    #[test]
+    fn a_gpu_section_without_a_render_node_still_binds_the_default_one() {
+        let cfg: BoxConfig = serde_json::from_str(
+            r#"{ "boot-source": { "kernel_image_path": "/k" }, "gpu": { "width": 1280 } }"#,
+        )
+        .expect("parses");
+        assert!(
+            parsed(&cfg).contains(&PathBuf::from("/dev/dri/renderD128")),
+            "the default has to match vmm/src/config.rs's, or nesbox opens a \
+             node that is not in the jail"
+        );
+    }
+
+    #[test]
+    fn the_metrics_socket_brings_in_its_directory_not_itself() {
+        let cfg: BoxConfig = serde_json::from_str(
+            r#"{ "boot-source": { "kernel_image_path": "/k" },
+                 "stats-socket": "/run/nesbox/1/stats.sock" }"#,
+        )
+        .expect("parses");
+        let p = parsed(&cfg);
+        assert!(p.contains(&PathBuf::from("/run/nesbox/1")), "{p:?}");
+        assert!(
+            !p.contains(&PathBuf::from("/run/nesbox/1/stats.sock")),
+            "nesbox creates the socket, so there is nothing there to bind yet"
+        );
+    }
+
+    #[test]
+    fn extra_binds_come_last_and_are_kept() {
+        let cfg: BoxConfig =
+            serde_json::from_str(r#"{ "boot-source": { "kernel_image_path": "/k" } }"#)
+                .expect("parses");
+        let paths = host_paths(
+            Path::new("/boxes/1/box.json"),
+            &cfg,
+            &[PathBuf::from("/opt/extra")],
+        )
+        .expect("derives");
+        assert_eq!(paths.last().unwrap().path, PathBuf::from("/opt/extra"));
+        assert_eq!(paths.last().unwrap().why, "--bind");
+    }
+
+    #[test]
+    fn a_relative_path_in_the_config_is_refused_and_says_which_field() {
+        let cfg: BoxConfig = serde_json::from_str(
+            r#"{ "boot-source": { "kernel_image_path": "vmlinux" },
+                 "drives": [ { "drive_id": "rootfs", "path_on_host": "rootfs.ext4",
+                               "is_root_device": true } ] }"#,
+        )
+        .expect("parses");
+        let err = host_paths(Path::new("/boxes/1/box.json"), &cfg, &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        // Both of them, in one message: fixing a config should not take one
+        // run per relative path.
+        assert!(msg.contains("boot-source.kernel_image_path"), "{msg}");
+        assert!(msg.contains("drives[\"rootfs\"].path_on_host"), "{msg}");
+    }
+
+    #[test]
+    fn a_config_that_names_no_kernel_is_refused_by_serde() {
+        // boot-source is required here even though nesbox defaults it: a
+        // default of "vmlinux" is relative, so a config relying on it could
+        // never work inside a jail anyway, and saying so at parse time is
+        // clearer than deriving a path that is then rejected.
+        assert!(serde_json::from_str::<BoxConfig>(r#"{ "drives": [] }"#).is_err());
+    }
+
+    #[test]
+    fn unknown_config_fields_are_ignored() {
+        // This mirrors part of VmConfig, so every field it does not model has
+        // to be harmless -- otherwise every nesbox config addition breaks the
+        // jailer.
+        let cfg: BoxConfig = serde_json::from_str(
+            r#"{ "boot-source": { "kernel_image_path": "/k", "boot_args": "ro" },
+                 "machine-config": { "vcpu_count": 4 },
+                 "seccomp": "strict",
+                 "something-added-next-year": { "nested": true } }"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.boot_source.kernel_image_path, PathBuf::from("/k"));
+    }
+
+    // ── the mounting machinery ─────────────────────────────────────────
 
     #[test]
     fn refuses_a_uid_already_in_use_on_the_host() {
@@ -580,154 +1009,12 @@ mod tests {
             target_path(Path::new("/jail"), Path::new("/sys")),
             PathBuf::from("/jail/sys")
         );
-        // A relative host_path (should never happen -- callers only ever
-        // pass absolute device/proc/sys paths) still lands somewhere sane
-        // rather than escaping the jail root.
+        // A relative host_path (should never happen -- host_paths refuses
+        // them) still lands somewhere sane rather than escaping the jail root.
         assert_eq!(
             target_path(Path::new("/jail"), Path::new("weird")),
             PathBuf::from("/jail/weird")
         );
-    }
-
-    #[test]
-    fn parsing_requires_jail_root_uid_gid_and_a_command() {
-        assert!(parse(&[]).is_err());
-        assert!(
-            parse(&["--uid".into(), "1000".into()])
-                .unwrap_err()
-                .contains("--jail-root")
-        );
-
-        let argv: Vec<String> = [
-            "--jail-root",
-            "/jail",
-            "--uid",
-            "1000",
-            "--gid",
-            "1000",
-            "--render-node",
-            "/dev/dri/renderD128",
-            "--vhost",
-            "/dev/vhost-net",
-            "--vhost",
-            "/dev/vhost-vsock",
-            "--",
-            "/usr/bin/nesbox",
-            "/run/nesbox/box.json",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        let a = parse(&argv).unwrap();
-        assert_eq!(a.jail_root, PathBuf::from("/jail"));
-        assert_eq!(a.uid, 1000);
-        assert_eq!(a.gid, 1000);
-        assert_eq!(a.render_node, Some(PathBuf::from("/dev/dri/renderD128")));
-        assert_eq!(a.kvm, PathBuf::from("/dev/kvm"), "default, not passed");
-        assert_eq!(
-            a.vhost,
-            vec![
-                PathBuf::from("/dev/vhost-net"),
-                PathBuf::from("/dev/vhost-vsock")
-            ]
-        );
-        assert_eq!(
-            a.command,
-            vec![
-                "/usr/bin/nesbox".to_string(),
-                "/run/nesbox/box.json".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn a_command_is_required_after_the_separator() {
-        let argv: Vec<String> = [
-            "--jail-root",
-            "/jail",
-            "--uid",
-            "1000",
-            "--gid",
-            "1000",
-            "--",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        assert!(parse(&argv).unwrap_err().contains("no command"));
-    }
-
-    #[test]
-    fn bind_paths_repeat_and_keep_their_order() {
-        let argv: Vec<String> = [
-            "--jail-root",
-            "/jail",
-            "--uid",
-            "1000",
-            "--gid",
-            "1000",
-            // The shape a real box needs: a config file, the kernel, a disk
-            // image and the tap device -- none of them hardware the named
-            // options describe.
-            "--bind",
-            "/var/lib/nesbox/boxes/1/box.json",
-            "--bind",
-            "/var/lib/nesbox/vmlinux",
-            "--bind",
-            "/var/lib/nesbox/boxes/1/rootfs.ext4",
-            "--bind",
-            "/dev/net/tun",
-            "--",
-            "/usr/bin/nesbox",
-            "/var/lib/nesbox/boxes/1/box.json",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        let a = parse(&argv).unwrap();
-        assert_eq!(
-            a.bind,
-            vec![
-                PathBuf::from("/var/lib/nesbox/boxes/1/box.json"),
-                PathBuf::from("/var/lib/nesbox/vmlinux"),
-                PathBuf::from("/var/lib/nesbox/boxes/1/rootfs.ext4"),
-                PathBuf::from("/dev/net/tun"),
-            ]
-        );
-        // Order matters when one path nests inside another, so it is kept
-        // rather than sorted or deduplicated.
-        assert_eq!(a.bind[0], PathBuf::from("/var/lib/nesbox/boxes/1/box.json"));
-    }
-
-    #[test]
-    fn no_bind_paths_is_valid() {
-        let argv: Vec<String> = [
-            "--jail-root", "/jail", "--uid", "1000", "--gid", "1000", "--", "/bin/true",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        assert!(parse(&argv).unwrap().bind.is_empty());
-    }
-
-    #[test]
-    fn kvm_can_be_overridden() {
-        let argv: Vec<String> = [
-            "--jail-root",
-            "/jail",
-            "--uid",
-            "1000",
-            "--gid",
-            "1000",
-            "--kvm",
-            "/dev/kvm-alt",
-            "--",
-            "/bin/true",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        assert_eq!(parse(&argv).unwrap().kvm, PathBuf::from("/dev/kvm-alt"));
     }
 
     /// End to end up to the exec, in a forked child so a failure or a stray
@@ -761,9 +1048,9 @@ mod tests {
                 bind_mount(&jail_root, Path::new("/proc"), true)?;
 
                 enter_jail(&jail_root)?;
-                // Confined here on: cat can only see /proc and /marker, not
-                // the rest of the host filesystem. Reaching for /etc/passwd
-                // would prove the chroot did nothing.
+                // Confined here on: only /proc and /marker are reachable, not
+                // the rest of the host filesystem. Reaching /etc/passwd would
+                // prove the chroot did nothing.
                 ensure!(
                     !Path::new("/etc/passwd").exists(),
                     "the host's /etc/passwd is reachable inside the jail"

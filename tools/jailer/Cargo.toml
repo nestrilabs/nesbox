@@ -9,3 +9,8 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
 libc = "0.2.189"
+# The box config is read here, not taken on faith from the caller -- see the
+# BoxConfig comment in src/main.rs for why this is a partial mirror of
+# vmm/src/config.rs rather than a dependency on the vmm crate.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
