@@ -118,6 +118,20 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     install -Dm755 target/release/nesbox /artifacts/nesbox/usr/bin/nesbox && \
     find /artifacts/nesbox -type f -printf '/%P\n' > /artifacts/nesbox/.manifest
 
+# `--workspace` above also builds `tools/jailer`, and only `nesbox` is
+# installed on purpose. The jailer runs on the *host*, as root, before the
+# chroot exists — it is never inside the jail, so putting a copy of it there
+# would be a privileged binary sitting in a tree whose whole point is to
+# bound what a compromised device model can reach. Get it from the repo's own
+# `cargo build --release` (`make jailer` in this directory does that and
+# copies it to output/), not from this image.
+#
+# This is also why nothing here needs Firecracker's static-musl jailer build:
+# its jailer copies one static binary into an otherwise-empty jail, so the
+# jail has no libc to link against. This jail is a full userspace with Mesa in
+# it, and the jailer that enters it links against the *host's* libc, which it
+# gets by being built on the host.
+
 
 # ───────────────────────────────────────────────────────────
 #  The shared Mesa build — pulled, not rebuilt

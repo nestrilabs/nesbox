@@ -17,7 +17,8 @@ build/
 
 ```sh
 make build          # docker build -t ghcr.io/nestrilabs/nesbox/jail:latest
-make materialize     # + unpack into output/jail/
+make jailer          # cargo build the host-side jailer into output/jailer
+make materialize     # + unpack into output/jail/, with the jailer beside it
 ```
 
 Needs `ghcr.io/nestrilabs/nestri/base:latest` to already exist — build it from
@@ -79,12 +80,30 @@ precise Mesa-only manifest — the same mechanism `nestri/build`'s own
 `strip-manifest` already uses internally — is a reasonable follow-up once
 this has built once for real.
 
-## What this does not do
+## The jailer is not in this image, on purpose
 
 Nothing here allocates a uid, unshares a mount namespace, or bind-mounts
-`/dev/dri`, `/dev/kvm`, `/sys`, `/proc` or the metrics socket into the jail
-— that is the jailer binary's own job, proposed but not yet implemented.
-This directory only builds what the jailer chroots *into*.
+`/dev/dri`, `/dev/kvm`, `/sys`, `/proc` or the metrics socket into the jail —
+that is [`tools/jailer`](../tools/jailer)'s job. This directory only builds
+what the jailer chroots *into*.
+
+The jailer binary is a host-side tool and stays one. The repo's own
+`cargo build --release` produces it next to `nesbox` — `target/release/jailer`
+and `target/release/nesbox`, the same pair Firecracker ships — and
+`make jailer` here copies it into `output/` beside the materialized jail, so
+`make materialize` gives you both halves of a runnable local setup.
+
+It is deliberately *not* installed into the image. It runs as root, before
+the chroot exists, and never inside it; a copy of it in the jail would be a
+privileged binary sitting in the one tree whose entire purpose is to bound
+what a compromised device model can reach.
+
+That also explains the one visible difference from Firecracker's jailer, which
+is built as a static musl binary. Firecracker's copies a single static
+`firecracker` into an otherwise-empty jail, so there is no libc in there to
+link against. This jail is a full userspace — Mesa, virglrenderer, `nesbox`
+itself — and the jailer that enters it links against the *host's* libc, which
+it gets by being built on the host rather than extracted from this image.
 
 Materializing the built image onto shared storage in production is whatever
 launches the box's job — `scripts/materialize.sh` here is a stand-in for
