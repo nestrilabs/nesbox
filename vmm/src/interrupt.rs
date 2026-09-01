@@ -15,7 +15,7 @@ use kvm_bindings::{
     KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
     KVM_IRQCHIP_PIC_SLAVE, KvmIrqRouting, kvm_irq_routing_entry,
 };
-use kvm_ioctls::VmFd;
+use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
 use pci::{MsiRouter, MsiVector};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -120,6 +120,26 @@ impl IrqManager {
             .set_gsi_routing(&routing)
             .context("KVM_SET_GSI_ROUTING failed")?;
         Ok(())
+    }
+}
+
+impl pci::IoeventRegistrar for IrqManager {
+    /// Hand a doorbell to KVM.
+    ///
+    /// `NoDatamatch` is a zero-sized type, so the registration carries length
+    /// zero and matches a write of any width at that address -- which is what a
+    /// virtio notify register needs, since a driver may write it two bytes or
+    /// four.
+    fn register(&self, addr: u64, fd: &EventFd) -> Result<()> {
+        self.vm_fd
+            .register_ioevent(fd, &IoEventAddress::Mmio(addr), NoDatamatch)
+            .with_context(|| format!("KVM_IOEVENTFD register at {addr:#x}"))
+    }
+
+    fn unregister(&self, addr: u64, fd: &EventFd) -> Result<()> {
+        self.vm_fd
+            .unregister_ioevent(fd, &IoEventAddress::Mmio(addr), NoDatamatch)
+            .with_context(|| format!("KVM_IOEVENTFD deassign at {addr:#x}"))
     }
 }
 

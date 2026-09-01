@@ -115,6 +115,37 @@ pub const ECAM_SIZE: u64 = 0x10_0000;
 /// bytes; the extended area reads as zero.
 const ECAM_FUNCTION_SIZE: u64 = 0x1000;
 
+/// A register a guest writes purely to say "there is work" -- a virtio queue's
+/// notify register being the only kind here.
+///
+/// The value written carries nothing this device needs; the write *is* the
+/// message. That is what makes it worth handing to KVM, which can match the
+/// write in the kernel and signal `fd` without ever returning to userspace --
+/// no VM exit into the vCPU thread, no region scan, no `write_bar`, no
+/// `write()` syscall on the eventfd.
+///
+/// A device declaring a doorbell must still serve the same write through
+/// [`PciDevice::write_bar`]: registration can fail, and on a host where it does
+/// the guest's writes arrive the ordinary way.
+#[derive(Clone)]
+pub struct Doorbell {
+    /// Which BAR the register lives in.
+    pub bar_idx: usize,
+    /// Byte offset within that BAR.
+    pub offset: u64,
+    /// Signalled on every write, whatever its value or width.
+    pub fd: Arc<vmm_sys_util::eventfd::EventFd>,
+}
+
+/// Somewhere to register doorbells with. Implemented by the VMM, because the
+/// bus has no business knowing about KVM.
+pub trait IoeventRegistrar: Send + Sync {
+    /// Ask for `fd` to be signalled when the guest writes to `addr`.
+    fn register(&self, addr: u64, fd: &vmm_sys_util::eventfd::EventFd) -> Result<()>;
+    /// Undo a [`IoeventRegistrar::register`] for the same address and fd.
+    fn unregister(&self, addr: u64, fd: &vmm_sys_util::eventfd::EventFd) -> Result<()>;
+}
+
 pub trait PciDevice: Send + Sync {
     /// Read from PCI configuration space. `offset` is byte offset, `data`
     /// is 1, 2 or 4 bytes wide.
@@ -132,6 +163,11 @@ pub trait PciDevice: Send + Sync {
     fn bar_type(&self, _bar_idx: usize) -> BarType {
         BarType::Mem32
     }
+    /// Registers whose writes are pure notifications, for KVM to answer in the
+    /// kernel. See [`Doorbell`]. Most devices have none.
+    fn doorbells(&self) -> Vec<Doorbell> {
+        Vec::new()
+    }
 }
 
 // ── Internal book-keeping ─────────────────────────────────────────────────────
@@ -145,6 +181,14 @@ struct Bar {
     /// probed one register at a time, so this is tracked per half.
     probing_lo: bool,
     probing_hi: bool,
+}
+
+/// A doorbell the kernel is currently answering, and where.
+struct RegisteredDoorbell {
+    bdf: (u8, u8, u8),
+    bar_idx: usize,
+    addr: u64,
+    fd: Arc<vmm_sys_util::eventfd::EventFd>,
 }
 
 struct PciDeviceEntry {
@@ -162,6 +206,15 @@ pub struct Bus {
     config_addr: Mutex<u32>,
     /// Flat MMIO region index: (base, size, bdf, bar_idx).
     mmio_regions: RwLock<Vec<(u64, u64, (u8, u8, u8), usize)>>,
+    /// Where doorbells get handed to the kernel. Absent means every notify
+    /// takes the long way round, through a VM exit and `write_bar`.
+    ioevents: RwLock<Option<Arc<dyn IoeventRegistrar>>>,
+    /// Doorbells currently registered, and at which address. Kept because a
+    /// guest moves BARs -- it sizes them by writing all ones and then assigns
+    /// its own address -- and a registration that is not moved with its BAR
+    /// leaves the kernel matching an address the device no longer answers at,
+    /// while the address it *does* answer at exits to userspace.
+    registered: RwLock<Vec<RegisteredDoorbell>>,
     /// Where 64-bit BARs are placed. Depends on the guest CPU's address width.
     mmio64: Mmio64Window,
 }
@@ -173,11 +226,108 @@ impl Bus {
             next_bdf: Mutex::new((0, 1, 0)), // device 0 = host bridge (synthetic, handled inline)
             config_addr: Mutex::new(0),
             mmio_regions: RwLock::new(Vec::new()),
+            ioevents: RwLock::new(None),
+            registered: RwLock::new(Vec::new()),
             mmio64,
         }
     }
 
     /// Register a PCI device and assign BAR addresses.  Returns the BDF.
+    /// Hand the bus somewhere to register doorbells. Set this before adding
+    /// devices; a device added earlier keeps its writes going through
+    /// `write_bar`, which is correct, only slower.
+    pub fn set_ioevent_registrar(&self, registrar: Arc<dyn IoeventRegistrar>) {
+        *self.ioevents.write().unwrap() = Some(registrar);
+    }
+
+    /// Register a device's doorbells at their current addresses.
+    fn register_doorbells(
+        &self,
+        bdf: (u8, u8, u8),
+        device: &Arc<dyn PciDevice>,
+        bars: &[(usize, u64)],
+    ) {
+        let doorbells = device.doorbells();
+        if doorbells.is_empty() {
+            return;
+        }
+        let Some(registrar) = self.ioevents.read().unwrap().clone() else {
+            return;
+        };
+        let mut registered = self.registered.write().unwrap();
+        for door in doorbells {
+            let Some(&(_, base)) = bars.iter().find(|(idx, _)| *idx == door.bar_idx) else {
+                continue;
+            };
+            let addr = base + door.offset;
+            match registrar.register(addr, &door.fd) {
+                Ok(()) => {
+                    log::debug!(
+                        "{:02x}:{:02x}.{} doorbell at {addr:#x} answered by the kernel",
+                        bdf.0,
+                        bdf.1,
+                        bdf.2
+                    );
+                    registered.push(RegisteredDoorbell {
+                        bdf,
+                        bar_idx: door.bar_idx,
+                        addr,
+                        fd: door.fd.clone(),
+                    })
+                }
+                Err(err) => log::warn!(
+                    "{:02x}:{:02x}.{} doorbell at {addr:#x} could not be handed to the kernel \
+                     ({err:#}); its writes will exit to userspace instead",
+                    bdf.0,
+                    bdf.1,
+                    bdf.2
+                ),
+            }
+        }
+    }
+
+    /// Move a device's doorbells after the guest reassigned a BAR.
+    ///
+    /// `old_base` comes from the write that moved it rather than from the
+    /// device, which by this point already holds the new address.
+    fn move_doorbells_from(&self, bdf: (u8, u8, u8), bar_idx: usize, old_base: u64, new_base: u64) {
+        let Some(registrar) = self.ioevents.read().unwrap().clone() else {
+            return;
+        };
+        let mut registered = self.registered.write().unwrap();
+        for entry in registered.iter_mut() {
+            if entry.bdf != bdf || entry.bar_idx != bar_idx {
+                continue;
+            }
+            // A doorbell is defined by its offset within the BAR, so that is
+            // what survives the move.
+            let offset = entry.addr.saturating_sub(old_base);
+            let addr = new_base + offset;
+            if addr == entry.addr {
+                continue;
+            }
+            // Deassign first: KVM will not hold the same fd at two addresses,
+            // and leaving the old registration would have the kernel answering
+            // writes to an address the device no longer decodes.
+            if let Err(err) = registrar.unregister(entry.addr, &entry.fd) {
+                log::warn!(
+                    "could not unregister a doorbell at {:#x}: {err:#}",
+                    entry.addr
+                );
+            }
+            match registrar.register(addr, &entry.fd) {
+                Ok(()) => {
+                    log::debug!("doorbell moved {:#x} -> {addr:#x}", entry.addr);
+                    entry.addr = addr;
+                }
+                Err(err) => log::warn!(
+                    "doorbell could not follow its BAR to {addr:#x} ({err:#}); its writes will \
+                     exit to userspace instead"
+                ),
+            }
+        }
+    }
+
     pub fn add_device(&self, device: impl PciDevice + 'static) -> Result<(u8, u8, u8)> {
         self.add_device_arc(Arc::new(device))
     }
@@ -281,15 +431,22 @@ impl Bus {
         drop(next_bdf);
 
         // Register MMIO regions for dispatch.
-        {
+        let (device, bars) = {
             let devices = self.devices.read().unwrap();
-            if let Some(entry) = devices.get(&bdf) {
-                let mut mmio = self.mmio_regions.write().unwrap();
-                for bar in &entry.bars {
-                    mmio.push((bar.addr, bar.size, bdf, bar.bar_idx));
+            match devices.get(&bdf) {
+                Some(entry) => {
+                    let mut mmio = self.mmio_regions.write().unwrap();
+                    for bar in &entry.bars {
+                        mmio.push((bar.addr, bar.size, bdf, bar.bar_idx));
+                    }
+                    let bars: Vec<(usize, u64)> =
+                        entry.bars.iter().map(|b| (b.bar_idx, b.addr)).collect();
+                    (entry.device.clone(), bars)
                 }
+                None => return Ok(bdf),
             }
-        }
+        };
+        self.register_doorbells(bdf, &device, &bars);
 
         Ok(bdf)
     }
@@ -443,7 +600,7 @@ impl Bus {
             // Handle BAR write without holding devices lock while touching mmio_regions,
             // to keep a consistent lock order (always: mmio_regions before devices, or
             // acquire them separately, never nest in opposite order).
-            let (moved_to, owning_slot) = {
+            let (moved_to, owning_slot, moved_from) = {
                 let mut devices = self.devices.write().unwrap();
                 let entry = match devices.get_mut(&bdf) {
                     Some(e) => e,
@@ -502,17 +659,21 @@ impl Bus {
                 if requested == bar.addr {
                     return;
                 }
+                let previous = bar.addr;
                 bar.addr = requested;
-                (requested, bar.bar_idx)
+                (requested, bar.bar_idx, previous)
             }; // devices lock released here
 
             // Now update mmio_regions separately (no nesting).
-            let mut mmio = self.mmio_regions.write().unwrap();
-            for region in mmio.iter_mut() {
-                if region.2 == bdf && region.3 == owning_slot {
-                    region.0 = moved_to;
+            {
+                let mut mmio = self.mmio_regions.write().unwrap();
+                for region in mmio.iter_mut() {
+                    if region.2 == bdf && region.3 == owning_slot {
+                        region.0 = moved_to;
+                    }
                 }
             }
+            self.move_doorbells_from(bdf, owning_slot, moved_from, moved_to);
             return;
         }
 
@@ -649,6 +810,111 @@ mod tests {
         fn bar_type(&self, i: usize) -> BarType {
             self.bars.get(i).map(|b| b.1).unwrap_or(BarType::Mem32)
         }
+    }
+
+    /// A device with one doorbell, for the ioeventfd tests.
+    struct DoorbellDevice {
+        fd: Arc<vmm_sys_util::eventfd::EventFd>,
+    }
+
+    impl PciDevice for DoorbellDevice {
+        fn read_config(&self, _o: u32, d: &mut [u8]) {
+            d.fill(0);
+        }
+        fn write_config(&self, _o: u32, _d: &[u8]) {}
+        fn read_bar(&self, _i: usize, _o: u64, _d: &mut [u8]) -> bool {
+            true
+        }
+        fn write_bar(&self, _i: usize, _o: u64, _d: &[u8]) -> bool {
+            true
+        }
+        fn bar_size(&self, i: usize) -> u64 {
+            if i == 0 { 0x1000 } else { 0 }
+        }
+        fn doorbells(&self) -> Vec<Doorbell> {
+            vec![Doorbell {
+                bar_idx: 0,
+                offset: 0x300,
+                fd: self.fd.clone(),
+            }]
+        }
+    }
+
+    /// Records what the kernel would have been asked to do.
+    #[derive(Default)]
+    struct RecordingRegistrar {
+        calls: Mutex<Vec<(&'static str, u64)>>,
+    }
+
+    impl IoeventRegistrar for RecordingRegistrar {
+        fn register(&self, addr: u64, _fd: &vmm_sys_util::eventfd::EventFd) -> Result<()> {
+            self.calls.lock().unwrap().push(("register", addr));
+            Ok(())
+        }
+        fn unregister(&self, addr: u64, _fd: &vmm_sys_util::eventfd::EventFd) -> Result<()> {
+            self.calls.lock().unwrap().push(("unregister", addr));
+            Ok(())
+        }
+    }
+
+    fn doorbell_bus() -> (Bus, Arc<RecordingRegistrar>, (u8, u8, u8)) {
+        let bus = new_bus();
+        let registrar = Arc::new(RecordingRegistrar::default());
+        bus.set_ioevent_registrar(registrar.clone());
+        let fd = Arc::new(vmm_sys_util::eventfd::EventFd::new(0).unwrap());
+        let bdf = bus.add_device(DoorbellDevice { fd }).unwrap();
+        (bus, registrar, bdf)
+    }
+
+    /// A doorbell is registered at the address its BAR was assigned, not at its
+    /// offset within the BAR.
+    #[test]
+    fn a_doorbell_is_registered_where_its_bar_landed() {
+        let (bus, registrar, bdf) = doorbell_bus();
+        let base = read_reg(&bus, bdf, 0x10) as u64 & !0xF;
+        assert_eq!(
+            *registrar.calls.lock().unwrap(),
+            vec![("register", base + 0x300)]
+        );
+    }
+
+    /// The guest moves BARs -- it assigns its own addresses after sizing them --
+    /// and a registration left at the old address has the kernel answering
+    /// writes the device no longer decodes, while the address it does decode
+    /// exits to userspace. Both halves have to happen, in that order.
+    #[test]
+    fn a_doorbell_follows_its_bar_when_the_guest_moves_it() {
+        let (bus, registrar, bdf) = doorbell_bus();
+        let old = read_reg(&bus, bdf, 0x10) as u64 & !0xF;
+        let new = MMIO_WINDOW_START + 0x10_0000;
+        write_reg(&bus, bdf, 0x10, new as u32);
+
+        assert_eq!(
+            *registrar.calls.lock().unwrap(),
+            vec![
+                ("register", old + 0x300),
+                ("unregister", old + 0x300),
+                ("register", new + 0x300),
+            ]
+        );
+    }
+
+    /// Sizing a BAR means writing all ones and reading back the mask. It is not
+    /// a move, and re-registering a doorbell at 0xFFFFF300 would point the
+    /// kernel at nothing.
+    #[test]
+    fn sizing_a_bar_does_not_move_its_doorbell() {
+        let (bus, registrar, bdf) = doorbell_bus();
+        let base = read_reg(&bus, bdf, 0x10) as u64 & !0xF;
+        write_reg(&bus, bdf, 0x10, 0xFFFF_FFFF);
+        let _ = read_reg(&bus, bdf, 0x10); // the size mask
+        write_reg(&bus, bdf, 0x10, base as u32); // the guest puts it back
+
+        assert_eq!(
+            *registrar.calls.lock().unwrap(),
+            vec![("register", base + 0x300)],
+            "sizing must not touch the registration"
+        );
     }
 
     /// A window like a 39-bit CPU would get: 16 GiB just under 512 GiB.

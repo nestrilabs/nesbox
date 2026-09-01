@@ -8,7 +8,9 @@
       "drive_id": "rootfs",
       "path_on_host": "/path/to/rootfs.ext4",
       "is_root_device": true,
-      "is_read_only": true
+      "is_read_only": true,
+      "num_queues": 4,
+      "poll_us": 0
     }
   ],
   "machine-config": {

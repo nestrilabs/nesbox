@@ -99,7 +99,12 @@ pci/                 config space, CAM1 + ECAM decode, BAR allocation, MSI types
   src/msi.rs         MsiVector + MsiRouter, the seam between devices and the VMM
 virtio-devices/      one file per device, all virtio 1.0 over PCI
   src/common.rs      shared: queue state, MSI-X table, config-space helpers
-  src/blk.rs         virtio-blk, synchronous, single queue
+  src/blk/           virtio-blk: io_uring, multiqueue, direct I/O where it can
+    mod.rs           the PCI device, feature negotiation, per-queue state
+    disk.rs          the backing file: O_DIRECT, alignment probe, capacity
+    request.rs       a descriptor chain into a checked request
+    engine.rs        io_uring, with a positional-syscall fallback
+    worker.rs        one thread per queue: drain, submit, complete, interrupt
   src/console.rs     virtio-console, hvc0, host stdin <-> guest
   src/vsock.rs       virtio-vsock, queues handed to /dev/vhost-vsock
   src/fs.rs          virtio-fs, queues handed to virtiofsd over vhost-user
@@ -154,7 +159,7 @@ RUST_LOG=trace ./target/debug/nesbox cfg.json 2>&1 | grep -c 'INTx fallback'   #
 
 | Device | Backend | Verified by |
 |---|---|---|
-| virtio-blk | in-process, worker thread | root filesystem mounts; 400 MiB read off `/dev/vda` is byte-identical to the host image at 516 MB/s |
+| virtio-blk | in-process, `io_uring`, one worker per queue | root filesystem mounts; 400 MiB read off `/dev/vda` is byte-identical to the host image. Since the rewrite: `/sys/block/vda/mq/` shows the queues, a 64 MiB write with `conv=fsync` reads back at the same md5, `fstrim -v /` trims 2.3 GiB and the host image's allocation drops with it, and `scripts/bench-blk.sh` A/Bs it against the old device |
 | virtio-console | in-process | typed commands execute in the guest |
 | virtio-vsock | kernel, `/dev/vhost-vsock` | host connect to the guest CID gets ECONNRESET from the guest's own stack; an unused CID gets ENODEV. `/dev/vsock` is present in the guest. **No application-level exchange has been done** — the test rootfs has no vsock-capable tool |
 | virtio-fs | virtiofsd, vhost-user | `mount -t virtiofs`, reading a host file, EROFS on a read-only export |
@@ -205,6 +210,31 @@ Do not re-derive these.
   dead, and anything with no trailing newline — a shell prompt, `clear` — shows
   up only when the *next* command produces output. `serial.rs` already got this
   right; `console.rs` did not.
+- **A driver walks the feature selector past the features.** Linux writes and
+  reads `feature_select` 0, 1, 2, 3 -- the spec's feature space is 128 bits --
+  and the last two carry zero. Every device here read that as "not word zero, so
+  it must be the high word", which broke it in *both* directions: on the write
+  side select 2 wiped bits 32..63, `VIRTIO_F_VERSION_1` with them, and on the
+  read side selects 2 and 3 answered with word 1's contents, offering the guest
+  feature bits 64 and up. Both now match on the word index --
+  `write_driver_feature` and `com_read` in `common.rs`. The write half was found
+  first and the read half sat there another day, looking like a driver that had
+  declined a feature.
+- **`IORING_SETUP_SINGLE_ISSUER` binds a ring to the task that first touches
+  it.** Building a worker's ring where the worker is *constructed* and then
+  moving it to the thread that runs it fails every submission with `EEXIST` --
+  at the first request, not at setup, so it looks like an I/O bug rather than a
+  setup one. Rings are built on the thread that submits to them.
+- **A guest kernel panic does not stop the VMM.** The kernel halts, KVM happily
+  keeps running it, and a scripted guest that ends in a panic hangs until
+  something else kills it -- which quietly turned every benchmark run into a
+  timeout. `panic=-1` in the guest command line turns the panic into a reset,
+  which nesbox does exit on.
+- **ZFS asks for 128 KiB-aligned direct I/O.** `stx_dio_offset_align` is the
+  recordsize, and Linux refuses a virtio-blk device whose `blk_size` is above
+  its page size, so passing that alignment on as the block size gets
+  `Invalid logical block size (131072)` and a disk that does not probe. Above
+  4096 the drive is opened buffered instead, with the reason logged.
 - **The virtio ISR register is INTx-only.** An MSI-X driver never reads it, so
   anything gated on it stops working after the first interrupt.
 - **Capability offsets are not derivable from capability contents.** Only
@@ -270,38 +300,128 @@ Do not re-derive these.
 
 ## 6. Known gaps
 
-- **Storage is the weakest device in the VMM, and one part of it was a
-  correctness bug.** `virtio-blk` advertised `VIRTIO_BLK_F_FLUSH` (feature bit 9)
-  and implemented `BLK_T_FLUSH` as `File::flush()`, which is a **documented no-op**
-  — `std` does no userspace buffering, so nothing was forced to the platter. A
-  guest that wrote, flushed, and was told OK treated the data as durable and a
-  host crash lost it. Now `sync_data()`, with the error reported rather than
-  swallowed, because a flush that failed is not a flush.
+- **Storage was the weakest device in the VMM. It was rewritten on 2026-08-28**
+  (`virtio-devices/src/blk/`), and what is left is listed at the end of this
+  entry rather than in it.
 
-  The rest is performance, and it is structural rather than a missing flag:
+  What it was, and why each part was a real cost:
 
-  - **Request depth is effectively 1.** `io()` uses `seek` + `read_exact` /
-    `write_all`, so the file offset is shared state and requests *must* be
-    serialised. One worker thread drains the ring one entry at a time. A guest
-    that submits 128 deep gets them executed in single file.
-  - **A `vec![0u8; len]` per descriptor, per request.** Every read allocates a
-    host buffer, reads into it, copies into guest memory, and frees it. Guest
-    memory is already mapped in this process; the copy and the allocator traffic
-    both exist only because of the `seek`-based API.
-  - **One queue.** No per-vCPU submission, so all guest CPUs contend on one ring
-    and one lock.
-  - **No `DISCARD` / `WRITE_ZEROES`.** Nothing ever punches holes back, so a
-    thin-provisioned image only grows.
+  - **Request depth was effectively 1.** `io()` used `seek` + `read_exact` /
+    `write_all`, so the file offset was shared state and requests *had* to be
+    serialised. A guest submitting 128 deep got them executed in single file.
+  - **A `vec![0u8; len]` per descriptor, per request.** Every read allocated a
+    host buffer, read into it, copied into guest memory, and freed it -- while
+    guest memory was already mapped in this process.
+  - **One queue**, so every guest CPU contended on one ring, one lock and one
+    worker.
+  - **No `O_DIRECT`**, so every guest byte was cached twice and an `io.max`
+    bound on a VM stopped meaning anything once the host had the image cached
+    (§12.2 of [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md): a capped guest ran 35x
+    faster than an uncapped cold one).
+  - **No `DISCARD` / `WRITE_ZEROES`**, so a thin-provisioned image only grew.
 
-  `pread`/`pwrite` into guest memory would remove the shared offset, the copy and
-  the allocation together, and make a small worker pool possible — most of the
-  win, without `io_uring`. `io_uring` is the right end state for depth and for
-  `O_DIRECT`, which matters more than it looks: without it, every byte a guest
-  reads is cached twice, once in the host page cache and once in the guest's, so
-  N guests streaming large files cost N times the host RAM for the same bytes.
+  What it is now:
 
-  §6's 8.5 ms worst case over a 400 MiB read is the visible symptom of all of the
-  above, and it has still never been measured with GPU work in flight.
+  - **`io_uring`, one ring per queue**, with the queue's kick eventfd armed
+    inside the ring so a single `io_uring_enter` waits for both new work and
+    finished work. Requests complete out of order and the depth is the guest's.
+    There is a `preadv`/`pwritev` fallback for hosts with `io_uring` switched
+    off (`kernel.io_uring_disabled=2`), which keeps the copy and the shared
+    offset gone even where the depth is not.
+  - **Zero copy.** A request's guest pages *are* the I/O buffers. Nothing is
+    allocated per request; the bounce buffer exists only for a driver whose
+    segments direct I/O cannot take, which a Linux guest never produces.
+  - **Multiqueue.** `VIRTIO_BLK_F_MQ`, one worker and one ring per queue,
+    defaulting to one per vCPU up to four. The guest's own block layer keeps a
+    submission queue per CPU: `/sys/block/vda/mq/` has the entries to prove it.
+  - **Indirect descriptors** (`VIRTIO_F_RING_INDIRECT_DESC`), so a large
+    request is one chain rather than a chain per `seg_max` segments. The walk
+    is in `common.rs` and is bounded by the ring size the guest advertised --
+    an indirect table's length is the driver's claim about its own memory, and
+    it is clamped rather than believed.
+  - **Fewer exits and fewer interrupts.** The used ring's `NO_NOTIFY` flag is
+    set while a worker is draining, and an interrupt is skipped when the driver
+    set `NO_INTERRUPT`. Both need the barriers around them that are now there;
+    see the `set_used_no_notify` comment for the store-buffer race that a
+    missing one gives you.
+  - **`DISCARD` and `WRITE_ZEROES`**, as `fallocate` hole-punch and zero-range,
+    one range per request. `EOPNOTSUPP` is reported to the guest as unsupported
+    once, with a line saying the image will only grow.
+  - **`O_DIRECT` where the host can give it**, probed with
+    `statx(STATX_DIOALIGN)` rather than assumed, and configurable per drive:
+    `"direct": true` refuses to start without it, `false` keeps the page cache,
+    absent takes it where it is available. The advertised `blk_size` follows the
+    alignment the probe reports, so the guest issues I/O the host can take
+    directly.
+
+  The first boot of it found two bugs neither review nor a unit test would
+  have: `IORING_SETUP_SINGLE_ISSUER` and where a ring is built, and what ZFS
+  reports as its direct-I/O alignment. Both are in §5 with the rest of the
+  traps.
+
+  What is still open:
+
+  - ~~**The `O_DIRECT` path has never run.**~~ **Verified 2026-08-28 on
+    `nestripc-1`**, which has both filesystems this box actually uses: xfs on
+    `/mnt/INSTANCES` (offset alignment 4096, so the guest is given a 4096 block)
+    and ext4 on `/` (alignment 512, guest given 512). Reads come back
+    byte-identical to the host image on both, a read-write guest writes and
+    `fsync`s and reads the same md5 back, and `fstrim` returned 2.5 GB of the
+    image's allocation to the host. Numbers in
+    [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §14.1 — including the one the
+    flag exists for: a guest reading 300 MiB left **312 MiB** of the image in
+    the host page cache buffered and **nothing at all** direct, for about 4% of
+    sequential throughput.
+
+    It still cannot be exercised on *the development workstation* (the HP Z2 /
+    Xeon E-2276G box) -- every filesystem there refuses direct I/O, ZFS by
+    asking 128 KiB alignment and btrfs by being mounted `compress=zstd` -- so
+    anything measured there is the buffered path. The difference is one log line
+    at startup; read it.
+  - ~~**The other half of what `O_DIRECT` is for is unmeasured.**~~ **Measured
+    2026-08-28**, once the `io` controller was delegated to the user session on
+    `nestripc-1` (`Delegate=pids memory cpu io` in a `user@.service` drop-in --
+    it is not the default, and without it an unprivileged `io.max` has nothing
+    to attach to). Against a **warm** host cache and a 20 MB/s cap: buffered
+    reads ran at 13.3 GB/s, ignoring the cap entirely; direct reads ran at
+    20.0 MB/s. Benchmarks §12.2.1. So a storage bound on a box is real only with
+    `"direct": true`, and with it the configured number is also the number you
+    get.
+  - **Only one root drive is honoured**; extra `drives` entries are still
+    ignored.
+  - **The per-request floor is ~10 us, and it is now measured.** A 4 KiB read
+    issued on its own costs 23.6 us served from host cache and 38.0 us against
+    an NVMe; letting a worker spin on its ring instead of sleeping (`"poll_us"`
+    on a drive) takes 11.0 and 9.5 us off those. That is the doorbell-to-worker
+    path -- trap, dispatch, eventfd, wakeup -- and the faster the storage, the
+    larger a share of the request it is. Benchmarks §14.2.
+
+    ~~The two ways to get some of it for free are still open~~ -- **the first is
+    done, 2026-08-28, and it turned out to be nearly all of it:**
+    - **`ioeventfd` on the notify register (done).** KVM matches the guest's
+      write in the kernel and signals the queue's eventfd: no exit to userspace,
+      no region scan, no `write_bar`, no `write()` on the eventfd. Measured by
+      alternating against the same binary without it, 4 KiB reads at depth one:
+      **23.5 -> 12.3 us per request, and nothing spent to get it.** With
+      `poll_us: 50` on top, 7.6 us. So the VM exit was ~11 us of the ~11 us, and
+      the thread wakeup -- the part `poll_us` buys with CPU -- is the remaining
+      ~5. Doorbells are declared by the device (`PciDevice::doorbells`),
+      registered by the bus, and **re-registered when the guest moves a BAR**,
+      which is the part with teeth: a guest sizes a BAR by writing all ones
+      before assigning its own address, and a registration left behind would
+      have the kernel answering an address the device no longer decodes. Three
+      tests in `pci/src/lib.rs` cover assignment, the move, and
+      sizing-is-not-a-move.
+    - **`VIRTIO_F_RING_EVENT_IDX` (implemented, unproven).** Each side names
+      the index at which it wants to hear from the other, rather than the
+      all-or-nothing flags. Offered, negotiated, and measured: notifications per
+      request fall from ~0.67 to ~0.62 and interrupts from ~0.60 to ~0.58, and
+      **the elapsed time does not move**. The workload is why -- eight readers
+      at depth one over four queues is ~2 requests in flight per queue, and two
+      is nothing to coalesce. Proving it needs a guest that can hold a queue
+      deep (`fio --iodepth=32`), which the test rootfs cannot. Benchmarks §14.3.
+      It does nothing for depth one in any case, where each request needs its
+      own notify and its own interrupt.
 
 - **Egress works**: guest to 1.1.1.1, 0% loss, 11.5ms, with the host set up as
   the only privileged step. Verified from a blocked host: setup detected the
@@ -396,11 +516,10 @@ Do not re-derive these.
   it. Loop-mount as root, or `mkfs` a fresh image.
 - No API socket, no jailer, no seccomp, no snapshots, no CPU pinning. All were
   in the Firecracker fork; none exist here.
-- `virtio-blk` serves requests on a worker thread, but serially and with
-  blocking reads. Requests do not overlap, so a deep queue is drained one at a
-  time; io_uring would let them run concurrently. Measured over a 400 MiB read:
-  242 batches, 275ms of I/O in total, 1.14ms mean, 8.5ms worst — that worst case
-  is half a frame at 60fps, and it used to happen on the vCPU thread.
+- `virtio-blk` requests now overlap: `io_uring`, a ring and a worker per queue,
+  the guest's own pages as the buffers. The serial worker's measured 8.5 ms
+  worst case over a 400 MiB read is the number that motivated it; the rewrite
+  and what is still open are above.
 - Only one root drive is honoured; extra `drives` entries are ignored.
 
 ---
@@ -491,8 +610,9 @@ and an older one at 26.1.0-devel (`git-e100ca7c86`).
    there is what made guest networking silently not work. nesbox knows both
    halves and could generate `ip=<guest>::<gateway>:<netmask>::eth0:off`
    itself; the guest kernel needs `CONFIG_IP_PNP`.
-3. `virtio-blk` serves requests serially; io_uring would let a deep queue
-   overlap.
+3. ~~`virtio-blk` serves requests serially~~ — **done 2026-08-28**, see §6.
+   What is left there is a host that can actually exercise `O_DIRECT`, and an
+   `ioeventfd` on the notify register.
 
 ## 9. Running virtio-net
 
