@@ -84,6 +84,19 @@ by the VMM itself.
   for. Its source directories are derived from `shared-directories` like
   anything else; the *binary* is not bound in at all, because nesbox spawns
   it from inside the jail and the jail image ships it.
+
+  **The image is read-only, and that is what makes sharing it safe.** It is
+  the lower half of an overlay whose upper half is a `tmpfs` private to the
+  box, so nothing inside a jail can write to the tree the next box will load
+  its Mesa, its virglrenderer and its nesbox out of. Without that, one
+  guest compromise would mean planting a library every other box on the host
+  `dlopen`s — worse than the no-jail baseline, where each box loads from a
+  host tree no guest uid can touch. `writing_inside_the_jail_never_reaches_the_image`
+  is the test.
+
+  It bounds the image, not the jail. `/proc`, `/sys`, the metrics directory
+  and every path derived from the config stay writable exactly as their own
+  permissions on the host allow — the overlay says nothing about them.
 - It assumes Firecracker's API-socket contract, which is not ours.
   `tools/jailer` has none — it is `chroot` + bind-mount + uid/gid drop +
   `execve`, and nothing else.

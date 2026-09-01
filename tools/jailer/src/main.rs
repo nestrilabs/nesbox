@@ -19,11 +19,16 @@
 //!   1. read the box config, and derive every host path that box needs.
 //!   2. unshare a mount namespace, and cut propagation to the host's, so
 //!      nothing done here leaks back out.
-//!   3. bind-mount those paths, at the same path inside the jail.
-//!   4. `chroot` into the jail root -- already built and materialized
-//!      elsewhere. This binary does not build, fetch or version it.
-//!   5. drop from root to the uid/gid the caller names.
-//!   6. `execve` nesbox, with the same config file.
+//!   3. build the jail: the image, read-only, as the lower half of an
+//!      overlay whose upper half is a `tmpfs` private to this box. See
+//!      [`build_jail`] -- the image is never written to, by this or by
+//!      anything running inside it.
+//!   4. bind-mount those paths, at the same path inside the jail.
+//!   5. `chroot` into the merged tree. The image itself was built and
+//!      materialized elsewhere; this binary does not build, fetch or
+//!      version it.
+//!   6. drop from root to the uid/gid the caller names.
+//!   7. `execve` nesbox, with the same config file.
 //!
 //! # The config decides what comes in
 //!
@@ -97,6 +102,8 @@ const CLONE_NEWNS: libc::c_int = 0x0002_0000;
 const MS_REC: libc::c_ulong = 0x0000_4000;
 const MS_PRIVATE: libc::c_ulong = 0x0004_0000;
 const MS_BIND: libc::c_ulong = 0x0000_1000;
+const MS_NOSUID: libc::c_ulong = 0x0000_0002;
+const MS_NODEV: libc::c_ulong = 0x0000_0004;
 
 /// Where nesbox lives inside the jail image `build/` produces. Overridable,
 /// because an image built somewhere else may lay it out differently, but not
@@ -105,6 +112,11 @@ const DEFAULT_NESBOX_BIN: &str = "/usr/bin/nesbox";
 
 /// Needed by every box, named by no config, and not worth an option: a VMM
 /// without `/dev/kvm` is not a VMM.
+/// Where the overlay's writable layer is put. On `/run` because it is a
+/// tmpfs on any host this runs on, so the one thing left behind -- an empty
+/// directory per jailer process -- does not survive a reboot.
+const DEFAULT_SCRATCH_DIR: &str = "/run/nesbox-jailer";
+
 const KVM: &str = "/dev/kvm";
 /// `virtio-devices/src/tap.rs`'s `TUN_PATH`. nesbox opens an existing tap
 /// through it; creating one is the host setup script's job.
@@ -127,12 +139,20 @@ Must run as root -- that is the whole point: it does the things nesbox's own
 seccomp filter refuses to let nesbox do to itself. Nothing it does stays
 privileged past the drop.
 
+The jail image is never written to: it is the read-only lower half of an
+overlay whose upper half is a tmpfs private to this box, so mount points and
+anything the box writes go there and vanish when it exits.
+
 Options:
   --nesbox-bin <path>   nesbox inside the jail image. Default /usr/bin/nesbox.
   --bind <path>          an extra host path to bring in, at the same path
                          inside the jail; repeatable. An escape hatch for
                          something a config does not name -- everything a
                          config does name comes in without being asked for.
+  --scratch-dir <path>   where the overlay's writable layer goes.
+                         Default /run/nesbox-jailer.
+  --dry-run              print the paths this config would bring in, and why,
+                         then exit. Needs no root and mounts nothing.
 
 Every path in the config must be absolute: this chroots before nesbox opens
 any of them, so a relative path would resolve against a directory that is no
@@ -148,6 +168,8 @@ struct Args {
     gid: u32,
     nesbox_bin: PathBuf,
     bind: Vec<PathBuf>,
+    scratch_dir: PathBuf,
+    dry_run: bool,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -157,6 +179,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut gid = None;
     let mut nesbox_bin = PathBuf::from(DEFAULT_NESBOX_BIN);
     let mut bind = Vec::new();
+    let mut scratch_dir = PathBuf::from(DEFAULT_SCRATCH_DIR);
+    let mut dry_run = false;
 
     fn val(argv: &[String], i: usize) -> Result<&str, String> {
         argv.get(i + 1)
@@ -199,6 +223,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 bind.push(PathBuf::from(val(argv, i)?));
                 i += 2
             }
+            "--scratch-dir" => {
+                scratch_dir = PathBuf::from(val(argv, i)?);
+                i += 2
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -210,6 +242,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         gid: gid.ok_or("--gid is required")?,
         nesbox_bin,
         bind,
+        scratch_dir,
+        dry_run,
     })
 }
 
@@ -387,21 +421,36 @@ fn path_to_cstring(p: &Path) -> Result<CString> {
         .with_context(|| format!("{} contains a NUL byte", p.display()))
 }
 
-/// `mount(2)`, with `None` meaning "pass NULL" for `source` and `fstype` --
-/// which is what a propagation change (no source) and a bind mount (fstype
-/// is ignored by the kernel once `MS_BIND` is set) both want.
-fn raw_mount(source: Option<&Path>, target: &Path, flags: libc::c_ulong) -> Result<()> {
+/// `mount(2)`, with `None` meaning "pass NULL" -- which is what a propagation
+/// change (no source, no type) and a bind mount (fstype is ignored by the
+/// kernel once `MS_BIND` is set) both want. `fstype` and `data` are for the
+/// two mounts that are not binds: the scratch `tmpfs` and the `overlay`.
+fn raw_mount(
+    source: Option<&Path>,
+    target: &Path,
+    fstype: Option<&str>,
+    flags: libc::c_ulong,
+    data: Option<&str>,
+) -> Result<()> {
     let src_c = source.map(path_to_cstring).transpose()?;
     let tgt_c = path_to_cstring(target)?;
-    // SAFETY: both pointers are either null or borrowed from a CString that
+    let fst_c = fstype
+        .map(|t| CString::new(t).context("fstype contains a NUL byte"))
+        .transpose()?;
+    let data_c = data
+        .map(|d| CString::new(d).context("mount options contain a NUL byte"))
+        .transpose()?;
+    // SAFETY: every pointer is either null or borrowed from a CString that
     // outlives this call; `mount` reads them and returns.
     let rc = unsafe {
         libc::mount(
             src_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             tgt_c.as_ptr(),
-            std::ptr::null(),
+            fst_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             flags,
-            std::ptr::null(),
+            data_c
+                .as_ref()
+                .map_or(std::ptr::null(), |c| c.as_ptr().cast()),
         )
     };
     if rc != 0 {
@@ -425,7 +474,7 @@ fn unshare_mount_namespace() -> Result<()> {
     if unsafe { libc::unshare(CLONE_NEWNS) } != 0 {
         return Err(std::io::Error::last_os_error()).context("unshare(CLONE_NEWNS)");
     }
-    raw_mount(None, Path::new("/"), MS_REC | MS_PRIVATE)
+    raw_mount(None, Path::new("/"), None, MS_REC | MS_PRIVATE, None)
         .context("making the mount tree private after unshare")
 }
 
@@ -479,7 +528,7 @@ fn bind_mount(jail_root: &Path, host_path: &Path, recursive: bool) -> Result<()>
     }
 
     let flags = MS_BIND | if recursive { MS_REC } else { 0 };
-    raw_mount(Some(host_path), &target, flags).with_context(|| {
+    raw_mount(Some(host_path), &target, None, flags, None).with_context(|| {
         format!(
             "bind-mounting {} onto {}",
             host_path.display(),
@@ -492,6 +541,126 @@ fn bind_mount(jail_root: &Path, host_path: &Path, recursive: bool) -> Result<()>
         target.display()
     );
     Ok(())
+}
+
+/// The scratch `tmpfs` that holds the overlay's upper and work directories,
+/// and the merged tree that becomes the jail.
+///
+/// Small on purpose: nothing of size is meant to land here. It holds the
+/// mount points [`bind_mount`] creates, whatever the jailed process writes to
+/// a path the image does not otherwise provide -- virtiofsd's socket and
+/// pidfile under `/tmp` (`vmm/src/virtiofsd.rs` puts them in
+/// `env::temp_dir()`), a lock file, a log nobody redirected -- and nothing
+/// else. A box that fills 16 MiB of it is doing something this jail was not
+/// built for, and failing on ENOSPC is the right way to find that out.
+const SCRATCH_SIZE: &str = "size=16m,mode=0700";
+
+/// `lowerdir=...,upperdir=...,workdir=...`, refusing paths overlayfs cannot
+/// express.
+///
+/// The option string is comma-separated and its `lowerdir` list is
+/// colon-separated, with no escaping mechanism worth relying on -- a jail
+/// root with a comma in its name would silently become two lowerdirs. That is
+/// a refusal rather than a surprise, and it is checked here rather than at
+/// mount time because the kernel's own error for it ("Invalid argument") says
+/// nothing about which path was wrong.
+fn overlay_options(lower: &Path, upper: &Path, work: &Path) -> Result<String> {
+    for (label, p) in [
+        ("--jail-root", lower),
+        ("upperdir", upper),
+        ("workdir", work),
+    ] {
+        let s = p.to_string_lossy();
+        ensure!(
+            !s.contains(',') && !s.contains(':'),
+            "{label} {} contains a ',' or ':', which overlayfs mount options \
+             cannot express -- move it somewhere without one",
+            p.display()
+        );
+    }
+    Ok(format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    ))
+}
+
+/// Build the jail as a read-only image plus a per-box writable layer, and
+/// return the merged tree to chroot into.
+///
+/// This is what makes "a read-only OCI image materialized once onto the
+/// shared box-store" (`.nestri` 0045) true rather than asserted. The image is
+/// the overlay's `lowerdir`, which the kernel never writes to; everything
+/// written inside the jail lands in an upper directory on a `tmpfs` private
+/// to this mount namespace, and goes away with it.
+///
+/// A plain `chroot` into the image would not do. Three things need to write
+/// somewhere:
+///
+///   * [`bind_mount`] creates its own mount points. On a genuinely read-only
+///     image that is EROFS and the jailer dies; on a writable one it mutates
+///     a tree every other box on the host shares, and two jailers starting at
+///     once race on it.
+///   * nesbox spawns virtiofsd, which puts its socket and pidfile under
+///     `/tmp` *inside the jail*.
+///   * an image cannot pre-create mount points for paths it cannot know --
+///     `renderD128` or `renderD129`, `/run/nesbox/<box>`, wherever a config
+///     keeps its kernel and disks.
+///
+/// An overlay answers all three without the image having to anticipate any of
+/// them, and without one box being able to write anything another box will
+/// read.
+fn build_jail(image: &Path, scratch: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(scratch)
+        .with_context(|| format!("creating the scratch directory {}", scratch.display()))?;
+    // Mounted after the unshare, so the tmpfs and everything in it belongs to
+    // this mount namespace and is gone when the last process in it exits. The
+    // empty directory it is mounted on is the only thing left on the host.
+    raw_mount(
+        Some(Path::new("tmpfs")),
+        scratch,
+        Some("tmpfs"),
+        MS_NOSUID | MS_NODEV,
+        Some(SCRATCH_SIZE),
+    )
+    .with_context(|| format!("mounting the scratch tmpfs at {}", scratch.display()))?;
+
+    let upper = scratch.join("upper");
+    let work = scratch.join("work");
+    let merged = scratch.join("merged");
+    for d in [&upper, &work, &merged] {
+        std::fs::create_dir(d).with_context(|| format!("creating {}", d.display()))?;
+    }
+
+    let opts = overlay_options(image, &upper, &work)?;
+    // MS_NOSUID and MS_NODEV on the overlay itself, not just on the tmpfs
+    // underneath it: access goes through this mount, so these are the flags
+    // the kernel enforces. The device nodes bound in later are their own
+    // mounts and keep their own flags, so nodev here does not reach them.
+    // `exec_command`'s NO_NEW_PRIVS already blocks a setuid exec; this stops
+    // one being honoured at all.
+    raw_mount(
+        Some(Path::new("overlay")),
+        &merged,
+        Some("overlay"),
+        MS_NOSUID | MS_NODEV,
+        Some(&opts),
+    )
+    .with_context(|| {
+        format!(
+            "mounting an overlay of {} at {} -- is overlayfs available?",
+            image.display(),
+            merged.display()
+        )
+    })?;
+
+    log::info!(
+        "jailer: jail is {} (read-only) + a private tmpfs, merged at {}",
+        image.display(),
+        merged.display()
+    );
+    Ok(merged)
 }
 
 // ── chroot, privilege drop, exec ────────────────────────────────────────
@@ -633,6 +802,38 @@ fn exec_command(command: &[String]) -> Result<()> {
 // ── main ─────────────────────────────────────────────────────────────────
 
 fn run(args: Args) -> Result<()> {
+    // The config is read and checked before anything privileged happens, so
+    // --dry-run needs no root: getting a config wrong is the ordinary
+    // mistake, and finding out should not require sudo.
+    let config_path = std::fs::canonicalize(&args.config)
+        .with_context(|| format!("--config {}", args.config.display()))?;
+    let cfg = read_config(&config_path)?;
+    let paths = host_paths(&config_path, &cfg, &args.bind)?;
+
+    if args.dry_run {
+        println!(
+            "{} would bring {} paths into {}, and exec {} {}:\n",
+            env!("CARGO_PKG_NAME"),
+            paths.len() + 2,
+            args.jail_root.display(),
+            args.nesbox_bin.display(),
+            config_path.display(),
+        );
+        // The two that are not derived, printed with the rest so the list is
+        // the whole list.
+        println!("  {:<44}  always, recursively", "/proc");
+        println!("  {:<44}  always, recursively", "/sys");
+        for n in &paths {
+            let missing = if n.path.exists() { "" } else { "  [MISSING]" };
+            println!("  {:<44}  {}{}", n.path.display(), n.why, missing);
+        }
+        println!(
+            "\nNothing was mounted. A [MISSING] path is one this config names \
+             that does not exist on this host; the real run fails on it."
+        );
+        return Ok(());
+    }
+
     // SAFETY: infallible.
     let euid = unsafe { libc::geteuid() };
     ensure!(
@@ -646,51 +847,51 @@ fn run(args: Args) -> Result<()> {
         "--uid/--gid 0 defeats the whole point of dropping out of root"
     );
 
-    // Both canonicalized before anything is derived from them. A relative
-    // --config would otherwise be bound at a path that does not mirror the
-    // host's, and a relative --jail-root would be resolved against a working
-    // directory that chroot is about to make meaningless.
-    let config_path = std::fs::canonicalize(&args.config)
-        .with_context(|| format!("--config {}", args.config.display()))?;
-    let jail_root = std::fs::canonicalize(&args.jail_root)
+    // Canonicalized for the same reason as the config: a relative --jail-root
+    // would be resolved against a working directory chroot is about to make
+    // meaningless.
+    let image = std::fs::canonicalize(&args.jail_root)
         .with_context(|| format!("--jail-root {}", args.jail_root.display()))?;
     ensure!(
-        jail_root.is_dir(),
+        image.is_dir(),
         "--jail-root {} is not a directory",
-        jail_root.display()
+        image.display()
     );
-
-    let cfg = read_config(&config_path)?;
-    let paths = host_paths(&config_path, &cfg, &args.bind)?;
 
     refuse_if_uid_is_live(args.uid)?;
 
     unshare_mount_namespace()?;
+
+    // The image stays read-only; this is the tree that gets written to. One
+    // scratch directory per jailer process, so two boxes starting at once
+    // cannot collide.
+    let scratch = args.scratch_dir.join(std::process::id().to_string());
+    let jail = build_jail(&image, &scratch)?;
 
     // Always, and before the derived set: cgroup self-reporting and Mesa's
     // own /proc reads both need them, and they are not meaningfully optional
     // the way a GPU or a vhost device is. Recursive, because /sys/fs/cgroup
     // is its own mount. See the module doc comment for what a host-sourced
     // /proc and /sys inside the jail does and does not mean.
-    bind_mount(&jail_root, Path::new("/proc"), true)?;
-    bind_mount(&jail_root, Path::new("/sys"), true)?;
+    bind_mount(&jail, Path::new("/proc"), true)?;
+    bind_mount(&jail, Path::new("/sys"), true)?;
 
     for n in &paths {
-        bind_mount(&jail_root, &n.path, false)
+        bind_mount(&jail, &n.path, false)
             .with_context(|| format!("{} is needed because of {}", n.path.display(), n.why))?;
     }
 
     log::info!(
         "jailer: {} paths bound, chrooting into {}, dropping to uid={} gid={}, exec'ing {} {}",
         paths.len(),
-        jail_root.display(),
+        jail.display(),
         args.uid,
         args.gid,
         args.nesbox_bin.display(),
         config_path.display(),
     );
 
-    enter_jail(&jail_root)?;
+    enter_jail(&jail)?;
     drop_privileges(args.uid, args.gid)?;
 
     // nesbox's whole command line: the binary inside the jail, and the config
@@ -733,9 +934,27 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// Enough privilege to mount. True inside a user namespace too, which is
+    /// what makes the overlay test runnable without sudo:
+    ///     unshare --map-root-user --mount --user -- cargo test -p jailer
     fn is_root() -> bool {
         // SAFETY: infallible.
         unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Root *and* able to use it on ids other than its own.
+    ///
+    /// `geteuid() == 0` is also true in a user namespace an unprivileged user
+    /// created, where the only mapped id is their own -- `setuid(65534)` there
+    /// fails with EINVAL however root the euid looks. A test that drops to a
+    /// specific uid needs the real thing, so it checks the mapping instead of
+    /// the euid and skips rather than reporting a failure that is the
+    /// environment's, not the code's.
+    fn can_drop_to_other_uids() -> bool {
+        is_root()
+            && std::fs::read_to_string("/proc/self/uid_map")
+                .map(|m| m.split_whitespace().eq(["0", "0", "4294967295"]))
+                .unwrap_or(false)
     }
 
     fn args(pairs: &[&str]) -> Vec<String> {
@@ -830,6 +1049,83 @@ mod tests {
         assert_eq!(
             a.bind,
             vec![PathBuf::from("/opt/first"), PathBuf::from("/opt/second")]
+        );
+    }
+
+    #[test]
+    fn scratch_dir_has_a_default_and_dry_run_is_off() {
+        let a = parse(&args(&[
+            "--config",
+            "/b.json",
+            "--jail-root",
+            "/jail",
+            "--uid",
+            "1",
+            "--gid",
+            "1",
+        ]))
+        .unwrap();
+        assert_eq!(a.scratch_dir, PathBuf::from("/run/nesbox-jailer"));
+        assert!(!a.dry_run);
+
+        let a = parse(&args(&[
+            "--config",
+            "/b.json",
+            "--jail-root",
+            "/jail",
+            "--uid",
+            "1",
+            "--gid",
+            "1",
+            "--dry-run",
+            "--scratch-dir",
+            "/var/tmp/jails",
+        ]))
+        .unwrap();
+        assert!(a.dry_run);
+        assert_eq!(a.scratch_dir, PathBuf::from("/var/tmp/jails"));
+    }
+
+    // ── the overlay ────────────────────────────────────────────────────
+
+    #[test]
+    fn overlay_options_name_all_three_layers() {
+        let opts = overlay_options(
+            Path::new("/srv/nesbox/jail"),
+            Path::new("/run/nesbox-jailer/7/upper"),
+            Path::new("/run/nesbox-jailer/7/work"),
+        )
+        .unwrap();
+        assert_eq!(
+            opts,
+            "lowerdir=/srv/nesbox/jail,upperdir=/run/nesbox-jailer/7/upper,\
+             workdir=/run/nesbox-jailer/7/work"
+                .replace(['\n', ' '], "")
+        );
+    }
+
+    #[test]
+    fn a_comma_or_colon_in_a_layer_path_is_refused_by_name() {
+        // Silently becoming two lowerdirs is the failure being prevented.
+        for bad in ["/srv/a,b/jail", "/srv/a:b/jail"] {
+            let err = overlay_options(
+                Path::new(bad),
+                Path::new("/run/j/upper"),
+                Path::new("/run/j/work"),
+            )
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("--jail-root"), "{msg}");
+            assert!(msg.contains(bad), "{msg}");
+        }
+        assert!(
+            overlay_options(
+                Path::new("/srv/jail"),
+                Path::new("/run/up,per"),
+                Path::new("/run/work")
+            )
+            .is_err(),
+            "the upper is checked too, not just the lower"
         );
     }
 
@@ -1017,6 +1313,84 @@ mod tests {
         );
     }
 
+    /// The read-only claim, checked rather than asserted: writing inside the
+    /// jail must not reach the image, and the mount points [`bind_mount`]
+    /// creates must land in the upper layer rather than in the shared tree.
+    ///
+    /// Root only, and forked, for the same reason as the test below.
+    #[test]
+    fn writing_inside_the_jail_never_reaches_the_image() {
+        if !is_root() {
+            eprintln!("skipped: not root");
+            return;
+        }
+        // SAFETY: the child only touches its own address space and exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let code = (|| -> Result<i32> {
+                let dir = std::env::temp_dir().join(format!("jailer-ro-{}", std::process::id()));
+                let image = dir.join("image");
+                let scratch = dir.join("scratch");
+                std::fs::create_dir_all(&image)?;
+                std::fs::write(image.join("marker"), b"from the image\n")?;
+
+                unshare_mount_namespace()?;
+                let jail = build_jail(&image, &scratch)?;
+
+                // The image reads through.
+                ensure!(
+                    std::fs::read_to_string(jail.join("marker"))? == "from the image\n",
+                    "the image did not read through the overlay"
+                );
+
+                // Now write, the two ways a box can: a new file, and over one
+                // the image provides.
+                std::fs::write(jail.join("brand-new"), b"x")?;
+                std::fs::write(jail.join("marker"), b"tampered\n")?;
+                // And the way the jailer itself writes: a mount point.
+                bind_mount(&jail, Path::new("/proc"), true)?;
+
+                // None of it reached the image.
+                ensure!(
+                    std::fs::read_to_string(image.join("marker"))? == "from the image\n",
+                    "a write inside the jail changed the image"
+                );
+                ensure!(
+                    !image.join("brand-new").exists(),
+                    "a file created inside the jail appeared in the image"
+                );
+                ensure!(
+                    !image.join("proc").exists(),
+                    "a mount point created by the jailer appeared in the image -- \
+                     every box sharing this image would see it"
+                );
+                Ok(0)
+            })();
+            // SAFETY: exiting without unwinding.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_exit_group,
+                    match code {
+                        Ok(_) => 0,
+                        Err(e) => {
+                            eprintln!("jailer ro test child: {e:#}");
+                            1
+                        }
+                    },
+                )
+            };
+            unreachable!();
+        }
+        let mut status = 0;
+        // SAFETY: waiting on our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child failed, status {status:#x}"
+        );
+    }
+
     /// End to end up to the exec, in a forked child so a failure or a stray
     /// mount cannot affect the test process. Skips itself when not root, the
     /// same pattern `vmm/src/isolation.rs` uses for its own privileged tests.
@@ -1028,8 +1402,8 @@ mod tests {
     /// process either.
     #[test]
     fn a_real_jail_chroots_binds_and_drops() {
-        if !is_root() {
-            eprintln!("skipped: not root");
+        if !can_drop_to_other_uids() {
+            eprintln!("skipped: needs real root, not a user namespace");
             return;
         }
         // SAFETY: the child only touches its own address space and exits.

@@ -147,12 +147,23 @@ the jailer chroots before nesbox opens any of them, so a relative path would
 resolve against a directory that is no longer there, and it says which field
 is wrong rather than letting nesbox fail on it later.
 
-Two knobs, both with defaults you will rarely change:
+Pass `--dry-run` first and it prints the list it derived, marks any path that
+does not exist on this host, mounts nothing and needs no root — which is how
+you find out a config is wrong without `sudo`.
+
+The jail image is never written to. It is the read-only lower half of an
+overlay whose upper half is a `tmpfs` private to that box, so the mount
+points the jailer creates, virtiofsd's socket, and anything the box writes to
+a path the image does not provide all land there and vanish when it exits.
+That is what lets one image be materialized once and shared: a compromised
+box cannot leave anything behind for the next one to load.
 
 | | |
 |---|---|
 | `--nesbox-bin <path>` | nesbox *inside the jail image*. Default `/usr/bin/nesbox` |
 | `--bind <path>` | an extra host path, repeatable. An escape hatch for something a config does not name |
+| `--scratch-dir <path>` | where the overlay's writable layer goes. Default `/run/nesbox-jailer` |
+| `--dry-run` | print what would be brought in, and why, then exit |
 
 **A uid nothing else on the host is using is still yours to get right.** The
 jailer refuses one held by a live process, because a jailed process sharing a
