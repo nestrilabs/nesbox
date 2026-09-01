@@ -255,7 +255,10 @@ mod tests {
         w.try_map(size).unwrap(); // the duplicate the caller must prevent
         w.release(size); // one unmap, because there is one shmem_offset
 
-        assert_eq!(w.used, size, "8 MiB is still held by a mapping that is gone");
+        assert_eq!(
+            w.used, size,
+            "8 MiB is still held by a mapping that is gone"
+        );
         assert_eq!(w.mappings, 1);
 
         // And it is cumulative, so a loop closes the window entirely.
