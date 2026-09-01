@@ -101,11 +101,12 @@ by the VMM itself.
   `tools/jailer` has none — it is `chroot` + bind-mount + uid/gid drop +
   `execve`, and nothing else.
 
-Its **uid/gid dropping is worth taking**, and `tools/jailer` now does it. A box
-can be launched under the jailer by hand — the README's *Running it under the
-jailer* shows the whole command line. What is still missing is the automation
-around it: nothing allocates a uid per guest or builds that command line, so
-it is not yet on any box's default launch path.
+Its **uid/gid dropping is worth taking**, and `tools/jailer` now does it.
+`neslet` allocates the uid — one per box, out of a range the operator states,
+held for the life of the box — and runs the jailer for every box when it is
+started with `--jail-root`. The README's *Running it under the jailer* shows
+the same command line for driving one by hand. What is left is that it is
+opt-in: a box started by running nesbox directly is not jailed at all.
 
 No dependency was added either. The runtime install is `prctl(PR_SET_NO_NEW_PRIVS)`
 plus one `seccomp` syscall against a flat array of 8-byte instructions — the whole
@@ -207,15 +208,18 @@ from each other by anything in this file.
 
 Three things fix it, and none of them is a syscall filter:
 
-- **A uid per guest.** `tools/jailer` does the drop — nesbox cannot do this to
-  itself, an unprivileged process cannot change its own uid — but nothing yet
-  *allocates* the uid. The jailer refuses one already held by a live host
-  process, which catches a colliding pool and nothing more; a real allocator
-  remains whatever launches the box's job.
+- **A uid per guest.** *Implemented*, in two halves: `tools/jailer` does the
+  drop — nesbox cannot do this to itself, an unprivileged process cannot
+  change its own uid — and `neslet` allocates the uid, since only the process
+  that owns the host's state knows what it has promised to boxes that are not
+  running yet. The jailer still refuses a uid a live host process holds, as a
+  guard against a colliding pool rather than as the allocator.
 - **A mount namespace**, so the paths a guest's VMM can name are the ones it
-  was given. `tools/jailer` unshares one and bind-mounts in what a box needs
-  before chrooting. Running a box under it is a command line someone has to
-  write today, not something that happens by default.
+  was given. *Implemented*: `tools/jailer` unshares one and bind-mounts in
+  what a box needs before chrooting into a read-only image.
+
+Both are opt-in rather than automatic: `neslet` jails boxes when it is given
+`--jail-root`, and a box started by running nesbox directly is not jailed.
 - **A network namespace** with no route out — *this one is implemented*, as
   `unshare-network` above, and off by default.
 

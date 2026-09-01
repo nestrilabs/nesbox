@@ -165,13 +165,15 @@ box cannot leave anything behind for the next one to load.
 | `--scratch-dir <path>` | where the overlay's writable layer goes. Default `/run/nesbox-jailer` |
 | `--dry-run` | print what would be brought in, and why, then exit |
 
-**A uid nothing else on the host is using is still yours to get right.** The
-jailer refuses one held by a live process, because a jailed process sharing a
-uid with a host process can read that process's `/proc/<pid>/root` and reach
-straight back out of the jail — but that is a guard against a colliding uid
-pool, not a substitute for allocating uids properly. `neslet` is what should
-allocate one per box and run this command; it does not exist yet, which is
-the only reason this is a command you type. See
+**A uid nothing else on the host is using is yours to get right when you run
+this by hand.** The jailer refuses one held by a live process, because a
+jailed process sharing a uid with a host process can read that process's
+`/proc/<pid>/root` and reach straight back out of the jail — but that is a
+guard against a colliding uid pool, not an allocator.
+
+`neslet` is the allocator. Started with `--jail-root`, it hands each box a uid
+out of a stated range, keeps it for the life of the box, and builds this
+command line itself — so typing it is for driving a box by hand. See
 [SECURITY.md](docs/SECURITY.md) for what the jail does and does not bound.
 
 ---
@@ -190,14 +192,14 @@ works today, verified by running it:
 
 What is missing is as important:
 
-- **A jailer exists (`tools/jailer`) and can be run by hand, but nothing runs
-  it for you.** It chroots into a materialized jail image, bind-mounts in the
-  paths a box needs, and drops from root to a per-guest uid before exec'ing
-  nesbox — see [Running it under the jailer](#running-it-under-the-jailer).
-  What is missing is the automation: nothing allocates a uid per guest or
-  builds that command line, so a box started the ordinary way still runs as
-  whoever launched nesbox. Boxes sharing a user account are separated by the
-  VM boundary and little else — see [SECURITY.md](docs/SECURITY.md).
+- **The jailer is not on by default.** `tools/jailer` chroots into a
+  materialized jail image, bind-mounts in the paths a box needs, and drops
+  from root to a per-guest uid before exec'ing nesbox — see [Running it under
+  the jailer](#running-it-under-the-jailer). `neslet` allocates the uid and
+  runs it for every box when started with `--jail-root`, but a box launched
+  the ordinary way, by running nesbox directly, still runs as whoever
+  launched it and is separated from its neighbours by the VM boundary and
+  little else — see [SECURITY.md](docs/SECURITY.md).
 - **No management API.** Configuration is a JSON file and the process is the
   interface. A read-only metrics socket exists ([STATS.md](docs/STATS.md)); there
   is no way to *control* a running box over it.
@@ -230,13 +232,6 @@ scheduler.
 Roughly in priority order:
 
 
-- **Wiring the jailer in.** `tools/jailer` already does the chroot,
-  bind-mount, uid/gid drop and exec, and a box can be launched under it by
-  hand today. What is missing is `neslet` allocating a uid per guest and
-  building that command line, so it happens for every box rather than when
-  someone remembers. seccomp bounds what a compromised device model can
-  *call*; this bounds what it can *reach*, which is the larger gap. See
-  [SECURITY.md](docs/SECURITY.md).
 - **A management API** — the stats socket already reports GPU health and VRAM
   usage; lifecycle control over a socket is what is still missing.
 - **Shader cache mounting** — a persistent host directory for virglrenderer, to
