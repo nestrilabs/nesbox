@@ -63,21 +63,31 @@ by the VMM itself.
   a property of the system. It was a property of whoever wrote the unit file, and
   nothing checked.
 - **`chroot` fights the requirements** *if the jail is built to exclude the
-  host.* `tools/jailer` takes the opposite approach: bind-mount in exactly the
-  DRM render node, `/dev/kvm`, any vhost device nodes, `/sys`, `/proc` and the
+  host.* `tools/jailer` takes the opposite approach: bind-mount in the DRM
+  render node, `/dev/kvm`, any vhost device nodes, `/sys`, `/proc` and the
   metrics socket path a box needs, at the same path inside the jail, then
   chroot. Nothing is discovered or guessed — every path is named on the
-  jailer's own command line by whatever launches it. virtiofs source
-  directories stay out of scope: virtiofsd already runs unsandboxed (below),
-  so it is never inside anything the jailer is responsible for.
+  jailer's own command line by whatever launches it.
+
+  That list is not only hardware, and pretending it was would have produced a
+  jailed nesbox that cannot find its own kernel. nesbox opens its config file,
+  `kernel_image_path`, every `drives[].path_on_host` and `/dev/net/tun` after
+  the exec, from inside the jail, so those come in through `--bind` — the same
+  named-by-the-caller rule, applied to per-box paths the jailer cannot know.
+  virtiofs source directories are the one case the original objection got
+  right for a different reason: virtiofsd runs unsandboxed as a separate
+  process (below), so it is not inside anything the jailer is responsible
+  for — but nesbox spawns it, so its binary and each source directory still
+  have to be `--bind`ed for a box that uses one.
 - It assumes Firecracker's API-socket contract, which is not ours.
   `tools/jailer` has none — it is `chroot` + bind-mount + uid/gid drop +
   `execve`, and nothing else.
 
-Its **uid/gid dropping is worth taking**, and `tools/jailer` now does it. What
-is still missing is everything around it: nothing today allocates a uid per
-guest or calls the jailer before nesbox starts. It exists as a binary with its
-own tests, not yet as part of any box's actual launch path.
+Its **uid/gid dropping is worth taking**, and `tools/jailer` now does it. A box
+can be launched under the jailer by hand — the README's *Running it under the
+jailer* shows the whole command line. What is still missing is the automation
+around it: nothing allocates a uid per guest or builds that command line, so
+it is not yet on any box's default launch path.
 
 No dependency was added either. The runtime install is `prctl(PR_SET_NO_NEW_PRIVS)`
 plus one `seccomp` syscall against a flat array of 8-byte instructions — the whole
@@ -181,11 +191,13 @@ Three things fix it, and none of them is a syscall filter:
 
 - **A uid per guest.** `tools/jailer` does the drop — nesbox cannot do this to
   itself, an unprivileged process cannot change its own uid — but nothing yet
-  allocates a uid per guest or calls the jailer before nesbox starts. That
+  *allocates* the uid. The jailer refuses one already held by a live host
+  process, which catches a colliding pool and nothing more; a real allocator
   remains whatever launches the box's job.
 - **A mount namespace**, so the paths a guest's VMM can name are the ones it
-  was given. `tools/jailer` unshares one and bind-mounts in exactly what a box
-  needs before chrooting; again, nothing yet calls it.
+  was given. `tools/jailer` unshares one and bind-mounts in what a box needs
+  before chrooting. Running a box under it is a command line someone has to
+  write today, not something that happens by default.
 - **A network namespace** with no route out — *this one is implemented*, as
   `unshare-network` above, and off by default.
 

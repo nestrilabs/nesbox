@@ -26,6 +26,14 @@
 //! is needed. Every path this binary brings in is named on its own command
 //! line by whatever launches it -- nothing is discovered or guessed here.
 //!
+//! That list is longer than the hardware, and `--bind` is why it exists.
+//! nesbox opens its own config file, `kernel_image_path`, every
+//! `drives[].path_on_host` and `/dev/net/tun` *after* the exec, from inside
+//! the jail, so a jailer that brought in only devices and a metrics socket
+//! would produce a nesbox that cannot find its own kernel. Those paths are
+//! per-box and known only to the caller, which is why they are an option
+//! rather than a list in here.
+//!
 //! virtiofs source directories stay out of scope: virtiofsd already runs
 //! unsandboxed, spawned by nesbox itself with `--sandbox none`
 //! (`vmm/src/virtiofsd.rs`), and never runs inside anything this binary is
@@ -84,6 +92,12 @@ Options:
   --kvm <path>            default: /dev/kvm
   --vhost <path>          a vhost device node in use; repeatable
   --metrics-dir <path>    directory the metrics socket will be created in
+  --bind <path>           any other file or directory the target process must
+                          reach: its config file, the kernel image, a disk
+                          image, /dev/net/tun, virtiofsd's binary and source
+                          directories. Repeatable. Bound at the same path
+                          inside the jail, and non-recursively -- a submount
+                          *underneath* one of these does not come with it.
 
 /proc and /sys are always bound in, read-write, exactly as they are on the
 host -- see the module doc comment for why, and for what that does and does
@@ -98,6 +112,7 @@ struct Args {
     kvm: PathBuf,
     vhost: Vec<PathBuf>,
     metrics_dir: Option<PathBuf>,
+    bind: Vec<PathBuf>,
     command: Vec<String>,
 }
 
@@ -109,6 +124,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut kvm = PathBuf::from("/dev/kvm");
     let mut vhost = Vec::new();
     let mut metrics_dir = None;
+    let mut bind = Vec::new();
 
     fn val(argv: &[String], i: usize) -> Result<&str, String> {
         argv.get(i + 1)
@@ -155,7 +171,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 metrics_dir = Some(PathBuf::from(val(argv, i)?));
                 i += 2
             }
-            "-h" | "--help" => return Err(USAGE.to_string()),
+            "--bind" => {
+                bind.push(PathBuf::from(val(argv, i)?));
+                i += 2
+            }
             "--" => {
                 i += 1;
                 break;
@@ -173,6 +192,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         kvm,
         vhost,
         metrics_dir,
+        bind,
         command: {
             if command.is_empty() {
                 return Err("no command given -- pass one after `--`".to_string());
@@ -473,6 +493,17 @@ fn run(args: Args) -> Result<()> {
     if let Some(metrics_dir) = &args.metrics_dir {
         bind_mount(&args.jail_root, metrics_dir, false)?;
     }
+    // Last, and in the order given: everything the target process opens that
+    // is neither hardware nor a metrics path. nesbox needs several -- its own
+    // config file, `kernel_image_path`, every `drives[].path_on_host`,
+    // /dev/net/tun for a tap, and virtiofsd's binary plus the directories it
+    // serves -- none of which the options above describe, and all of which it
+    // opens *after* the exec, from inside the jail. Naming them is still the
+    // caller's job; this only refuses to pretend the hardware paths are the
+    // whole list. See `docs/SECURITY.md`.
+    for path in &args.bind {
+        bind_mount(&args.jail_root, path, false)?;
+    }
 
     log::info!(
         "jailer: chrooting into {}, dropping to uid={} gid={}, exec'ing {:?}",
@@ -491,6 +522,14 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Before `parse`, not inside it: asking for help is not a usage error, so
+    // it prints once and exits 0. Routed through the error path it printed
+    // USAGE twice -- once as the "message", once as the usage appended to it
+    // -- and exited 2.
+    if argv.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return;
+    }
     let args = match parse(&argv) {
         Ok(a) => a,
         Err(msg) => {
@@ -616,6 +655,59 @@ mod tests {
         .map(String::from)
         .collect();
         assert!(parse(&argv).unwrap_err().contains("no command"));
+    }
+
+    #[test]
+    fn bind_paths_repeat_and_keep_their_order() {
+        let argv: Vec<String> = [
+            "--jail-root",
+            "/jail",
+            "--uid",
+            "1000",
+            "--gid",
+            "1000",
+            // The shape a real box needs: a config file, the kernel, a disk
+            // image and the tap device -- none of them hardware the named
+            // options describe.
+            "--bind",
+            "/var/lib/nesbox/boxes/1/box.json",
+            "--bind",
+            "/var/lib/nesbox/vmlinux",
+            "--bind",
+            "/var/lib/nesbox/boxes/1/rootfs.ext4",
+            "--bind",
+            "/dev/net/tun",
+            "--",
+            "/usr/bin/nesbox",
+            "/var/lib/nesbox/boxes/1/box.json",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let a = parse(&argv).unwrap();
+        assert_eq!(
+            a.bind,
+            vec![
+                PathBuf::from("/var/lib/nesbox/boxes/1/box.json"),
+                PathBuf::from("/var/lib/nesbox/vmlinux"),
+                PathBuf::from("/var/lib/nesbox/boxes/1/rootfs.ext4"),
+                PathBuf::from("/dev/net/tun"),
+            ]
+        );
+        // Order matters when one path nests inside another, so it is kept
+        // rather than sorted or deduplicated.
+        assert_eq!(a.bind[0], PathBuf::from("/var/lib/nesbox/boxes/1/box.json"));
+    }
+
+    #[test]
+    fn no_bind_paths_is_valid() {
+        let argv: Vec<String> = [
+            "--jail-root", "/jail", "--uid", "1000", "--gid", "1000", "--", "/bin/true",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(parse(&argv).unwrap().bind.is_empty());
     }
 
     #[test]

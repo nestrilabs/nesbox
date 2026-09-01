@@ -113,6 +113,53 @@ sudo ./scripts/nestri-net-setup.sh
 
 See `examples/vm.json` for the configuration format.
 
+### Running it under the jailer
+
+Run that way and the box is isolated by the KVM boundary and a seccomp
+filter, and nothing else. `tools/jailer` is the other way in: it chroots into
+a jail image, drops to a uid of its own, and only then execs nesbox. It is
+the thing you run; nesbox is what it hands off to.
+
+```bash
+cd build && make materialize    # output/jail/ + output/jailer
+```
+
+```bash
+sudo ./build/output/jailer \
+    --jail-root  /path/to/build/output/jail \
+    --uid 60000 --gid 60000 \
+    --render-node /dev/dri/renderD128 \
+    --vhost /dev/vhost-vsock \
+    --bind /dev/net/tun \
+    --bind /path/to/boxes/1 \
+    --metrics-dir /run/nesbox/1 \
+    -- /usr/bin/nesbox /path/to/boxes/1/box.json
+```
+
+`/usr/bin/nesbox` is the copy *inside the jail image*, not the one in
+`target/release`. Everything else on that line is a host path, bound in at
+the same path inside the jail — which is why the config file, the kernel
+image and the disk images have to be reachable at the path the config names.
+Putting a box's config, kernel and rootfs in one directory and binding that
+directory is the least fiddly way to do it; `--bind` is repeatable if they
+are scattered.
+
+Two things are still yours to get right, and neither is checked for you:
+
+- **A uid nothing else on the host is using.** The jailer refuses a uid held
+  by a live process, because a jailed process sharing a uid with a host
+  process can read that process's `/proc/<pid>/root` and reach straight back
+  out of the jail. That check is a guard against a colliding uid pool, not a
+  substitute for allocating uids properly.
+- **A tap device, and the shared directories if you use any.** Bind in
+  `/dev/net/tun` for networking, and for `shared-directories` both
+  virtiofsd's binary and each `path-on-host` — nesbox spawns virtiofsd
+  itself, and an unreachable binary or source directory fails at start.
+
+Nothing automates any of this yet: `neslet` is what should allocate the uid
+and build this command line per box, and it does not exist. See
+[SECURITY.md](docs/SECURITY.md) for what the jail does and does not bound.
+
 ---
 
 ## Status
@@ -129,12 +176,14 @@ works today, verified by running it:
 
 What is missing is as important:
 
-- **A jailer exists (`tools/jailer`) but nothing calls it yet.** It chroots
-  into a materialized jail image, bind-mounts in exactly the hardware paths a
-  box needs, and drops from root to a per-guest uid before exec'ing nesbox —
-  but nothing today allocates that uid or invokes it, so every box still runs
-  as whoever launched nesbox directly. Boxes sharing a user account are
-  separated by the VM boundary and little else — see [SECURITY.md](docs/SECURITY.md).
+- **A jailer exists (`tools/jailer`) and can be run by hand, but nothing runs
+  it for you.** It chroots into a materialized jail image, bind-mounts in the
+  paths a box needs, and drops from root to a per-guest uid before exec'ing
+  nesbox — see [Running it under the jailer](#running-it-under-the-jailer).
+  What is missing is the automation: nothing allocates a uid per guest or
+  builds that command line, so a box started the ordinary way still runs as
+  whoever launched nesbox. Boxes sharing a user account are separated by the
+  VM boundary and little else — see [SECURITY.md](docs/SECURITY.md).
 - **No management API.** Configuration is a JSON file and the process is the
   interface. A read-only metrics socket exists ([STATS.md](docs/STATS.md)); there
   is no way to *control* a running box over it.
@@ -167,9 +216,11 @@ scheduler.
 Roughly in priority order:
 
 
-- **Wiring the jailer in.** `tools/jailer` already does the chroot, bind-mount,
-  uid/gid drop and exec; nothing yet allocates a uid per guest or calls it
-  before nesbox starts. seccomp bounds what a compromised device model can
+- **Wiring the jailer in.** `tools/jailer` already does the chroot,
+  bind-mount, uid/gid drop and exec, and a box can be launched under it by
+  hand today. What is missing is `neslet` allocating a uid per guest and
+  building that command line, so it happens for every box rather than when
+  someone remembers. seccomp bounds what a compromised device model can
   *call*; this bounds what it can *reach*, which is the larger gap. See
   [SECURITY.md](docs/SECURITY.md).
 - **A management API** — the stats socket already reports GPU health and VRAM
