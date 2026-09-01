@@ -18,16 +18,21 @@ OUT="${2:?usage: materialize.sh <image-tag> <output-dir>}"
 CONTAINER_RT="$(command -v docker || command -v podman || true)"
 [[ -n "$CONTAINER_RT" ]] || { echo "Neither docker nor podman found in PATH" >&2; exit 1; }
 
-# Extract into a sibling temp directory and swap it in only once extraction
-# has actually succeeded, rather than wiping $OUT up front: a create/export/
-# tar failure partway through used to both lose the last good jail and leave
-# a half-populated one in its place. cid is cleaned up on every exit path
-# via the trap, not just the one after a successful `rm -f`.
+# Extract into a sibling temp directory, then swap it into place with two
+# renames rather than `rm -rf "$OUT"; mv "$TMP_OUT" "$OUT"`: that still had a
+# real gap where $OUT was already gone before the replacement landed, so an
+# interrupted or failed `mv` left neither the old jail nor the new one.
+# `mv` between two directories on the same filesystem is a `rename()` — near-
+# instant, not a copy — so `$OUT` -> `$OUT.old` -> (new) `$OUT` leaves the
+# window where something valid isn't at `$OUT` as short as two syscalls
+# rather than as long as an rm -rf of a multi-hundred-MB tree. cid and
+# OLD_OUT are both cleaned up on every exit path via the trap.
 TMP_OUT="${OUT}.tmp.$$"
+OLD_OUT="${OUT}.old.$$"
 cid=""
 cleanup() {
     [[ -n "$cid" ]] && "$CONTAINER_RT" rm -f "$cid" >/dev/null 2>&1
-    rm -rf "$TMP_OUT"
+    rm -rf "$TMP_OUT" "$OLD_OUT"
 }
 trap cleanup EXIT
 
@@ -40,7 +45,11 @@ cid="$("$CONTAINER_RT" create "$IMAGE")"
 "$CONTAINER_RT" rm -f "$cid" >/dev/null
 cid=""
 
-rm -rf "$OUT"
+# From here, $OUT is never missing: it's the old tree until the first mv
+# lands, then the new one from the moment the second mv lands. A failure
+# between the two renames still leaves the old jail recoverable at
+# $OLD_OUT rather than gone.
+[[ -e "$OUT" ]] && mv "$OUT" "$OLD_OUT"
 mv "$TMP_OUT" "$OUT"
 
 echo "Wrote ${OUT}"
