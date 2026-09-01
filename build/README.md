@@ -16,7 +16,7 @@ build/
 ```
 
 ```sh
-make build          # docker build -t nesbox-jail:latest
+make build          # docker build -t ghcr.io/nestrilabs/nesbox/jail:latest
 make materialize     # + unpack into output/jail/
 ```
 

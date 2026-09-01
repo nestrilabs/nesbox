@@ -9,8 +9,14 @@ endif
 # Same reason as nestri/build/Makefile: the Dockerfile COPYs vmm/,
 # virtio-devices/, pci/, tools/ and patches/, so the build context has to be
 # the repo root, not this directory.
+# ghcr.io/nestrilabs/nesbox/jail — a namespaced package name and a
+# fully-qualified one, same reasoning as nestri/build/Makefile's
+# IMAGE_NAME: matches how every other image this org publishes is named,
+# and resolves correctly for anyone pulling instead of building locally.
+# "jail", not "jailer": this builds the tree a jailer chroots INTO, not the
+# jailer binary itself — that doesn't exist yet.
 CONTEXT       := ..
-IMAGE_NAME    := nesbox-jail
+IMAGE_NAME    := ghcr.io/nestrilabs/nesbox/jail
 OUTPUT_DIR    := output
 FORCE_REBUILD ?=
 # Floating by default — see the NESTRI_BASE_IMAGE comment in the Dockerfile
@@ -41,7 +47,7 @@ clean:
 
 help:
 	@echo "Usage:"
-	@echo "  make build              Build the nesbox-jail:latest container image"
+	@echo "  make build              Build the $(IMAGE_NAME):latest container image"
 	@echo "  make materialize        Build + unpack into output/jail/ (local testing only)"
 	@echo "  make clean              Remove output/"
 	@echo "  make FORCE_REBUILD=1 ...  Rebuild from scratch, no layer cache"

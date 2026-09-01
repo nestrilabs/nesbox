@@ -10,7 +10,7 @@
 #  patched Mesa and never quietly drift onto two different ones.
 #
 #  Build from the repo root:
-#    docker build -f build/Dockerfile -t nesbox-jail:latest .
+#    docker build -f build/Dockerfile -t ghcr.io/nestrilabs/nesbox/jail:latest .
 #  (`make build` in this directory does exactly that.) Needs
 #  ghcr.io/nestrilabs/nestri/base:latest to already exist, locally or pullable — see
 #  nestri/build/ in the nestri repo.
@@ -141,6 +141,10 @@ FROM ${NESTRI_BASE_IMAGE} AS mesa-source
 #  jail — the tree the jailer actually chroots into
 # ───────────────────────────────────────────────────────────
 FROM docker.io/archlinux:base AS jail
+
+# What GHCR actually reads to connect a pushed image back to its repo — not
+# a setting to toggle after the fact, a label the image has to carry.
+LABEL org.opencontainers.image.source="https://github.com/nestrilabs/nesbox"
 
 # Runtime closure: what nesbox and virglrenderer actually link against once
 # running, distinct from builder's much larger build-time list. Same reason
