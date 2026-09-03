@@ -171,9 +171,9 @@ jailed process sharing a uid with a host process can read that process's
 `/proc/<pid>/root` and reach straight back out of the jail — but that is a
 guard against a colliding uid pool, not an allocator.
 
-`neslet` is the allocator. Started with `--jail-root`, it hands each box a uid
-out of a stated range, keeps it for the life of the box, and builds this
-command line itself — so typing it is for driving a box by hand. See
+**The supervising agent is the allocator.** With jailing enabled it hands each
+box a uid out of a stated range, keeps it for the life of the box, and builds
+this command line itself — so typing it is for driving a box by hand. See
 [SECURITY.md](docs/SECURITY.md) for what the jail does and does not bound.
 
 ---
@@ -195,9 +195,9 @@ What is missing is as important:
 - **The jailer is not on by default.** `tools/jailer` chroots into a
   materialized jail image, bind-mounts in the paths a box needs, and drops
   from root to a per-guest uid before exec'ing nesbox — see [Running it under
-  the jailer](#running-it-under-the-jailer). `neslet` allocates the uid and
-  runs it for every box when started with `--jail-root`, but a box launched
-  the ordinary way, by running nesbox directly, still runs as whoever
+  the jailer](#running-it-under-the-jailer). A supervising agent allocates the
+  uid and runs the jailer for every box when jailing is enabled, but a box
+  launched the ordinary way, by running nesbox directly, still runs as whoever
   launched it and is separated from its neighbours by the VM boundary and
   little else — see [SECURITY.md](docs/SECURITY.md).
 - **No management API.** Configuration is a JSON file and the process is the

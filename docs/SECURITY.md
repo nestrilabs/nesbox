@@ -102,9 +102,9 @@ by the VMM itself.
   `execve`, and nothing else.
 
 Its **uid/gid dropping is worth taking**, and `tools/jailer` now does it.
-`neslet` allocates the uid — one per box, out of a range the operator states,
-held for the life of the box — and runs the jailer for every box when it is
-started with `--jail-root`. The README's *Running it under the jailer* shows
+A supervising agent allocates the uid — one per box, out of a range the
+operator states, held for the life of the box — and runs the jailer for every
+box when jailing is enabled. The README's *Running it under the jailer* shows
 the same command line for driving one by hand. What is left is that it is
 opt-in: a box started by running nesbox directly is not jailed at all.
 
@@ -210,16 +210,16 @@ Three things fix it, and none of them is a syscall filter:
 
 - **A uid per guest.** *Implemented*, in two halves: `tools/jailer` does the
   drop — nesbox cannot do this to itself, an unprivileged process cannot
-  change its own uid — and `neslet` allocates the uid, since only the process
-  that owns the host's state knows what it has promised to boxes that are not
-  running yet. The jailer still refuses a uid a live host process holds, as a
+  change its own uid — and the supervising agent allocates the uid, since only
+  the process that owns the host's state knows what it has promised to boxes
+  that are not running yet. The jailer still refuses a uid a live host process holds, as a
   guard against a colliding pool rather than as the allocator.
 - **A mount namespace**, so the paths a guest's VMM can name are the ones it
   was given. *Implemented*: `tools/jailer` unshares one and bind-mounts in
   what a box needs before chrooting into a read-only image.
 
-Both are opt-in rather than automatic: `neslet` jails boxes when it is given
-`--jail-root`, and a box started by running nesbox directly is not jailed.
+Both are opt-in rather than automatic: an agent jails boxes when it is
+configured to, and a box started by running nesbox directly is not jailed.
 - **A network namespace** with no route out — *this one is implemented*, as
   `unshare-network` above, and off by default.
 
