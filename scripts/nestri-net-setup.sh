@@ -430,33 +430,45 @@ else
     # `masquerade` lives in postrouting/nat: it rewrites the source address of a
     # packet that is already being forwarded. It does not decide *whether* to
     # forward one. That is the filter/forward chain, and on a host whose forward
-    # policy is `drop` — which Docker, firewalld and ufw all set, and Docker
-    # does so merely by being installed — a guest's packets are translated and
-    # then discarded.
+    # policy is `drop` -- which Docker sets merely by being installed -- a
+    # guest's packets are translated and then discarded.
     #
     # What that looks like from inside a guest is not "no network". The address
     # is configured, the route is there, the gateway answers, and every lookup
-    # simply times out. Measured 2026-09-12 on a host with Docker installed:
-    # the box came up, resolved nothing, and reported the far end as
-    # unreachable.
+    # times out, so the far end looks down. Measured 2026-09-12 on a host with
+    # Docker installed.
     #
-    # In the `nesbox` table rather than in `filter`, deliberately. `nft` itself
-    # warns that `filter` is managed by iptables-nft wherever iptables is in
-    # use, and a second writer to somebody else's table is how a firewall ends
-    # up in a state its owner cannot explain. A separate table with its own
-    # hook composes: both chains run, either can accept.
-    if nft list table ip nesbox 2>/dev/null | grep -q 'hook forward'; then
-        say "  forward rules for ${BRIDGE} already present"
-    elif confirm "Allow forwarding to and from ${BRIDGE}?" y; then
-        run nft add table ip nesbox
-        run nft add chain ip nesbox forward \
-            '{ type filter hook forward priority filter; policy accept; }'
+    # **A separate table cannot fix this, and trying was the first mistake.**
+    # Every base chain on a hook is traversed: `accept` ends the chain it is in
+    # and the packet carries on to the next one, while `drop` is final. So a
+    # `nesbox` forward chain that accepts does not stop the `filter` chain
+    # running afterwards and dropping on its policy. The accept has to happen
+    # inside the chain that holds the policy, or through whatever entry point
+    # that chain's owner provides.
+    #
+    # Docker provides one: `DOCKER-USER` is jumped to from `FORWARD` before
+    # Docker's own rules, it is documented as the place for exactly this, and
+    # Docker does not rewrite it. That is why this reaches for iptables here
+    # rather than nft -- the chain belongs to iptables-nft, and `nft` says so
+    # itself every time it prints the ruleset.
+    if iptables -S DOCKER-USER >/dev/null 2>&1; then
+        FORWARD_CHAIN=DOCKER-USER
+    else
+        FORWARD_CHAIN=FORWARD
+    fi
+
+    if iptables -S "$FORWARD_CHAIN" 2>/dev/null | grep -q -- "-i ${BRIDGE} -j ACCEPT"; then
+        say "  forwarding for ${BRIDGE} already allowed in ${FORWARD_CHAIN}"
+    elif [[ "$(iptables -S FORWARD 2>/dev/null | head -1)" == "-P FORWARD ACCEPT" ]] &&
+         [[ "$FORWARD_CHAIN" == FORWARD ]]; then
+        say "  forward policy is already accept; nothing to add"
+    elif confirm "Allow forwarding to and from ${BRIDGE} (in ${FORWARD_CHAIN})?" y; then
         # Out: anything the guests send. Back: only what belongs to a
         # conversation a guest started, so the bridge is not a way in.
-        run nft add rule ip nesbox forward iifname "$BRIDGE" accept
-        run nft add rule ip nesbox forward oifname "$BRIDGE" \
-            ct state related,established accept
-        warn "not persistent — nft rules are lost on reboot unless saved"
+        run iptables -I "$FORWARD_CHAIN" -o "$BRIDGE" \
+            -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+        run iptables -I "$FORWARD_CHAIN" -i "$BRIDGE" -j ACCEPT
+        warn "not persistent -- iptables rules are lost on reboot unless saved"
     fi
 fi
 
