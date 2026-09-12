@@ -423,6 +423,41 @@ else
         run nft add rule ip nesbox postrouting ip saddr "$SUBNET" oifname != "$BRIDGE" masquerade
         warn "not persistent — nft rules are lost on reboot unless saved"
     fi
+
+    # Masquerade alone is not a working network, and the way it fails is the
+    # reason this block exists.
+    #
+    # `masquerade` lives in postrouting/nat: it rewrites the source address of a
+    # packet that is already being forwarded. It does not decide *whether* to
+    # forward one. That is the filter/forward chain, and on a host whose forward
+    # policy is `drop` — which Docker, firewalld and ufw all set, and Docker
+    # does so merely by being installed — a guest's packets are translated and
+    # then discarded.
+    #
+    # What that looks like from inside a guest is not "no network". The address
+    # is configured, the route is there, the gateway answers, and every lookup
+    # simply times out. Measured 2026-09-12 on a host with Docker installed:
+    # the box came up, resolved nothing, and reported the far end as
+    # unreachable.
+    #
+    # In the `nesbox` table rather than in `filter`, deliberately. `nft` itself
+    # warns that `filter` is managed by iptables-nft wherever iptables is in
+    # use, and a second writer to somebody else's table is how a firewall ends
+    # up in a state its owner cannot explain. A separate table with its own
+    # hook composes: both chains run, either can accept.
+    if nft list table ip nesbox 2>/dev/null | grep -q 'hook forward'; then
+        say "  forward rules for ${BRIDGE} already present"
+    elif confirm "Allow forwarding to and from ${BRIDGE}?" y; then
+        run nft add table ip nesbox
+        run nft add chain ip nesbox forward \
+            '{ type filter hook forward priority filter; policy accept; }'
+        # Out: anything the guests send. Back: only what belongs to a
+        # conversation a guest started, so the bridge is not a way in.
+        run nft add rule ip nesbox forward iifname "$BRIDGE" accept
+        run nft add rule ip nesbox forward oifname "$BRIDGE" \
+            ct state related,established accept
+        warn "not persistent — nft rules are lost on reboot unless saved"
+    fi
 fi
 
 # ── Taps ─────────────────────────────────────────────────
@@ -517,7 +552,13 @@ elif [[ "$MODE" == 1 ]]; then
     say "a hand-written config needs it on the kernel command line:"
     say "  ${DIM}nestri.ip=<addr>/<prefix> nestri.gw=<gateway>${RESET}"
 else
-    say "  host:    ${HOST_ADDR} on ${BRIDGE}, masquerading"
+    say "  host:    ${HOST_ADDR} on ${BRIDGE}, masquerading and forwarding"
+    say ""
+    say "Give each guest an address on that subnet, and a resolver -- a guest"
+    say "with a route and no resolver reports every lookup as the far end being"
+    say "down. An orchestrator would do this; a hand-written config needs it on"
+    say "the kernel command line:"
+    say "  ${DIM}nestri.ip=<addr>/<prefix> nestri.gw=${HOST_ADDR%%/*} nestri.dns=<resolver>${RESET}"
 fi
 say ""
 say "nesbox needs no capability now: name a tap in its config and it opens it."
