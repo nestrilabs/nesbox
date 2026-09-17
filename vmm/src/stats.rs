@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use virtio_devices::{GpuDevice, GpuSnapshot};
+use virtio_devices::{CommandKindCounts, GPU_COMMAND_NAMES, GpuDevice, GpuSnapshot, PhaseSnapshot};
 
 /// Everything the socket can report. Held by the serving thread.
 pub struct StatsSource {
@@ -61,6 +61,45 @@ impl StatsSource {
     }
 }
 
+/// A phase as `{"ns":…,"count":…}`.
+///
+/// Both halves, never a mean: a mean computed here would be a mean since boot.
+/// Two snapshots and the difference of each give the mean over the window the
+/// reader actually cares about, which is the same contract `gfx_ns` has.
+fn phase_json(p: &PhaseSnapshot) -> String {
+    format!("{{\"ns\":{},\"count\":{}}}", p.ns, p.count)
+}
+
+/// The per-opcode counts as a JSON array, indexed by opcode number.
+///
+/// An array and not an object with names: only opcode 2 is identified in this
+/// tree, and labelling the rest would publish a guess. The index *is* the
+/// opcode, which is the fact we actually have.
+fn ccmd_json(counts: &[u64]) -> String {
+    let body: Vec<String> = counts.iter().map(|c| c.to_string()).collect();
+    format!("[{}]", body.join(","))
+}
+
+/// Per-command-kind phases, as an object keyed by the kind's name.
+///
+/// Named rather than positional, unlike `ccmd` and `info_query`: those index
+/// protocols whose numbering is the fact, while this indexes an enum that is
+/// ours and whose order carries no meaning outside this binary. A reader
+/// should not have to hold that order in their head.
+///
+/// Kinds that never happened are left out. A zero row is noise on a surface
+/// with twenty-six of them, and absent already means zero here.
+fn kinds_json(kinds: &CommandKindCounts) -> String {
+    let body: Vec<String> = kinds
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.count != 0)
+        .map(|(i, p)| format!("\"{}\":{}", GPU_COMMAND_NAMES[i], phase_json(p)))
+        .collect();
+    format!("{{{}}}", body.join(","))
+}
+
 fn gpu_json(s: &GpuSnapshot) -> String {
     let occupancy = match s.occupancy {
         Some(o) => format!(
@@ -75,7 +114,19 @@ fn gpu_json(s: &GpuSnapshot) -> String {
          \"vram_bytes\":{},\"vram_peak_bytes\":{},\"vram_limit_bytes\":{},\
          \"vram_refusals\":{},\"gtt_bytes\":{},\
          \"window_bytes\":{},\"window_peak_bytes\":{},\"window_limit_bytes\":{},\
-         \"window_mappings\":{},\"window_refusals\":{},\
+         \"window_mappings\":{},\"window_refusals\":{},\"drained\":{},\
+         \"spin\":{spin},\"sleep\":{sleep},\"drain\":{drain},\
+         \"command\":{command},\"submit\":{submit},\"observe\":{observe},\
+         \"fence_create\":{fence_create},\"fence_latency\":{fence_latency},\
+         \"complete\":{complete},\
+         \"ccmd\":{ccmd},\"ccmd_high\":{},\"ccmd_records\":{},\
+         \"ccmd_malformed\":{},\
+         \"info_query\":{info_query},\"info_high\":{},\
+         \"rutabaga_map\":{rutabaga_map},\"rutabaga_unmap\":{rutabaga_unmap},\
+         \"kvm_map\":{kvm_map},\"kvm_unmap\":{kvm_unmap},\
+         \"placed_map\":{placed_map},\"placed_withdraw\":{placed_withdraw},\
+         \"place_refused\":{},\
+         \"command_kind\":{command_kind},\
          \"occupancy\":{occupancy}}}",
         s.submits,
         s.submits_failed,
@@ -90,6 +141,30 @@ fn gpu_json(s: &GpuSnapshot) -> String {
         s.window_limit_bytes,
         s.window_mappings,
         s.window_refusals,
+        s.drained,
+        s.ccmd_high,
+        s.ccmd_records,
+        s.ccmd_malformed,
+        s.info_high,
+        s.place_refused,
+        ccmd = ccmd_json(&s.ccmd),
+        info_query = ccmd_json(&s.info_query.0),
+        rutabaga_map = phase_json(&s.rutabaga_map),
+        rutabaga_unmap = phase_json(&s.rutabaga_unmap),
+        kvm_map = phase_json(&s.kvm_map),
+        kvm_unmap = phase_json(&s.kvm_unmap),
+        placed_map = phase_json(&s.placed_map),
+        placed_withdraw = phase_json(&s.placed_withdraw),
+        command_kind = kinds_json(&s.command_kind),
+        spin = phase_json(&s.spin),
+        sleep = phase_json(&s.sleep),
+        drain = phase_json(&s.drain),
+        command = phase_json(&s.command),
+        submit = phase_json(&s.submit),
+        observe = phase_json(&s.observe),
+        fence_create = phase_json(&s.fence_create),
+        fence_latency = phase_json(&s.fence_latency),
+        complete = phase_json(&s.complete),
     )
 }
 
@@ -190,6 +265,46 @@ mod tests {
             window_limit_bytes: 22,
             window_mappings: 23,
             window_refusals: 24,
+            drained: 25,
+            spin: PhaseSnapshot { ns: 30, count: 31 },
+            sleep: PhaseSnapshot { ns: 32, count: 33 },
+            drain: PhaseSnapshot { ns: 34, count: 35 },
+            command: PhaseSnapshot { ns: 36, count: 37 },
+            submit: PhaseSnapshot { ns: 38, count: 39 },
+            observe: PhaseSnapshot { ns: 40, count: 41 },
+            fence_create: PhaseSnapshot { ns: 42, count: 43 },
+            fence_latency: PhaseSnapshot { ns: 44, count: 45 },
+            complete: PhaseSnapshot { ns: 46, count: 47 },
+            ccmd: {
+                let mut a = [0u64; 16];
+                a[2] = 48;
+                a[4] = 49;
+                a
+            },
+            ccmd_high: 50,
+            ccmd_records: 51,
+            ccmd_malformed: 52,
+            info_query: {
+                let mut a = virtio_devices::InfoCounts::default();
+                a.0[0x0e] = 53;
+                a
+            },
+            info_high: 54,
+            command_kind: {
+                let mut k = CommandKindCounts::default();
+                // cmd_submit_3d and resource_map_blob, the two the reader cares
+                // about most.
+                k.0[19] = PhaseSnapshot { ns: 55, count: 56 };
+                k.0[21] = PhaseSnapshot { ns: 57, count: 58 };
+                k
+            },
+            rutabaga_map: PhaseSnapshot { ns: 59, count: 60 },
+            rutabaga_unmap: PhaseSnapshot { ns: 61, count: 62 },
+            kvm_map: PhaseSnapshot { ns: 63, count: 64 },
+            kvm_unmap: PhaseSnapshot { ns: 65, count: 66 },
+            placed_map: PhaseSnapshot { ns: 67, count: 68 },
+            placed_withdraw: PhaseSnapshot { ns: 69, count: 70 },
+            place_refused: 71,
             occupancy: Some(virtio_devices::Occupancy {
                 gfx_ns: 9,
                 requested_vram_bytes: 10,
@@ -200,6 +315,49 @@ mod tests {
         let body = format!("{{\"schema\":1,\"uptime_ms\":1,\"gpu\":{}}}", gpu_json(&s));
         let v: serde_json::Value = serde_json::from_str(&body).expect("must be valid JSON");
         assert_eq!(v["gpu"]["occupancy"]["gfx_ns"], 9);
+        // Every phase carries both halves. A phase that lost its count would
+        // still be valid JSON and would silently stop being a mean.
+        for phase in [
+            "spin",
+            "sleep",
+            "drain",
+            "command",
+            "submit",
+            "observe",
+            "fence_create",
+            "fence_latency",
+            "complete",
+        ] {
+            assert!(
+                v["gpu"][phase]["ns"].is_number() && v["gpu"][phase]["count"].is_number(),
+                "{phase} is not a phase: {}",
+                v["gpu"][phase]
+            );
+        }
+        assert_eq!(v["gpu"]["submit"]["ns"], 38);
+        assert_eq!(v["gpu"]["submit"]["count"], 39);
+        assert_eq!(v["gpu"]["drained"], 25);
+        // The opcode array is indexed by opcode, so its position carries
+        // meaning that a reordering or a truncation would silently destroy.
+        assert_eq!(v["gpu"]["ccmd"].as_array().map(Vec::len), Some(16));
+        assert_eq!(v["gpu"]["ccmd"][2], 48);
+        assert_eq!(v["gpu"]["ccmd"][4], 49);
+        assert_eq!(v["gpu"]["ccmd_records"], 51);
+        assert_eq!(v["gpu"]["info_query"].as_array().map(Vec::len), Some(64));
+        assert_eq!(v["gpu"]["info_query"][0x0e], 53);
+        assert_eq!(v["gpu"]["info_high"], 54);
+        assert_eq!(v["gpu"]["kvm_map"]["ns"], 63);
+        assert_eq!(v["gpu"]["placed_map"]["ns"], 67);
+        assert_eq!(v["gpu"]["place_refused"], 71);
+
+        // Named, not positional: the enum's order is ours and means nothing to
+        // a reader, so the kind is carried by its name.
+        assert_eq!(v["gpu"]["command_kind"]["cmd_submit_3d"]["ns"], 55);
+        assert_eq!(v["gpu"]["command_kind"]["cmd_submit_3d"]["count"], 56);
+        assert_eq!(v["gpu"]["command_kind"]["resource_map_blob"]["count"], 58);
+        // A kind that never happened is absent rather than a zero row: with
+        // twenty-six of them the zeroes would be most of the output.
+        assert!(v["gpu"]["command_kind"]["get_edid"].is_null());
         assert_eq!(v["gpu"]["submits_failed"], 2);
         assert_eq!(v["gpu"]["gtt_bytes"], 8);
         assert_eq!(v["gpu"]["window_mappings"], 23);

@@ -11,10 +11,12 @@
 
 use std::io::Read;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
-use std::sync::mpsc::Receiver;
+use std::os::fd::AsRawFd;
+use vmm_sys_util::eventfd::EventFd;
 
 use super::metrics::GpuMetrics;
 use log::{debug, error};
@@ -35,7 +37,7 @@ use super::protocol::{
     virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
 use super::virtio_gpu::{VirtioGpu, VirtioGpuRing};
-use super::{CTL_INDEX, GpuQueues, HostMemoryMapper};
+use super::{GpuQueues, HostMemoryMapper};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -43,8 +45,15 @@ use std::path::PathBuf;
 // ---------------------------------------------------------------------------
 
 pub struct Worker {
-    /// Receives queue-index notifications from the event handler.
-    receiver: Receiver<u64>,
+    /// Rung by KVM when the guest writes the control queue's notify register,
+    /// or by `bar0_write` on a host where that registration did not take.
+    kick: Arc<EventFd>,
+    /// Set when the device is reset. Read after every wake.
+    stop: Arc<AtomicBool>,
+    /// How long to look at the ring before sleeping. Zero sleeps at once.
+    poll_us: u64,
+    /// Host CPUs this thread may run on. Empty means no affinity.
+    cpu_affinity: Vec<usize>,
     mem: GuestMemoryMmap,
     /// The control queue, shared with the fence handler inside VirtioGpu.
     queues: Arc<dyn GpuQueues>,
@@ -63,7 +72,10 @@ pub struct Worker {
 impl Worker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        receiver: Receiver<u64>,
+        kick: Arc<EventFd>,
+        stop: Arc<AtomicBool>,
+        poll_us: u64,
+        cpu_affinity: Vec<usize>,
         mem: GuestMemoryMmap,
         queues: Arc<dyn GpuQueues>,
         shm_region: VirtioShmRegion,
@@ -77,7 +89,10 @@ impl Worker {
         metrics: Arc<GpuMetrics>,
     ) -> Self {
         Worker {
-            receiver,
+            kick,
+            stop,
+            poll_us,
+            cpu_affinity,
             mem,
             queues,
             shm_region,
@@ -93,11 +108,19 @@ impl Worker {
     }
 
     /// Spawn the worker on a dedicated OS thread.
-    pub fn run(self) {
+    /// Start the worker, handing back the join handle.
+    ///
+    /// **The handle is not decoration.** The doorbell is one eventfd for the
+    /// life of the device -- it has to be, since KVM is told about it when the
+    /// device joins the bus -- so a worker from a previous activation that is
+    /// still alive would be blocked on the same fd as the new one and would
+    /// consume kicks meant for it. The reset path joins on this to make
+    /// "stopped" mean stopped.
+    pub fn run(self) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("virtio-gpu worker".into())
             .spawn(|| self.work())
-            .expect("virtio-gpu: failed to spawn worker thread");
+            .expect("virtio-gpu: failed to spawn worker thread")
     }
 
     // -----------------------------------------------------------------------
@@ -105,6 +128,10 @@ impl Worker {
     // -----------------------------------------------------------------------
 
     fn work(mut self) {
+        // Before anything else, and on this thread rather than the one that
+        // spawned it: `sched_setaffinity` with pid 0 acts on the caller.
+        self.confine();
+
         let start = std::time::Instant::now();
         let Some(mut virtio_gpu) = VirtioGpu::new(
             self.queues.clone(),
@@ -142,31 +169,153 @@ impl Worker {
         }
 
         loop {
-            // Block until the event handler signals a queue event.
-            // The sent value is the queue index (CTL_INDEX or CUR_INDEX).
-            let queue_index = match self.receiver.recv() {
-                Ok(idx) => idx as usize,
-                Err(_) => {
-                    // Sender dropped means the device is being torn down.
-                    debug!("virtio-gpu worker: channel closed, exiting");
-                    break;
-                }
-            };
-
-            if queue_index == CTL_INDEX {
-                self.process_ctl_queue(&mut virtio_gpu);
+            self.wait();
+            if self.stop.load(Ordering::Acquire) {
+                debug!("virtio-gpu worker: asked to stop, exiting");
+                break;
             }
+            self.process_ctl_queue(&mut virtio_gpu);
             // CUR queue: cursor commands are not implemented for headless operation.
         }
+    }
+
+    /// Confine this thread to the CPUs the guest's vCPUs were given.
+    ///
+    /// A warning rather than a failure, for the same reason the vCPU threads
+    /// treat it that way: placement is an optimisation, and a box that runs on
+    /// the wrong cores is better than one that does not start. A set naming
+    /// CPUs this host does not have is the usual cause and is worth seeing.
+    fn confine(&self) {
+        if self.cpu_affinity.is_empty() {
+            return;
+        }
+        // SAFETY: all-zeros is a valid cpu_set_t; CPU_ZERO makes it explicit.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::CPU_ZERO(&mut set) };
+        let mut named = 0usize;
+        for &cpu in &self.cpu_affinity {
+            if cpu < libc::CPU_SETSIZE as usize {
+                // SAFETY: FFI call, index bounds checked above.
+                unsafe { libc::CPU_SET(cpu, &mut set) };
+                named += 1;
+            }
+        }
+        if named == 0 {
+            log::warn!("virtio-gpu: no CPU in the affinity set exists here; leaving it unset");
+            return;
+        }
+        // SAFETY: FFI call; pid 0 is the calling thread and the size matches.
+        let ret =
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+        if ret != 0 {
+            log::warn!(
+                "virtio-gpu: could not set the worker's CPU affinity: {}",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            log::info!("virtio-gpu: worker confined to {} CPU(s)", named);
+        }
+    }
+
+    /// Wait until there is something on the control queue, or the device stops.
+    ///
+    /// # Why it looks at the ring before it sleeps
+    ///
+    /// A guest under load kicks the control queue once per command submission
+    /// -- measured at ~24,000 a second with one game running, a gap of about
+    /// 42 us between them. A worker that sleeps in that gap pays a futex wake
+    /// and a scheduler round trip to be woken again almost immediately, and the
+    /// GPU is idle for all of it: the guest submits, waits for its fence, and
+    /// submits again, so there is no second submission in flight to hide the
+    /// wakeup behind.
+    ///
+    /// Reading the avail ring turns that wakeup into a memory read, and can see
+    /// the submission before the doorbell announcing it has finished being
+    /// delivered.
+    ///
+    /// The cost is bounded and lands only where there is work: the spin runs
+    /// for at most `poll_us` after each wake and then blocks, so an idle guest
+    /// spins once and stops. Under a steady stream it will spend most of the
+    /// window spinning, which approaches a busy core -- which is the trade, and
+    /// why the window is configurable rather than assumed.
+    fn wait(&mut self) {
+        if self.poll_us > 0 {
+            let began = Instant::now();
+            let deadline = began + Duration::from_micros(self.poll_us);
+            loop {
+                if self.queues.ctl_has_work() || self.stop.load(Ordering::Acquire) {
+                    // The doorbell is drained whether or not it was what told
+                    // us: the ring can show the submission before the kick
+                    // announcing it has been delivered, and leaving a stale
+                    // count behind would turn the next block into a spurious
+                    // return. Non-blocking, so draining an empty one is a no-op
+                    // rather than the sleep this branch is avoiding.
+                    let _ = self.kick.read();
+                    self.metrics.counters.spin.since(began);
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            self.metrics.counters.spin.since(began);
+        }
+        let slept = Instant::now();
+
+        // **`poll` and not `read`.** The doorbell is `EFD_NONBLOCK`, because
+        // every other holder of it -- KVM's ioeventfd, `bar0_write` -- must
+        // never block on a full counter. A `read` on it would return `EAGAIN`
+        // at once and turn this into a busy loop burning a core, so the sleep
+        // is done by waiting for the fd to become readable and the read is left
+        // non-blocking.
+        //
+        // A kick that arrived during the spin has already raised the counter,
+        // so this returns immediately rather than losing it.
+        let mut fds = libc::pollfd {
+            fd: self.kick.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised `pollfd` describing an fd this worker owns,
+        // and a negative timeout, which is `poll`'s documented "wait forever".
+        let polled = unsafe { libc::poll(&mut fds, 1, -1) };
+        self.metrics.counters.sleep.since(slept);
+        if polled < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                error!("virtio-gpu: poll on the doorbell failed: {err}");
+            }
+            return;
+        }
+        let _ = self.kick.read();
     }
 
     // -----------------------------------------------------------------------
     // CTL queue processing
     // -----------------------------------------------------------------------
 
+    /// Drain the control queue, then retire everything it produced at once.
+    ///
+    /// # One interrupt for the batch, not one per command
+    ///
+    /// `complete_ctl` ends in an MSI-X injection, and the guest runs its
+    /// interrupt handler once for each however many descriptors it retires.
+    /// This loop used to call it per descriptor, which under a game meant
+    /// roughly one interrupt per command submission -- tens of thousands a
+    /// second, each one stealing the vCPU that was trying to submit the next.
+    ///
+    /// The fence handler in `virtio_gpu.rs` has always collected first and
+    /// retired once; this is the other caller of the same API agreeing with it.
+    ///
+    /// Retiring late is allowed: the used ring carries no ordering promise, and
+    /// a fenced descriptor is already retired out of band by rutabaga's thread
+    /// whenever its fence happens to signal.
     fn process_ctl_queue(&mut self, virtio_gpu: &mut VirtioGpu) -> bool {
-        let mut used_any = false;
         let mem = self.mem.clone();
+        let mut completed: Vec<(u16, u32)> = Vec::new();
+        let began = Instant::now();
+        let mut taken = 0u64;
 
         loop {
             // Pop the next available descriptor chain.
@@ -174,6 +323,7 @@ impl Worker {
                 break;
             };
 
+            taken += 1;
             let mut reader = match Reader::new(&mem, &descs) {
                 Ok(r) => r,
                 Err(e) => {
@@ -192,7 +342,10 @@ impl Worker {
             // Decode the command.
             let (hdr, cmd, resp) = match GpuCommand::decode(&mut reader) {
                 Ok((hdr, cmd)) => {
+                    let at = Instant::now();
                     let resp = self.process_gpu_command(virtio_gpu, &mem, hdr, cmd, &mut reader);
+                    self.metrics.counters.command.since(at);
+                    self.metrics.counters.command_kind.record(cmd.kind(), at);
                     (Some(hdr), Some(cmd), resp)
                 }
                 Err(e) => {
@@ -211,8 +364,7 @@ impl Worker {
 
             // Skip writing the response if no writable descriptors were provided.
             if writer.available_bytes() == 0 {
-                self.queues.complete_ctl(&[(desc_index, 0)]);
-                used_any = true;
+                completed.push((desc_index, 0));
                 continue;
             }
 
@@ -260,12 +412,25 @@ impl Worker {
             }
 
             if add_to_queue {
-                self.queues.complete_ctl(&[(desc_index, len)]);
-                used_any = true;
+                completed.push((desc_index, len));
             }
         }
 
-        debug!("virtio-gpu: process_ctl_queue done (used_any={used_any})");
+        let used_any = !completed.is_empty();
+        if used_any {
+            self.queues.complete_ctl(&completed);
+        }
+        if taken > 0 {
+            self.metrics
+                .counters
+                .drained
+                .fetch_add(taken, Ordering::Relaxed);
+            self.metrics.counters.drain.since(began);
+        }
+        debug!(
+            "virtio-gpu: process_ctl_queue done ({} retired in one interrupt)",
+            completed.len()
+        );
         used_any
     }
 

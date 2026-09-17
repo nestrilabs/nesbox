@@ -16,6 +16,7 @@ use super::engine::{self, Done, Engine, IoVec, Job};
 use super::request::{self, BLK_S_IOERR, BLK_S_OK, DISK_ID, Op, ParseError, Request};
 use super::{Irq, Queue};
 use crate::common::QState;
+use crate::common::has_avail;
 use crate::common::{
     pop_avail, push_used, set_avail_event, set_used_no_notify, used_needs_interrupt,
 };
@@ -881,14 +882,6 @@ impl Worker {
 
     fn write_status(&self, addr: u64, status: u8) {
         let _ = self.mem.write_obj(status, GuestAddress(addr));
-    }
-}
-
-/// Is there anything in the avail ring we have not taken?
-fn has_avail(mem: &GuestMemoryMmap, q: &QState) -> bool {
-    match mem.read_obj::<u16>(GuestAddress(q.avail + 2)) {
-        Ok(idx) => u16::from_le(idx) != q.last,
-        Err(_) => false,
     }
 }
 

@@ -92,6 +92,43 @@ pub struct Gpu {
     /// needs, and a cap guessed too low breaks it.
     #[serde(default)]
     pub host_visible_max_mappings: Option<u32>,
+    /// Microseconds the GPU worker looks at the control queue before sleeping.
+    ///
+    /// **Defaulted on, unlike a drive's.** A guest kicks its disk when it has
+    /// I/O; it kicks the GPU once per command submission, measured at ~24,000 a
+    /// second under one game -- a gap of about 42 us, which is less than a
+    /// thread wakeup and a scheduler round trip. And the guest waits on each
+    /// submission's fence before making the next, so the GPU is idle for every
+    /// microsecond of that wakeup rather than working on something else.
+    ///
+    /// The cost is a core per *active* guest: the spin is bounded to this many
+    /// microseconds after each wake, so an idle box spins once and sleeps, but
+    /// a box under load spends most of the window spinning. On a host packed
+    /// with guests that is the wrong trade -- set it to `0` there.
+    #[serde(default = "default_gpu_poll_us")]
+    pub poll_us: u64,
+}
+
+/// Long enough to cover the gap between submissions from a guest running a
+/// game, which is what makes the spin land on work rather than on a deadline.
+///
+/// # Why 50 and not more
+///
+/// It was 200 for a while, on a measurement taken when the guest was making
+/// 30,000 forwarded calls a second and the mean gap between them was 33 us:
+/// the worker was reaching the deadline and sleeping on a long tail, and
+/// widening the window bought 3.6% more throughput for 13 points of a core.
+///
+/// That guest no longer exists. Caching the memory query in Mesa and placing
+/// blob resources inside the window instead of giving each one a memory slot
+/// took the call rate to 4,100 a second, and the worker now sleeps about half
+/// the time because there is genuinely nothing to do. A window four times the
+/// mean gap is spending a core to catch a tail that is mostly gone.
+///
+/// So: back to covering the ordinary gap, and the core goes back to the box.
+/// Raise it on a host that is running one guest and wants the last few percent.
+const fn default_gpu_poll_us() -> u64 {
+    50
 }
 
 fn default_render_node() -> PathBuf {

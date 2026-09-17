@@ -68,8 +68,87 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::metrics::{GpuCounters, GpuMetrics};
+
+/// Count the `amdgpu_ccmd` records in one forwarded stream, by opcode.
+///
+/// # Why this is separate from the accountant above
+///
+/// [`VramAccountant`] only exists when a VRAM quota is configured, and it only
+/// looks at `GEM_NEW` because that is the one record that costs device memory.
+/// This walk runs on every submit whether or not a quota is set, and cares
+/// about nothing except which opcodes went past -- because the question it
+/// answers is where a frame's several hundred forwards go, and the answer was
+/// invisible while the only parser in the tree ran conditionally and looked at
+/// one opcode.
+///
+/// It reads the header and skips; it never follows a payload. A stream it
+/// cannot walk is counted as malformed and abandoned rather than guessed at, so
+/// the buckets are always a floor and never an invention.
+pub fn count_ccmds(commands: &[u8], counters: &GpuCounters) {
+    let mut off = 0usize;
+    while commands.len() - off >= CCMD_HDR_LEN {
+        let rec = &commands[off..];
+        let (Some(cmd), Some(len)) = (rd_u32(rec, 0), rd_u32(rec, 4)) else {
+            counters.ccmd_malformed.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let len = len as usize;
+        // The same three checks the renderer applies. Mirrored so this cannot
+        // walk a stream the renderer would have rejected outright.
+        if len < CCMD_HDR_LEN || len > commands.len() - off || len % CCMD_ALIGN != 0 {
+            counters.ccmd_malformed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        match counters.ccmd.get(cmd as usize) {
+            Some(bucket) => bucket.fetch_add(1, Ordering::Relaxed),
+            None => counters.ccmd_high.fetch_add(1, Ordering::Relaxed),
+        };
+        if cmd == AMDGPU_CCMD_QUERY_INFO {
+            count_info_query(rec, len, counters);
+        }
+        counters.ccmd_records.fetch_add(1, Ordering::Relaxed);
+        off += len;
+    }
+}
+
+/// Which question a `QUERY_INFO` record is asking.
+///
+/// `struct amdgpu_ccmd_query_info_req` is a 16-byte `vdrm_ccmd_req` followed by
+/// a `struct drm_amdgpu_info`, whose third field is the query id:
+///
+/// ```text
+///  0  cmd            u32   ┐
+///  4  len            u32   │ vdrm_ccmd_req
+///  8  seqno          u32   │
+/// 12  rsp_off        u32   ┘
+/// 16  return_pointer u64   ┐
+/// 24  return_size    u32   │ drm_amdgpu_info
+/// 28  query          u32   ┘  <- this
+/// ```
+///
+/// A record too short to hold it is left uncounted rather than read past: the
+/// buckets are a floor by construction and one that lies is worse than one that
+/// is short.
+fn count_info_query(rec: &[u8], len: usize, counters: &GpuCounters) {
+    if len < QUERY_INFO_OFF_QUERY + 4 {
+        return;
+    }
+    let Some(query) = rd_u32(rec, QUERY_INFO_OFF_QUERY) else {
+        return;
+    };
+    if !counters.info_query.bump(query) {
+        counters.info_high.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `enum amdgpu_ccmd` — `AMDGPU_CCMD_QUERY_INFO`.
+const AMDGPU_CCMD_QUERY_INFO: u32 = 1;
+
+/// Byte offset of `drm_amdgpu_info::query` within a `QUERY_INFO` record.
+const QUERY_INFO_OFF_QUERY: usize = 28;
 
 /// `enum amdgpu_ccmd` — `AMDGPU_CCMD_GEM_NEW`.
 const AMDGPU_CCMD_GEM_NEW: u32 = 2;
@@ -408,6 +487,22 @@ mod tests {
         r
     }
 
+    /// One `amdgpu_ccmd_query_info_req`: a 16-byte header then a
+    /// `drm_amdgpu_info` whose `query` field is at byte 28.
+    fn query_info(query: u32) -> Vec<u8> {
+        let mut r = Vec::new();
+        r.extend_from_slice(&AMDGPU_CCMD_QUERY_INFO.to_le_bytes());
+        r.extend_from_slice(&48u32.to_le_bytes()); // len
+        r.extend_from_slice(&1u32.to_le_bytes()); // seqno
+        r.extend_from_slice(&0u32.to_le_bytes()); // rsp_off
+        r.extend_from_slice(&0u64.to_le_bytes()); // return_pointer
+        r.extend_from_slice(&8u32.to_le_bytes()); // return_size
+        r.extend_from_slice(&query.to_le_bytes()); // query
+        r.resize(48, 0); // the union
+        assert_eq!(r.len(), 48, "query_info_req is 48 bytes");
+        r
+    }
+
     fn other_ccmd(cmd: u32, len: usize) -> Vec<u8> {
         let mut r = Vec::new();
         r.extend_from_slice(&cmd.to_le_bytes());
@@ -632,5 +727,128 @@ mod tests {
             a.observe_submit(1, &gem_new(1, 4096, AMDGPU_GEM_DOMAIN_VRAM))
                 .is_err()
         );
+    }
+
+    /// Every record in a stream is counted, under its own opcode.
+    ///
+    /// The mix is the point: a stream carrying one `GEM_NEW` and several of
+    /// something else must not report as one forward, because "forwards per
+    /// frame" and "records per frame" are the two numbers this exists to tell
+    /// apart.
+    #[test]
+    fn every_record_in_a_stream_is_counted_under_its_own_opcode() {
+        let counters = GpuCounters::default();
+        let mut stream = Vec::new();
+        stream.extend(gem_new(1, MIB, AMDGPU_GEM_DOMAIN_VRAM));
+        stream.extend(other_ccmd(1, 24));
+        stream.extend(other_ccmd(4, 32));
+        stream.extend(other_ccmd(4, 32));
+        stream.extend(gem_new(2, MIB, AMDGPU_GEM_DOMAIN_VRAM));
+
+        count_ccmds(&stream, &counters);
+
+        let at = |i: usize| counters.ccmd[i].load(Ordering::Relaxed);
+        assert_eq!(at(AMDGPU_CCMD_GEM_NEW as usize), 2);
+        assert_eq!(at(1), 1);
+        assert_eq!(at(4), 2);
+        assert_eq!(counters.ccmd_records.load(Ordering::Relaxed), 5);
+        assert_eq!(counters.ccmd_malformed.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.ccmd_high.load(Ordering::Relaxed), 0);
+    }
+
+    /// An opcode past the last bucket is counted, not dropped.
+    ///
+    /// The enum can grow, and a new opcode silently vanishing from the totals
+    /// would look like traffic that stopped rather than traffic we stopped
+    /// naming.
+    #[test]
+    fn an_opcode_past_the_last_bucket_still_shows_up() {
+        let counters = GpuCounters::default();
+        count_ccmds(
+            &other_ccmd(super::super::metrics::CCMD_BUCKETS as u32, 24),
+            &counters,
+        );
+        assert_eq!(counters.ccmd_high.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.ccmd_records.load(Ordering::Relaxed), 1);
+    }
+
+    /// A stream that cannot be walked is abandoned and said so.
+    ///
+    /// Counting what was read before the bad record would publish a total that
+    /// is quietly short. `ccmd_malformed` being non-zero is what tells a reader
+    /// the buckets are a floor.
+    #[test]
+    fn a_stream_that_cannot_be_walked_is_reported_rather_than_half_counted() {
+        let counters = GpuCounters::default();
+        let mut stream = other_ccmd(1, 24);
+        // A length that is neither aligned nor inside the stream.
+        stream.extend(other_ccmd(2, 24));
+        let n = stream.len();
+        stream[n - 24 + 4..n - 24 + 8].copy_from_slice(&999u32.to_le_bytes());
+
+        count_ccmds(&stream, &counters);
+
+        assert_eq!(
+            counters.ccmd_records.load(Ordering::Relaxed),
+            1,
+            "the good one"
+        );
+        assert_eq!(counters.ccmd_malformed.load(Ordering::Relaxed), 1);
+    }
+
+    /// A `QUERY_INFO` record is counted under the question it asks.
+    ///
+    /// The opcode alone says only that the guest asked something. Which id it
+    /// asked is what separates a fact that cannot change while a context lives
+    /// from one that changes every frame -- and therefore whether there is
+    /// anything cacheable here at all.
+    #[test]
+    fn a_query_is_counted_under_the_id_it_asks_for() {
+        let counters = GpuCounters::default();
+        let mut stream = Vec::new();
+        // AMDGPU_INFO_FW_VERSION, twice, and AMDGPU_INFO_VRAM_USAGE once.
+        stream.extend(query_info(0x0e));
+        stream.extend(query_info(0x0e));
+        stream.extend(query_info(0x10));
+
+        count_ccmds(&stream, &counters);
+
+        assert_eq!(counters.info_query.0[0x0e].load(Ordering::Relaxed), 2);
+        assert_eq!(counters.info_query.0[0x10].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.ccmd[1].load(Ordering::Relaxed), 3);
+        assert_eq!(counters.info_high.load(Ordering::Relaxed), 0);
+    }
+
+    /// A query id past the last bucket is counted, not dropped.
+    #[test]
+    fn a_query_id_past_the_last_bucket_still_shows_up() {
+        let counters = GpuCounters::default();
+        count_ccmds(
+            &query_info(super::super::metrics::INFO_BUCKETS as u32),
+            &counters,
+        );
+        assert_eq!(counters.info_high.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.ccmd[1].load(Ordering::Relaxed), 1);
+    }
+
+    /// A record too short to hold a query id is not read past.
+    ///
+    /// It still counts as a `QUERY_INFO`, because it was one. It just does not
+    /// invent which question it asked.
+    #[test]
+    fn a_truncated_query_record_is_counted_but_not_read_past() {
+        let counters = GpuCounters::default();
+        count_ccmds(&other_ccmd(AMDGPU_CCMD_QUERY_INFO, 24), &counters);
+        assert_eq!(counters.ccmd[1].load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters
+                .info_query
+                .0
+                .iter()
+                .map(|b| b.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(counters.info_high.load(Ordering::Relaxed), 0);
     }
 }
