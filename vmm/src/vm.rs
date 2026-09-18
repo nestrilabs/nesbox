@@ -100,12 +100,14 @@ impl Vm {
             let host_addr = mem
                 .get_host_address(start)
                 .context("Failed to get host address")?;
+            let huge = advise_huge(host_addr, size);
             log::info!(
-                "RAM slot {}: guest {:#x}..{:#x} ({} MiB)",
+                "RAM slot {}: guest {:#x}..{:#x} ({} MiB){}",
                 slot,
                 start.raw_value(),
                 start.raw_value() + size as u64,
-                size / (1024 * 1024)
+                size / (1024 * 1024),
+                if huge { "  huge pages requested" } else { "" }
             );
             unsafe {
                 vm_fd
@@ -355,4 +357,37 @@ pub fn run_vcpu_loop(
         }
     }
     Ok(())
+}
+
+/// Ask the kernel to back a guest RAM region with huge pages.
+///
+/// # Why this is needed even where THP is `always`
+///
+/// Guest RAM here is a **memfd**, mapped shared so vhost-user backends can see
+/// it. `/sys/kernel/mm/transparent_hugepage/enabled` governs anonymous memory;
+/// shmem -- which a memfd is -- is governed by `shmem_enabled`, a separate knob
+/// that is `never` or `advise` on almost every kernel. So a host reading
+/// `enabled = [always]` can still be running every guest on 4 KiB pages, and
+/// nothing says so: an 8 GiB guest is then two million page-table entries and a
+/// TLB miss on memory the guest touches constantly.
+///
+/// `advise` is the common setting and is exactly what this call satisfies.
+/// Where `shmem_enabled` is `never` the advice is accepted and ignored, which
+/// is why the log line says *requested* rather than *enabled*. What actually
+/// happened is in `/proc/<pid>/smaps_rollup` as `ShmemPmdMapped`.
+///
+/// A failure is not fatal. Huge pages are a performance property, and a box
+/// that runs slightly slower is better than one that does not start.
+fn advise_huge(host_addr: *mut u8, size: usize) -> bool {
+    // SAFETY: FFI call over a mapping this process just made, with its own
+    // length. `madvise` neither reads nor writes the range.
+    let ret = unsafe { libc::madvise(host_addr as *mut libc::c_void, size, libc::MADV_HUGEPAGE) };
+    if ret != 0 {
+        log::warn!(
+            "guest RAM will use 4 KiB pages: madvise(MADV_HUGEPAGE) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return false;
+    }
+    true
 }

@@ -1,7 +1,7 @@
 //! Shared constants and types for virtio-pci devices.
 use pci::{MsiRouter, MsiVector};
 use std::sync::Arc;
-use vm_memory::{Bytes, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 // ── BAR layout ──────────────────────────────────────────────────────────────
@@ -249,6 +249,20 @@ pub fn collect_descs_with(
 }
 
 /// Read one avail descriptor from the queue. Returns None if empty.
+/// Is there anything in the avail ring the guest has offered and we have not
+/// taken?
+///
+/// Answered by reading the ring rather than by disturbing the queue, so a
+/// worker can ask it while spinning without taking anything it is not ready to
+/// serve. Reading `avail.idx` and comparing it to our own `last` is the same
+/// comparison [`pop_avail`] makes before it commits to a chain.
+pub fn has_avail(mem: &GuestMemoryMmap, q: &QState) -> bool {
+    match mem.read_obj::<u16>(GuestAddress(q.avail + 2)) {
+        Ok(idx) => u16::from_le(idx) != q.last,
+        Err(_) => false,
+    }
+}
+
 pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64, u32, u16)>)> {
     // A queue the guest sized to zero has no ring to index into, and the
     // remainder below would panic rather than report anything. See

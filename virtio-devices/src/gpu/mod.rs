@@ -23,8 +23,9 @@ mod worker;
 
 pub use self::descriptor_utils::{Error as DescriptorError, Reader, Writer};
 pub use self::device::{GpuConfig, GpuDevice};
-pub use self::metrics::GpuSnapshot;
+pub use self::metrics::{CommandKindCounts, GpuSnapshot, InfoCounts, PhaseSnapshot};
 pub use self::occupancy::Occupancy;
+pub use self::protocol::GPU_COMMAND_NAMES;
 
 /// Control virtqueue index.
 pub const CTL_INDEX: usize = 0;
@@ -86,7 +87,18 @@ pub trait GpuQueues: Send + Sync {
     fn pop_ctl(&self) -> Option<(u16, Vec<Descriptor>)>;
     /// Complete descriptors on the control queue, then interrupt the guest.
     /// Each entry is a descriptor head index and the number of bytes written.
+    ///
+    /// **One call per batch, not one per descriptor.** Every call ends in an
+    /// MSI-X injection, and the guest's interrupt handler runs once for it
+    /// however many descriptors it retires. A caller that has several to retire
+    /// and makes several calls is buying the guest an interrupt storm and
+    /// itself nothing.
     fn complete_ctl(&self, completed: &[(u16, u32)]);
+    /// Has the guest offered work on the control queue that we have not taken?
+    ///
+    /// Asked without taking anything, so a worker can spin on it instead of
+    /// sleeping. See [`crate::common::has_avail`].
+    fn ctl_has_work(&self) -> bool;
 }
 
 /// Registers host memory as guest RAM, so the guest reaches it directly
@@ -97,9 +109,29 @@ pub trait GpuQueues: Send + Sync {
 /// access would defeat the entire point. Implemented by the VMM, which is the
 /// only part that holds the KVM handle.
 pub trait HostMemoryMapper: Send + Sync {
-    /// Back `size` bytes at `guest_addr` with the host mapping at `host_addr`.
+    /// The host address inside the shared window that already backs
+    /// `guest_addr`, or `None` if there is no window or the range is outside it.
+    ///
+    /// **The preferred path, and the reason this trait has four methods.** The
+    /// window is one KVM memory slot registered at boot, so a resource placed
+    /// inside it with `MAP_FIXED` needs no memslot update and costs an `mmap`.
+    /// The alternative below costs a `KVM_SET_USER_MEMORY_REGION` on a running
+    /// VM, which stalls every vCPU -- measured at 732 µs to map and 2.13 ms to
+    /// unmap.
+    fn host_addr(&self, guest_addr: u64, size: u64) -> Option<u64>;
+
+    /// Return a placed range to unbacked, by overwriting it rather than
+    /// unmapping it. See the implementation for why the difference matters.
+    fn withdraw(&self, guest_addr: u64, size: u64) -> anyhow::Result<()>;
+
+    /// Back `size` bytes at `guest_addr` with the host mapping at `host_addr`,
+    /// as its own memory slot.
+    ///
+    /// The fallback, for a resource virglrenderer will not place. Correct and
+    /// slow; see [`HostMemoryMapper::host_addr`].
     fn map(&self, guest_addr: u64, host_addr: u64, size: u64) -> anyhow::Result<()>;
-    /// Stop backing `size` bytes at `guest_addr`.
+
+    /// Stop backing `size` bytes at `guest_addr`, removing its slot.
     fn unmap(&self, guest_addr: u64, size: u64) -> anyhow::Result<()>;
 }
 

@@ -562,6 +562,78 @@ pub enum GpuCommand {
     ResourceAssignUuid(virtio_gpu_resource_assign_uuid),
 }
 
+/// Command kinds, for the per-kind timing buckets.
+///
+/// A dense index rather than the command's wire type, which is sparse and
+/// starts at 0x100 -- an array indexed by that would be mostly holes. The
+/// order matches the enum above and nothing outside the metrics depends on the
+/// numbering; a reader is given the names.
+pub const GPU_COMMAND_KINDS: usize = 26;
+
+/// Names for the buckets, in index order, so the stats surface can label them.
+pub const GPU_COMMAND_NAMES: [&str; GPU_COMMAND_KINDS] = [
+    "get_display_info",
+    "get_edid",
+    "resource_create_2d",
+    "resource_unref",
+    "set_scanout",
+    "set_scanout_blob",
+    "resource_flush",
+    "transfer_to_host_2d",
+    "resource_attach_backing",
+    "resource_detach_backing",
+    "get_capset_info",
+    "get_capset",
+    "ctx_create",
+    "ctx_destroy",
+    "ctx_attach_resource",
+    "ctx_detach_resource",
+    "resource_create_3d",
+    "transfer_to_host_3d",
+    "transfer_from_host_3d",
+    "cmd_submit_3d",
+    "resource_create_blob",
+    "resource_map_blob",
+    "resource_unmap_blob",
+    "update_cursor",
+    "move_cursor",
+    "resource_assign_uuid",
+];
+
+impl GpuCommand {
+    /// This command's bucket. See [`GPU_COMMAND_NAMES`].
+    pub fn kind(&self) -> usize {
+        match self {
+            Self::GetDisplayInfo => 0,
+            Self::GetEdid(_) => 1,
+            Self::ResourceCreate2d(_) => 2,
+            Self::ResourceUnref(_) => 3,
+            Self::SetScanout(_) => 4,
+            Self::SetScanoutBlob(_) => 5,
+            Self::ResourceFlush(_) => 6,
+            Self::TransferToHost2d(_) => 7,
+            Self::ResourceAttachBacking(_) => 8,
+            Self::ResourceDetachBacking(_) => 9,
+            Self::GetCapsetInfo(_) => 10,
+            Self::GetCapset(_) => 11,
+            Self::CtxCreate(_) => 12,
+            Self::CtxDestroy(_) => 13,
+            Self::CtxAttachResource(_) => 14,
+            Self::CtxDetachResource(_) => 15,
+            Self::ResourceCreate3d(_) => 16,
+            Self::TransferToHost3d(_) => 17,
+            Self::TransferFromHost3d(_) => 18,
+            Self::CmdSubmit3d(_) => 19,
+            Self::ResourceCreateBlob(_) => 20,
+            Self::ResourceMapBlob(_) => 21,
+            Self::ResourceUnmapBlob(_) => 22,
+            Self::UpdateCursor(_) => 23,
+            Self::MoveCursor(_) => 24,
+            Self::ResourceAssignUuid(_) => 25,
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum GpuCommandDecodeError {
     #[error("invalid command type ({0})")]

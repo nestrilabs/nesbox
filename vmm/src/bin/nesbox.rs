@@ -126,39 +126,78 @@ fn main() -> Result<()> {
     // the bus, so a registrar set afterwards would come too late for it.
     pci_bus.set_ioevent_registrar(irq.clone());
 
-    // ── Block device ──────────────────────────────────────────────────────
+    // The INTx line follows the PCI slot, and slots are handed out in the order
+    // devices are added. One counter, incremented exactly where a device lands,
+    // so adding or removing one does not silently renumber the ones after it.
+    let mut next_slot: u32 = 1;
+
+    // ── Block devices ─────────────────────────────────────────────────────
+    // The root drive is still special: the boot source names it, so it is found
+    // first and gets slot 1. Everything else in `config.drives` is added in
+    // config order after it, exactly like virtio-fs shares are below.
     let root_drive = config
         .drives
         .iter()
         .find(|d| d.is_root_device)
         .context("No root drive specified")?;
+
     // A queue per vCPU is what the guest's own multiqueue block layer wants,
     // bounded because past about four the queues stop being the constraint and
     // start being threads.
-    let blk_queues = root_drive
-        .num_queues
-        .unwrap_or_else(|| (config.machine_config.vcpu_count as u16).clamp(1, 4));
+    let default_queues = (config.machine_config.vcpu_count as u16).clamp(1, 4);
+
     let blk_device = BlkDevice::new(
         &BlkConfig {
             path: root_drive.path_on_host.clone(),
             read_only: root_drive.is_read_only,
             direct: root_drive.direct,
-            num_queues: blk_queues,
+            num_queues: root_drive.num_queues.unwrap_or(default_queues),
             poll_us: root_drive.poll_us.unwrap_or(0),
         },
         vm.mem.clone(),
     )?;
-
     let blk_vectors = irq
         .allocate_msi_vectors(blk_device.msix_vectors())
         .context("blk MSI-X vectors")?;
-    let blk_intx = irq.legacy_irqfd(acpi_slot_gsi(1)).context("blk INTx")?;
+    let blk_intx = irq
+        .legacy_irqfd(acpi_slot_gsi(next_slot))
+        .context("blk INTx")?;
     blk_device.bind_interrupts(blk_vectors, irq.clone(), blk_intx);
     let blk_bdf = pci_bus.add_device(blk_device)?;
     info!(
-        "virtio-blk at {:02x}:{:02x}.{}",
+        "virtio-blk (root) at {:02x}:{:02x}.{}",
         blk_bdf.0, blk_bdf.1, blk_bdf.2
     );
+    next_slot += 1;
+
+    for drive in config.drives.iter().filter(|d| !d.is_root_device) {
+        let device = BlkDevice::new(
+            &BlkConfig {
+                path: drive.path_on_host.clone(),
+                read_only: drive.is_read_only,
+                direct: drive.direct,
+                num_queues: drive.num_queues.unwrap_or(default_queues),
+                poll_us: drive.poll_us.unwrap_or(0),
+            },
+            vm.mem.clone(),
+        )?;
+        let vectors = irq
+            .allocate_msi_vectors(device.msix_vectors())
+            .context("blk MSI-X vectors")?;
+        let intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("blk INTx")?;
+        device.bind_interrupts(vectors, irq.clone(), intx);
+        let bdf = pci_bus.add_device(device)?;
+        info!(
+            "virtio-blk \"{}\" at {:02x}:{:02x}.{}",
+            drive.path_on_host.display(),
+            bdf.0,
+            bdf.1,
+            bdf.2
+        );
+        next_slot += 1;
+    }
 
     // ── Console device ────────────────────────────────────────────────────
     let console_device = ConsoleDevice::new();
@@ -166,25 +205,28 @@ fn main() -> Result<()> {
     let con_vectors = irq
         .allocate_msi_vectors(4)
         .context("console MSI-X vectors")?;
-    let con_intx = irq.legacy_irqfd(acpi_slot_gsi(2)).context("console INTx")?;
+    let con_intx = irq
+        .legacy_irqfd(acpi_slot_gsi(next_slot))
+        .context("console INTx")?;
     console_device.bind_interrupts(con_vectors, irq.clone(), con_intx);
     let con_bdf = pci_bus.add_device(console_device)?;
     info!(
         "virtio-console at {:02x}:{:02x}.{}",
         con_bdf.0, con_bdf.1, con_bdf.2
     );
+    next_slot += 1;
 
     // ── Vsock device (optional) ───────────────────────────────────────────
     if let Some(vsock_cfg) = &config.vsock {
         let vsock_device = VsockDevice::new(vsock_cfg.guest_cid, vm.mem.clone())?;
         let vsock_vectors = irq.allocate_msi_vectors(4).context("vsock MSI-X vectors")?;
-        let slot = 3;
         let vsock_intx = irq
-            .legacy_irqfd(acpi_slot_gsi(slot))
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
             .context("vsock INTx")?;
         vsock_device.bind_interrupts(vsock_vectors, irq.clone(), vsock_intx);
         let bdf = pci_bus.add_device(vsock_device)?;
         info!("virtio-vsock at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
+        next_slot += 1;
     }
 
     // ── Network device (optional) ─────────────────────────────────────────
@@ -197,11 +239,13 @@ fn main() -> Result<()> {
             vm.mem.clone(),
         )?;
         let net_vectors = irq.allocate_msi_vectors(4).context("net MSI-X vectors")?;
-        let slot = 4;
-        let net_intx = irq.legacy_irqfd(acpi_slot_gsi(slot)).context("net INTx")?;
+        let net_intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("net INTx")?;
         net_device.bind_interrupts(net_vectors, irq.clone(), net_intx);
         let bdf = pci_bus.add_device(net_device)?;
         info!("virtio-net at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
+        next_slot += 1;
     }
 
     // ── GPU (optional) ────────────────────────────────────────────────────
@@ -223,6 +267,7 @@ fn main() -> Result<()> {
         }
 
         let slots = MemorySlots::new(vm.vm_fd.clone(), vm.ram_slot_count);
+        let window_slots = slots.clone();
         let gpu_device = Arc::new(GpuDevice::new(
             &GpuConfig {
                 render_node: gpu_cfg.render_node.clone(),
@@ -230,12 +275,18 @@ fn main() -> Result<()> {
                 vram_limit_bytes: gpu_cfg.vram_limit_mib.map(|m| m * (1 << 20)),
                 window_limit_bytes: gpu_cfg.host_visible_window_mib.map_or(0, |m| m * (1 << 20)),
                 window_max_mappings: gpu_cfg.host_visible_max_mappings.unwrap_or(0),
+                poll_us: gpu_cfg.poll_us,
+                // The same set the vCPU threads get: the worker is the other
+                // half of every forwarded command, and placing one without the
+                // other leaves the handoff crossing dies anyway.
+                cpu_affinity: config.machine_config.cpu_affinity.clone(),
             },
             vm.mem.clone(),
         )?);
         let gpu_vectors = irq.allocate_msi_vectors(4).context("GPU MSI-X vectors")?;
-        let slot = 5;
-        let gpu_intx = irq.legacy_irqfd(acpi_slot_gsi(slot)).context("GPU INTx")?;
+        let gpu_intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("GPU INTx")?;
         gpu_device.bind_interrupts(gpu_vectors, irq.clone(), gpu_intx);
         gpu_device.bind_mapper(slots);
         let bdf = pci_bus.add_device_arc(gpu_device.clone())?;
@@ -245,11 +296,22 @@ fn main() -> Result<()> {
             .bar_address(bdf, GPU_SHM_BAR)
             .context("the GPU has no BAR2")?;
         gpu_device.set_shm_guest_addr(shm_addr);
+        // Reserved and registered once, now that BAR2 has an address. A failure
+        // is not fatal: every blob then takes the per-resource slot path, which
+        // is what this VMM did before the window existed. It is warned about
+        // because that path costs a memslot update per map and per unmap.
+        if let Err(err) = window_slots.open_window(shm_addr, GpuDevice::shm_bar_size()) {
+            log::warn!(
+                "GPU window not reserved ({err:#}); every blob will take its own \
+                 memory slot, which is markedly slower"
+            );
+        }
         info!(
             "virtio-gpu at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
             bdf.0, bdf.1, bdf.2
         );
         stats_gpu = Some(gpu_device);
+        next_slot += 1;
     }
 
     // ── Metrics surface ───────────────────────────────────────────────────
@@ -264,16 +326,6 @@ fn main() -> Result<()> {
     // kills virtiofsd.
     let runtime_dir = std::env::temp_dir().join(format!("nesbox-{}", std::process::id()));
     let mut fs_daemons = Vec::new();
-    // Devices take PCI slots in the order they are added, and the INTx line
-    // follows the slot, so where these start depends on whether there is a
-    // network device ahead of them.
-    let mut first_fs_slot = 4;
-    if config.network.is_some() {
-        first_fs_slot += 1;
-    }
-    if config.gpu.is_some() {
-        first_fs_slot += 1;
-    }
     for shared in &config.shared_directories {
         let daemon = Virtiofsd::spawn(
             &shared.tag,
@@ -285,9 +337,8 @@ fn main() -> Result<()> {
         let vectors = irq
             .allocate_msi_vectors(4)
             .context("virtio-fs MSI-X vectors")?;
-        let slot = first_fs_slot + fs_daemons.len() as u32;
         let intx = irq
-            .legacy_irqfd(acpi_slot_gsi(slot))
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
             .context("virtio-fs INTx")?;
         fs_device.bind_interrupts(vectors, irq.clone(), intx);
         let bdf = pci_bus.add_device(fs_device)?;
@@ -296,6 +347,7 @@ fn main() -> Result<()> {
             shared.tag, bdf.0, bdf.1, bdf.2
         );
         fs_daemons.push(daemon);
+        next_slot += 1;
     }
 
     // ── Legacy COM1, for early boot output ────────────────────────────────

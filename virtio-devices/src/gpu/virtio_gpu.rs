@@ -72,6 +72,12 @@ struct FenceDescriptor {
     fence_id: u64,
     desc_index: u16,
     len: u32,
+    /// When the guest started waiting on this.
+    ///
+    /// Taken here rather than in `create_fence`, which runs microseconds
+    /// earlier on the same thread -- close enough that the difference is below
+    /// what any of these measurements resolve, and it costs no second map.
+    recorded: std::time::Instant,
 }
 
 #[derive(Default, Debug)]
@@ -105,6 +111,34 @@ impl AssociatedScanouts {
     }
 }
 
+unsafe extern "C" {
+    /// Map a resource at an address the caller chose, `MAP_FIXED`.
+    ///
+    /// # Why this is declared here rather than called through rutabaga
+    ///
+    /// `rutabaga_gfx` has a binding for it, behind a `virgl_renderer_unstable`
+    /// cfg, and the body inside that cfg does not compile -- it matches
+    /// `if let Some(addr)` on a `u64`. The symbol itself is a *stable* virglrenderer
+    /// export and is already linked into this process, so it is declared and called
+    /// directly rather than forking the crate to fix a dead branch.
+    ///
+    /// Returns `0` on success and `-EOPNOTSUPP` for a resource that cannot be
+    /// placed this way, which is a documented answer and the reason the slot path
+    /// below still exists.
+    ///
+    /// **The mapping belongs to the caller.** virglrenderer does not record it --
+    /// `res->mapped` is left alone -- so `virgl_renderer_resource_unmap` refuses it
+    /// with `EINVAL`, and undoing it is this file's job. See the header comment on
+    /// the C side, which says exactly that.
+    fn virgl_renderer_resource_map_fixed(
+        res_handle: u32,
+        addr: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int;
+}
+
+/// `-EOPNOTSUPP`, the answer meaning "not this resource, use the other path".
+const EOPNOTSUPP: std::ffi::c_int = -95;
+
 #[derive(Copy, Clone, Debug)]
 struct VirtioGpuResource {
     scanouts: AssociatedScanouts,
@@ -113,6 +147,13 @@ struct VirtioGpuResource {
     /// Where in the shared window it is mapped, once it is.
     shmem_offset: Option<u64>,
     rutabaga_external_mapping: bool,
+    /// Mapped by being placed inside the window rather than given a slot.
+    ///
+    /// The two are torn down differently and cannot be told apart afterwards:
+    /// a placed resource is withdrawn by overwriting its range, a slotted one
+    /// by deleting its memory slot. Doing either to the other leaves the guest
+    /// addressing memory nothing owns.
+    placed: bool,
 }
 
 impl VirtioGpuResource {
@@ -125,6 +166,7 @@ impl VirtioGpuResource {
             size,
             shmem_offset: None,
             rutabaga_external_mapping: false,
+            placed: false,
         }
     }
 
@@ -234,6 +276,9 @@ impl VirtioGpu {
                 return;
             }
 
+            for desc in &completed {
+                metrics.counters.fence_latency.since(desc.recorded);
+            }
             let used: Vec<(u16, u32)> = completed
                 .iter()
                 .map(|desc| (desc.desc_index, desc.len))
@@ -535,10 +580,10 @@ impl VirtioGpu {
             // released, so the unref is refused and the resource kept: a
             // resource the guest still holds is a far smaller problem than a
             // window into freed host memory.
-            if let Err(err) = self.mapper.unmap(guest_addr, resource.size) {
+            if self.withdraw_mapping(&resource, guest_addr).is_err() {
                 log::error!(
                     "NESBOX_GPU: unref_resource: resource {resource_id} at {guest_addr:#x} \
-                     would not unmap, refusing the unref: {err:#}"
+                     would not unmap, refusing the unref"
                 );
                 self.resources.insert(resource_id, resource);
                 return Err(ErrUnspec);
@@ -713,6 +758,13 @@ impl VirtioGpu {
         // dropping the submit leaves the guest holding a buffer it believes was
         // created, waiting on a fence that will never signal -- measured, and it
         // hangs the guest rather than failing it. See `vram.rs`.
+        // Unconditional, unlike the accounting below it: what a stream contains
+        // is the question, and gating the only parser in the tree on a quota
+        // being configured is why nobody could answer it.
+        let at = std::time::Instant::now();
+        super::vram::count_ccmds(commands, &self.metrics.counters);
+        self.metrics.counters.observe.since(at);
+
         if let Some(vram) = self.vram.as_mut() {
             if let Err(why) = vram.observe_submit(ctx_id, commands) {
                 log::warn!("virtio-gpu: ctx {ctx_id}: {why} -- {}", vram.summary());
@@ -720,18 +772,22 @@ impl VirtioGpu {
         }
 
         GpuCounters::inc(&self.metrics.counters.submits);
-        self.rutabaga
-            .submit_command(ctx_id, commands, fence_ids)
-            .map_err(|e| {
-                GpuCounters::inc(&self.metrics.counters.submits_failed);
-                log::error!("NESBOX_GPU: submit_command FAILED ctx={} : {:?}", ctx_id, e);
-                ErrUnspec
-            })?;
+        let at = std::time::Instant::now();
+        let submitted = self.rutabaga.submit_command(ctx_id, commands, fence_ids);
+        self.metrics.counters.submit.since(at);
+        submitted.map_err(|e| {
+            GpuCounters::inc(&self.metrics.counters.submits_failed);
+            log::error!("NESBOX_GPU: submit_command FAILED ctx={} : {:?}", ctx_id, e);
+            ErrUnspec
+        })?;
         Ok(OkNoData)
     }
 
     pub fn create_fence(&mut self, fence: RutabagaFence) -> VirtioGpuResult {
-        self.rutabaga.create_fence(fence)?;
+        let at = std::time::Instant::now();
+        let made = self.rutabaga.create_fence(fence);
+        self.metrics.counters.fence_create.since(at);
+        made?;
         Ok(OkNoData)
     }
 
@@ -754,6 +810,7 @@ impl VirtioGpu {
                 fence_id,
                 desc_index,
                 len,
+                recorded: std::time::Instant::now(),
             });
         }
         already_done
@@ -875,43 +932,93 @@ impl VirtioGpu {
             return Err(ErrUnspec);
         }
 
-        // Ask virglrenderer to map the resource into our address space, then
-        // hand that mapping to the guest as memory it can address directly.
-        //
-        // The obvious alternative — export the resource as a dmabuf and map the
-        // fd — cannot work on amdgpu. RADV creates buffers with
-        // AMDGPU_GEM_CREATE_VM_ALWAYS_VALID, and `amdgpu_gem_prime_export`
-        // refuses those with EPERM unconditionally. No capability changes that,
-        // so it is not a fallback worth keeping.
-        let mapping = match self.rutabaga.map(resource_id) {
-            Ok(m) => m,
-            Err(e) => {
-                self.window.release(res_size);
-                log::error!("NESBOX_GPU: map_blob: resource {resource_id} would not map: {e:?}");
-                return Err(ErrUnspec);
+        let guest_addr = shm_region.guest_addr + offset;
+
+        // **Placed inside the window first.** The window is one KVM memory slot
+        // registered at boot, so putting a resource in it is an `mmap` and
+        // nothing else. The alternative below needs a memslot update on a
+        // running VM, which zaps shadow page tables and synchronises against
+        // every vCPU: measured at 732 µs to map and 2.13 ms to unmap, tens of
+        // times a second, and every one of them a stall the guest sees.
+        let placed = match self.mapper.host_addr(guest_addr, res_size) {
+            None => false,
+            Some(host) => {
+                let at = std::time::Instant::now();
+                // SAFETY: `host` is inside the window reservation, which the
+                // mapper owns and has just bounds-checked, and the call maps
+                // over it rather than anywhere else. The resource id is one
+                // virglrenderer gave us.
+                let ret = unsafe {
+                    virgl_renderer_resource_map_fixed(resource_id, host as *mut std::ffi::c_void)
+                };
+                self.metrics.counters.placed_map.since(at);
+                match ret {
+                    0 => true,
+                    EOPNOTSUPP => {
+                        // A documented answer for some resource types, not a
+                        // fault. Counted so the share still paying the old cost
+                        // is visible rather than inferred.
+                        GpuCounters::inc(&self.metrics.counters.place_refused);
+                        false
+                    }
+                    err => {
+                        log::warn!(
+                            "NESBOX_GPU: map_blob: placing resource {resource_id} at \
+                             {host:#x} failed ({err}); falling back to its own slot"
+                        );
+                        GpuCounters::inc(&self.metrics.counters.place_refused);
+                        false
+                    }
+                }
             }
         };
 
-        if mapping.size < res_size {
-            log::error!(
-                "NESBOX_GPU: map_blob: resource {resource_id} mapped {:#x} bytes, \
-                 short of the {res_size:#x} the guest expects",
-                mapping.size
-            );
-            let _ = self.rutabaga.unmap(resource_id);
-            self.window.release(res_size);
-            return Err(ErrUnspec);
-        }
+        if !placed {
+            // The slow path, for a resource virglrenderer will not place and for
+            // a host where the window could not be reserved at all.
+            //
+            // The obvious alternative -- export the resource as a dmabuf and map
+            // the fd -- cannot work on stock amdgpu. RADV creates buffers with
+            // AMDGPU_GEM_CREATE_VM_ALWAYS_VALID, and `amdgpu_gem_prime_export`
+            // refuses those with EPERM unconditionally.
+            let at = std::time::Instant::now();
+            let mapped = self.rutabaga.map(resource_id);
+            self.metrics.counters.rutabaga_map.since(at);
+            let mapping = match mapped {
+                Ok(m) => m,
+                Err(e) => {
+                    self.window.release(res_size);
+                    log::error!(
+                        "NESBOX_GPU: map_blob: resource {resource_id} would not map: {e:?}"
+                    );
+                    return Err(ErrUnspec);
+                }
+            };
 
-        let guest_addr = shm_region.guest_addr + offset;
-        if let Err(err) = self.mapper.map(guest_addr, mapping.ptr, mapping.size) {
-            log::error!(
-                "NESBOX_GPU: map_blob: could not publish {:#x} bytes at guest {guest_addr:#x}: {err:#}",
-                mapping.size
-            );
-            let _ = self.rutabaga.unmap(resource_id);
-            self.window.release(res_size);
-            return Err(ErrUnspec);
+            if mapping.size < res_size {
+                log::error!(
+                    "NESBOX_GPU: map_blob: resource {resource_id} mapped {:#x} bytes, \
+                     short of the {res_size:#x} the guest expects",
+                    mapping.size
+                );
+                let _ = self.rutabaga.unmap(resource_id);
+                self.window.release(res_size);
+                return Err(ErrUnspec);
+            }
+
+            let at = std::time::Instant::now();
+            let published = self.mapper.map(guest_addr, mapping.ptr, mapping.size);
+            self.metrics.counters.kvm_map.since(at);
+            if let Err(err) = published {
+                log::error!(
+                    "NESBOX_GPU: map_blob: could not publish {:#x} bytes at guest \
+                     {guest_addr:#x}: {err:#}",
+                    mapping.size
+                );
+                let _ = self.rutabaga.unmap(resource_id);
+                self.window.release(res_size);
+                return Err(ErrUnspec);
+            }
         }
 
         let resource = self
@@ -919,9 +1026,43 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
         resource.shmem_offset = Some(offset);
-        resource.rutabaga_external_mapping = true;
+        resource.rutabaga_external_mapping = !placed;
+        resource.placed = placed;
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+        })
+    }
+
+    /// Take a mapping away from the guest, by whichever means made it.
+    ///
+    /// **The one place that decides between the two.** They were separate once
+    /// and disagreed -- `resource_unmap_blob` removed a slot while
+    /// `unref_resource` did not -- and the guest went on addressing host memory
+    /// the renderer had freed. Both callers now ask this.
+    fn withdraw_mapping(
+        &self,
+        resource: &VirtioGpuResource,
+        guest_addr: u64,
+    ) -> std::result::Result<(), ()> {
+        if resource.placed {
+            // Overwritten with PROT_NONE rather than unmapped, and
+            // virglrenderer is *not* told: it never recorded this mapping, so
+            // its `resource_unmap` would refuse it with EINVAL, and if it ever
+            // stopped refusing it would `munmap` a hole in the middle of the
+            // window the guest still has a memory slot over.
+            let at = std::time::Instant::now();
+            let withdrawn = self.mapper.withdraw(guest_addr, resource.size);
+            self.metrics.counters.placed_withdraw.since(at);
+            return withdrawn.map_err(|err| {
+                log::error!("NESBOX_GPU: withdrawing {guest_addr:#x}: {err:#}");
+            });
+        }
+
+        let at = std::time::Instant::now();
+        let removed = self.mapper.unmap(guest_addr, resource.size);
+        self.metrics.counters.kvm_unmap.since(at);
+        removed.map_err(|err| {
+            log::error!("NESBOX_GPU: unmapping {guest_addr:#x}: {err:#}");
         })
     }
 
@@ -941,17 +1082,18 @@ impl VirtioGpu {
         // disagree about whether a resource is mapped or where.
         let guest_addr = resource.mapped_at(shm_region).ok_or(ErrUnspec)?;
 
-        // Take it away from the guest first: virglrenderer's mapping must not
-        // be released while the guest can still reach it.
-        if let Err(err) = self.mapper.unmap(guest_addr, size) {
+        // Take it away from the guest first: the renderer's mapping must not be
+        // released while the guest can still reach it.
+        let snapshot = *resource;
+        if self.withdraw_mapping(&snapshot, guest_addr).is_err() {
             // Not worth ending the VM over one resource.
-            log::error!(
-                "NESBOX_GPU: unmap_blob: resource {resource_id} at {guest_addr:#x}: {err:#}"
-            );
             return Err(ErrUnspec);
         }
         if external {
-            if let Err(e) = self.rutabaga.unmap(resource_id) {
+            let at = std::time::Instant::now();
+            let released = self.rutabaga.unmap(resource_id);
+            self.metrics.counters.rutabaga_unmap.since(at);
+            if let Err(e) = released {
                 log::warn!(
                     "NESBOX_GPU: unmap_blob: virglrenderer kept resource {resource_id} mapped: {e:?}"
                 );
@@ -964,6 +1106,7 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
         resource.shmem_offset = None;
         resource.rutabaga_external_mapping = false;
+        resource.placed = false;
         self.window.release(size);
         Ok(OkNoData)
     }
