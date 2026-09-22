@@ -2,8 +2,22 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// A box's configuration, as the caller wrote it.
+///
+/// `deny_unknown_fields` on purpose. A key this build does not understand is
+/// almost always one of two things, and both are worse silently: a typo, or a
+/// config written for a build that has a feature this one does not. The second
+/// is not hypothetical -- a config asking for `gpu-forward` was handed to a
+/// nesbox built before that device existed, and it booted a guest with no GPU
+/// and said nothing. The guest came up, the forwarding backend sat waiting on
+/// a socket nobody connected to, and the failure surfaced as a driver inside
+/// the guest finding no hardware.
+///
+/// Refusing the config names the key instead, at the point the mistake was
+/// made. The nested sections that already did this (`Gpu`, `GpuForward`) were
+/// right; the top level was the one that most needed it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct VmConfig {
     #[serde(default)]
     pub boot_source: BootSource,
@@ -438,5 +452,54 @@ mod whole_config_tests {
     #[test]
     fn a_tap_name_is_required() {
         assert!(serde_json::from_str::<Network>(r#"{ "mac": "02:00:00:00:00:01" }"#).is_err());
+    }
+
+    /// A key this build does not know is refused, not dropped.
+    ///
+    /// The case that prompted it: a config naming `gpu-forward` handed to a
+    /// nesbox built before that device existed. It parsed, the key was
+    /// dropped, and the guest booted with no GPU while the forwarding backend
+    /// waited on a socket nobody connected to. The key here stands in for
+    /// whatever the *next* such device is called -- this build knows
+    /// `gpu-forward`, so using it would test nothing.
+    #[test]
+    fn a_config_key_this_build_does_not_know_is_refused() {
+        let err = serde_json::from_str::<VmConfig>(
+            r#"{ "machine-config": { "vcpu_count": 2 },
+                 "some-device-a-later-build-adds": { "socket": "/tmp/x.sock" } }"#,
+        )
+        .expect_err("an unknown section must not be silently dropped");
+        assert!(
+            err.to_string().contains("some-device-a-later-build-adds"),
+            "the error must name the key that was not understood, got: {err}"
+        );
+    }
+
+    /// A misspelling is the same failure wearing different clothes, and is
+    /// the commoner one.
+    #[test]
+    fn a_misspelled_key_is_refused_rather_than_ignored() {
+        let err = serde_json::from_str::<VmConfig>(
+            r#"{ "machine_config": { "vcpu_count": 2 } }"#,
+        )
+        .expect_err("machine_config is not machine-config");
+        assert!(err.to_string().contains("machine_config"), "got: {err}");
+    }
+
+    /// And the same config against a build that does know it still parses, so
+    /// the check above is catching the unknown key and not the shape.
+    #[test]
+    fn the_same_config_parses_where_the_device_exists() {
+        let c: VmConfig = serde_json::from_str(
+            r#"{ "machine-config": { "vcpu_count": 2 },
+                 "gpu-forward": { "socket": "/tmp/nvgpu.sock" },
+                 "shared-directories": [
+                   { "tag": "nvidia", "path-on-host": "/var/lib/nvgpu", "read-only": true }
+                 ] }"#,
+        )
+        .expect("every key here is one this build understands");
+        assert_eq!(c.gpu_forward.expect("gpu-forward kept").socket,
+                   PathBuf::from("/tmp/nvgpu.sock"));
+        assert!(c.shared_directories[0].read_only);
     }
 }
