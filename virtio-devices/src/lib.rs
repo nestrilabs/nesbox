@@ -4,6 +4,7 @@ mod console;
 mod fs;
 pub mod gpu;
 mod net;
+mod nvgpu;
 pub mod tap;
 mod vsock;
 //pub mod gpu;
@@ -16,4 +17,5 @@ pub use gpu::{
     PhaseSnapshot,
 };
 pub use net::{NetConfig, NetDevice};
+pub use nvgpu::NvGpuDevice;
 pub use vsock::VsockDevice;

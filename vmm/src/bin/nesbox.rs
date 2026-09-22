@@ -15,7 +15,7 @@ use termios::*;
 use virtio_devices::gpu::display::DisplayInfo;
 use virtio_devices::{
     BlkConfig, BlkDevice, ConsoleDevice, FsDevice, GpuConfig, GpuDevice, NetConfig, NetDevice,
-    VsockDevice,
+    NvGpuDevice, VsockDevice,
 };
 
 /// BAR index the GPU puts its shared memory window in.
@@ -326,6 +326,25 @@ fn main() -> Result<()> {
     // kills virtiofsd.
     let runtime_dir = std::env::temp_dir().join(format!("nesbox-{}", std::process::id()));
     let mut fs_daemons = Vec::new();
+    // ── GPU ioctl forwarding ──────────────────────────────────────────────
+    // Attached before the filesystem shares so its PCI slot does not move when
+    // a share is added or removed: a guest that enumerates a different slot
+    // across boots binds its driver to a different device.
+    if let Some(forward) = &config.gpu_forward {
+        let device = NvGpuDevice::new(&forward.socket, vm.mem.clone())
+            .with_context(|| format!("GPU forwarding backend at {}", forward.socket.display()))?;
+        let vectors = irq
+            .allocate_msi_vectors(3)
+            .context("virtio-gpu-nv MSI-X vectors")?;
+        let intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("virtio-gpu-nv INTx")?;
+        device.bind_interrupts(vectors, irq.clone(), intx);
+        let bdf = pci_bus.add_device(device)?;
+        info!("virtio-gpu-nv at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
+        next_slot += 1;
+    }
+
     for shared in &config.shared_directories {
         let daemon = Virtiofsd::spawn(
             &shared.tag,

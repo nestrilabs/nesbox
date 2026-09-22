@@ -23,6 +23,14 @@ pub struct VmConfig {
     /// Optional GPU. Absent means the guest has no display device.
     #[serde(default)]
     pub gpu: Option<Gpu>,
+    /// Optional GPU ioctl forwarding device.
+    ///
+    /// Independent of `gpu`: that one gives the guest a rendering device this
+    /// process drives, while this one carries the guest's own driver ioctls to
+    /// a separate backend. A guest may have either, or in principle both,
+    /// since they are different devices serving different guest drivers.
+    #[serde(default, rename = "gpu-forward")]
+    pub gpu_forward: Option<GpuForward>,
     /// Unix socket to serve a JSON metrics snapshot on. Absent means no surface,
     /// which is right for a hand-driven box and wrong for a supervised one.
     #[serde(default, rename = "stats-socket")]
@@ -55,6 +63,18 @@ pub struct VmConfig {
 
 fn default_seccomp() -> String {
     "enforce".to_string()
+}
+
+/// GPU ioctl forwarding over a vhost-user backend.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct GpuForward {
+    /// Unix socket a forwarding backend is already listening on.
+    ///
+    /// The backend is started separately and holds the real host device
+    /// descriptors. This process only carries the transport, so it needs no
+    /// access to the GPU itself.
+    pub socket: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
