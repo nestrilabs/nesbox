@@ -355,8 +355,9 @@ impl NvGpuDevice {
         // 206 NV_ESC_ALLOC_OS_EVENT   after hClient and hDevice
         // 207 NV_ESC_FREE_OS_EVENT    same layout as alloc
         //  39 NV_ESC_RM_ALLOC_MEMORY
+        //  78 NV_ESC_RM_MAP_MEMORY    the fd the mapping is made on
         const FD_CARRYING_IOCTLS: &[(u32, u32)] =
-            &[(201, 0), (206, 8), (207, 8), (39, 48)];
+            &[(201, 0), (206, 8), (207, 8), (39, 48), (78, 48)];
 
         let version = driver_version(proc_root).with_context(|| {
             format!(
