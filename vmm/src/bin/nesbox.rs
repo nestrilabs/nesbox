@@ -331,7 +331,7 @@ fn main() -> Result<()> {
     // a share is added or removed: a guest that enumerates a different slot
     // across boots binds its driver to a different device.
     if let Some(forward) = &config.gpu_forward {
-        let device = NvGpuDevice::new(&forward.socket, vm.mem.clone())
+        let device = NvGpuDevice::new(&forward.socket, &forward.proc_nvidia, vm.mem.clone())
             .with_context(|| format!("GPU forwarding backend at {}", forward.socket.display()))?;
         let vectors = irq
             .allocate_msi_vectors(3)

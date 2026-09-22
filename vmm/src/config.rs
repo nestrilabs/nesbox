@@ -75,6 +75,16 @@ pub struct GpuForward {
     /// descriptors. This process only carries the transport, so it needs no
     /// access to the GPU itself.
     pub socket: PathBuf,
+    /// Where the host GPU driver publishes itself.
+    ///
+    /// Overridable so the device can be exercised against a fixture tree
+    /// rather than a live driver.
+    #[serde(default = "default_proc_nvidia")]
+    pub proc_nvidia: PathBuf,
+}
+
+fn default_proc_nvidia() -> PathBuf {
+    PathBuf::from("/proc/driver/nvidia")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

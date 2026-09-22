@@ -8,13 +8,17 @@
 //!
 //! Two things make this device's shape differ from the others here.
 //!
-//! **Device config is large and comes from the backend.** The guest driver
-//! reads an 8912-byte structure describing the host driver version and the
-//! GPUs it owns. Those are facts about the host that only the backend knows,
-//! so they are fetched over `VHOST_USER_GET_CONFIG` rather than built locally.
-//! The guest reads them during probe, before it sets DRIVER_OK, so the
-//! handshake needed for a config read is completed when the device is created
-//! rather than when it is activated.
+//! **Device config is built here, not fetched.** The guest driver reads a
+//! structure describing the host driver version and the GPUs it owns, at fixed
+//! offsets. The obvious source is the backend, over `VHOST_USER_GET_CONFIG` --
+//! but that message caps `offset + size` at 4096 bytes. It is therefore
+//! assembled here from what the kernel publishes under `/proc/driver/nvidia`,
+//! the same way virtio-fs builds its own tag config locally.
+//!
+//! Two independent 4 KiB limits meet here, which is worth knowing before
+//! anyone tries to grow this structure: the vhost-user config message is one,
+//! and a guest mapping device config with PAGE_SIZE as its maximum is the
+//! other. Neither is in this code, and neither can be raised from it.
 //!
 //! **It cannot use the common BAR layout.** That layout leaves 256 bytes
 //! between the ISR and notify regions for device config, which is 35 times too
@@ -29,9 +33,7 @@ use pci::{MsiRouter, MsiVector, PciDevice};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use vhost::vhost_user::message::{
-    VhostUserConfigFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
-};
+use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost::vhost_user::{Frontend, VhostUserFrontend};
 use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
@@ -53,12 +55,11 @@ const PCI_DEVICE_ID: u16 = 0x1040 + VIRTIO_ID_GPU_NV;
 
 /// Size of the guest-visible device configuration structure.
 ///
-/// Most of it is a per-GPU block of descriptive text, which is why it is large
-/// for a virtio config space. Carrying that over the control queue instead
-/// would shrink this by an order of magnitude, but the layout is a contract
-/// with a guest driver that reads it at fixed offsets, so it is matched rather
-/// than improved here.
-const CONFIG_LEN: usize = 8912;
+/// It must fit in one page. A guest maps the device config capability with
+/// PAGE_SIZE as its maximum and silently truncates anything longer, so a
+/// larger layout is not merely wasteful: every field past 4096 reads back out
+/// of range and takes the guest driver down inside virtio_cread_bytes.
+const CONFIG_LEN: usize = 4016;
 
 // ── BAR 0 layout, local to this device ──────────────────────────────────────
 // Small regions first, config last and page aligned, so growing config moves
@@ -104,11 +105,35 @@ impl Inner {
         VIRTIO_F_VERSION_1
     }
 
-    /// Hand the queues over. The ownership and feature handshake already ran
-    /// when the device was created, because config had to be readable first.
+    /// Complete the vhost-user handshake and hand over the queues.
     fn activate(&mut self) -> Result<()> {
         if self.running {
             return Ok(());
+        }
+
+        self.frontend.set_owner().context("VHOST_USER_SET_OWNER")?;
+
+        let backend_features = self
+            .frontend
+            .get_features()
+            .context("VHOST_USER_GET_FEATURES")?;
+        let protocol_bit = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let acked = (self.com.df & self.features()) | (backend_features & protocol_bit);
+        self.frontend
+            .set_features(acked)
+            .context("VHOST_USER_SET_FEATURES")?;
+
+        if backend_features & protocol_bit != 0 {
+            let offered = self
+                .frontend
+                .get_protocol_features()
+                .context("VHOST_USER_GET_PROTOCOL_FEATURES")?;
+            // Only the ones we implement: there is no backend-request channel
+            // here, so BACKEND_REQ stays unacknowledged.
+            let wanted = VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::REPLY_ACK;
+            self.frontend
+                .set_protocol_features(offered & wanted)
+                .context("VHOST_USER_SET_PROTOCOL_FEATURES")?;
         }
 
         let regions = self.memory_regions()?;
@@ -231,21 +256,42 @@ fn new_queues() -> [QState; NUM_QUEUES] {
     })
 }
 
+/// The host GPU driver version, as its procfs reports it.
+///
+/// Matched by shape rather than by field position: the wording around the
+/// number differs between driver builds and has changed before, but a bare
+/// three-part dotted number in that line has not.
+fn driver_version(proc_root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(proc_root.join("version")).ok()?;
+    text.split_whitespace()
+        .find(|w| {
+            let mut parts = w.split('.');
+            let num = |p: Option<&str>| {
+                p.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            };
+            num(parts.next()) && num(parts.next()) && num(parts.next()) && parts.next().is_none()
+        })
+        .map(str::to_string)
+}
+
 pub struct NvGpuDevice {
     inner: Mutex<Inner>,
 }
 
 impl NvGpuDevice {
     /// Connect to a forwarding backend already listening on `socket_path`.
-    pub fn new(socket_path: &Path, mem: Arc<GuestMemoryMmap>) -> Result<Self> {
-        let mut frontend = Frontend::connect(socket_path, NUM_QUEUES as u64).with_context(|| {
+    pub fn new(socket_path: &Path, proc_root: &Path, mem: Arc<GuestMemoryMmap>) -> Result<Self> {
+        // Built before connecting: if this host cannot describe a GPU there is
+        // no point holding a backend socket open, and the reason is clearer
+        // here than after a handshake.
+        let device_config = Self::build_device_config(proc_root)?;
+
+        let frontend = Frontend::connect(socket_path, NUM_QUEUES as u64).with_context(|| {
             format!(
                 "failed to connect to the GPU forwarding backend at {}",
                 socket_path.display()
             )
         })?;
-
-        let device_config = Self::handshake_and_read_config(&mut frontend)?;
 
         let kick_fds = (0..NUM_QUEUES)
             .map(|_| EventFd::new(0).context("failed to create virtio-gpu-nv kick eventfd"))
@@ -275,70 +321,126 @@ impl NvGpuDevice {
         })
     }
 
-    /// Take ownership, negotiate enough to read config, and read it.
+    /// Assemble the guest-visible device configuration.
     ///
-    /// This runs at creation rather than at activation because the guest reads
-    /// device config during probe, long before it sets DRIVER_OK. A device that
-    /// waited would answer that read with zeros, and the guest driver rejects a
-    /// zero GPU count -- failing probe with nothing to say why.
-    fn handshake_and_read_config(frontend: &mut Frontend) -> Result<Vec<u8>> {
-        frontend.set_owner().context("VHOST_USER_SET_OWNER")?;
+    /// Every offset here is read by a guest driver that will not tell you when
+    /// it disagrees: a wrong one shows up as a failed probe with no detail, so
+    /// they are named as constants and asserted in tests rather than written
+    /// inline.
+    fn build_device_config(proc_root: &Path) -> Result<Vec<u8>> {
+        const OFF_DRIVER_VERSION: usize = 0;
+        const LEN_DRIVER_VERSION: usize = 32;
+        const OFF_NUM_GPUS: usize = 32;
+        const OFF_GPUS: usize = 72;
+        const SLOT_LEN: usize = 476;
+        const SLOT_PCI_ADDR: usize = 0;
+        const LEN_PCI_ADDR: usize = 16;
+        const SLOT_MINOR: usize = 16;
+        const SLOT_INFO_LEN: usize = 20;
+        const SLOT_INFO_TEXT: usize = 28;
+        const LEN_INFO_TEXT: usize = 448;
+        const MAX_GPUS: usize = 8;
+        const OFF_NUM_FD_TRANSLATIONS: usize = 3880;
+        const OFF_FD_TRANSLATIONS: usize = 3888;
 
-        let backend_features = frontend
-            .get_features()
-            .context("VHOST_USER_GET_FEATURES")?;
-        let protocol_bit = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
-        anyhow::ensure!(
-            backend_features & protocol_bit != 0,
-            "backend does not offer protocol features, so its device config cannot be read"
-        );
-        frontend
-            .set_features((backend_features & VIRTIO_F_VERSION_1) | protocol_bit)
-            .context("VHOST_USER_SET_FEATURES")?;
+        // Which ioctls carry a file descriptor, and where it sits in the
+        // parameter struct. The guest driver rewrites a descriptor only for an
+        // ioctl named here; for any other it forwards the guest's own fd
+        // number, which means nothing on the host, and the backend refuses the
+        // call. Publishing an empty table is therefore not a degraded mode: it
+        // is the difference between nvidia-smi working and it reporting
+        // "Unable to determine the device handle for GPU0".
+        //
+        // 201 NV_ESC_REGISTER_FD      the descriptor is the whole struct
+        // 206 NV_ESC_ALLOC_OS_EVENT   after hClient and hDevice
+        // 207 NV_ESC_FREE_OS_EVENT    same layout as alloc
+        //  39 NV_ESC_RM_ALLOC_MEMORY
+        const FD_CARRYING_IOCTLS: &[(u32, u32)] =
+            &[(201, 0), (206, 8), (207, 8), (39, 48)];
 
-        let offered = frontend
-            .get_protocol_features()
-            .context("VHOST_USER_GET_PROTOCOL_FEATURES")?;
-        anyhow::ensure!(
-            offered.contains(VhostUserProtocolFeatures::CONFIG),
-            "backend does not support VHOST_USER_PROTOCOL_F_CONFIG, so it cannot describe \
-             the host GPUs to the guest"
-        );
-        // Only what we implement: there is no backend-request channel here, so
-        // BACKEND_REQ stays unacknowledged.
-        let wanted = VhostUserProtocolFeatures::MQ
-            | VhostUserProtocolFeatures::REPLY_ACK
-            | VhostUserProtocolFeatures::CONFIG;
-        frontend
-            .set_protocol_features(offered & wanted)
-            .context("VHOST_USER_SET_PROTOCOL_FEATURES")?;
-
-        let (_, payload) = frontend
-            .get_config(
-                0,
-                CONFIG_LEN as u32,
-                VhostUserConfigFlags::WRITABLE,
-                &vec![0u8; CONFIG_LEN],
+        let version = driver_version(proc_root).with_context(|| {
+            format!(
+                "no GPU driver version under {}; is the host kernel module loaded?",
+                proc_root.display()
             )
-            .context("VHOST_USER_GET_CONFIG")?;
+        })?;
 
-        let mut config = payload.to_vec();
+        let mut addrs: Vec<String> = std::fs::read_dir(proc_root.join("gpus"))
+            .with_context(|| format!("no GPUs listed under {}", proc_root.display()))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        // readdir order is not stable, and a guest that sees its GPUs in a
+        // different order across boots addresses the wrong card.
+        addrs.sort();
         anyhow::ensure!(
-            !config.is_empty(),
-            "backend returned no device config; the guest driver cannot probe without it"
+            !addrs.is_empty(),
+            "the host driver is loaded but owns no GPUs; the guest driver rejects an empty table"
         );
-        // A backend built against a different revision may answer short. Pad
-        // rather than fail: the guest reads fixed offsets, and a short buffer
-        // would otherwise be a panic on the first read past the end.
-        if config.len() < CONFIG_LEN {
+
+        let mut cfg = vec![0u8; CONFIG_LEN];
+        let put = |cfg: &mut [u8], at: usize, bytes: &[u8], cap: usize| {
+            let n = bytes.len().min(cap);
+            cfg[at..at + n].copy_from_slice(&bytes[..n]);
+            n
+        };
+
+        // One byte short of the field, so the terminator the guest writes over
+        // the last byte lands on padding rather than on a character.
+        put(
+            &mut cfg,
+            OFF_DRIVER_VERSION,
+            version.as_bytes(),
+            LEN_DRIVER_VERSION - 1,
+        );
+
+        let count = addrs.len().min(MAX_GPUS);
+        if addrs.len() > MAX_GPUS {
             log::warn!(
-                "backend returned {} bytes of config, expected {CONFIG_LEN}; padding",
-                config.len()
+                "host has {} GPUs; config space describes {MAX_GPUS}, so the rest are not offered",
+                addrs.len()
             );
-            config.resize(CONFIG_LEN, 0);
         }
-        config.truncate(CONFIG_LEN);
-        Ok(config)
+        cfg[OFF_NUM_GPUS..OFF_NUM_GPUS + 4].copy_from_slice(&(count as u32).to_le_bytes());
+
+        for (i, addr) in addrs.iter().take(count).enumerate() {
+            let base = OFF_GPUS + i * SLOT_LEN;
+            put(
+                &mut cfg,
+                base + SLOT_PCI_ADDR,
+                addr.as_bytes(),
+                LEN_PCI_ADDR - 1,
+            );
+            // The index is the minor only because the kernel numbers the device
+            // nodes in the same order it lists these directories in.
+            cfg[base + SLOT_MINOR..base + SLOT_MINOR + 4].copy_from_slice(&(i as u32).to_le_bytes());
+
+            let info = std::fs::read_to_string(proc_root.join("gpus").join(addr).join("information"))
+                .unwrap_or_default();
+            let n = put(
+                &mut cfg,
+                base + SLOT_INFO_TEXT,
+                info.as_bytes(),
+                LEN_INFO_TEXT,
+            );
+            cfg[base + SLOT_INFO_LEN..base + SLOT_INFO_LEN + 4]
+                .copy_from_slice(&(n as u32).to_le_bytes());
+        }
+
+        for (i, (nr, off)) in FD_CARRYING_IOCTLS.iter().enumerate() {
+            let at = OFF_FD_TRANSLATIONS + i * 8;
+            cfg[at..at + 4].copy_from_slice(&nr.to_le_bytes());
+            cfg[at + 4..at + 8].copy_from_slice(&off.to_le_bytes());
+        }
+        cfg[OFF_NUM_FD_TRANSLATIONS..OFF_NUM_FD_TRANSLATIONS + 4]
+            .copy_from_slice(&(FD_CARRYING_IOCTLS.len() as u32).to_le_bytes());
+
+        log::info!(
+            "virtio-gpu-nv: host driver {version}, {count} GPU(s), {} fd-translation ioctl(s)",
+            FD_CARRYING_IOCTLS.len()
+        );
+        Ok(cfg)
     }
 
     pub fn bind_interrupts(
@@ -532,6 +634,131 @@ mod tests {
 
     /// The guest driver reads these at fixed offsets and rejects what it does
     /// not recognise, so they are a contract rather than a choice.
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new(files: &[(&str, &str)]) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "nvgpu-cfg-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).expect("mkdir");
+            for (path, body) in files {
+                let p = base.join(path);
+                std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+                std::fs::write(&p, body).expect("write");
+            }
+            Self(base)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const VERSION_LINE: &str =
+        "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  615.71.09  Release Build\n";
+
+    fn u32_at(cfg: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(cfg[off..off + 4].try_into().expect("4 bytes"))
+    }
+
+    #[test]
+    fn config_is_the_length_the_guest_driver_expects() {
+        let f = Fixture::new(&[
+            ("version", VERSION_LINE),
+            ("gpus/0000:01:00.0/information", "Model: NVIDIA RTX A2000\n"),
+        ]);
+        let cfg = NvGpuDevice::build_device_config(f.path()).expect("config");
+        assert_eq!(cfg.len(), CONFIG_LEN);
+    }
+
+    /// The offsets the driver reads by hand. A wrong one is a failed probe with
+    /// no explanation, so each is checked against a known input.
+    #[test]
+    fn fields_land_where_the_guest_driver_reads_them() {
+        let f = Fixture::new(&[
+            ("version", VERSION_LINE),
+            ("gpus/0000:01:00.0/information", "Model: NVIDIA RTX A2000\n"),
+        ]);
+        let cfg = NvGpuDevice::build_device_config(f.path()).expect("config");
+
+        assert_eq!(&cfg[0..9], b"615.71.09", "driver version at offset 0");
+        assert_eq!(u32_at(&cfg, 32), 1, "num_gpus at offset 32");
+        assert_eq!(&cfg[72..84], b"0000:01:00.0", "first pci_addr at offset 72");
+        assert_eq!(u32_at(&cfg, 72 + 16), 0, "minor at slot offset 16");
+        assert_eq!(
+            u32_at(&cfg, 72 + 20) as usize,
+            "Model: NVIDIA RTX A2000\n".len(),
+            "info_len at slot offset 20"
+        );
+        assert_eq!(&cfg[100..105], b"Model", "info_text at slot offset 28");
+    }
+
+    #[test]
+    fn gpus_are_ordered_by_pci_address_not_readdir_order() {
+        let f = Fixture::new(&[
+            ("version", VERSION_LINE),
+            ("gpus/0000:41:00.0/information", "C\n"),
+            ("gpus/0000:01:00.0/information", "A\n"),
+            ("gpus/0000:21:00.0/information", "B\n"),
+        ]);
+        let cfg = NvGpuDevice::build_device_config(f.path()).expect("config");
+        assert_eq!(u32_at(&cfg, 32), 3);
+        let addr = |i: usize| String::from_utf8_lossy(&cfg[72 + i * 476..72 + i * 476 + 12]).into_owned();
+        assert_eq!(addr(0), "0000:01:00.0");
+        assert_eq!(addr(1), "0000:21:00.0");
+        assert_eq!(addr(2), "0000:41:00.0");
+    }
+
+    /// The guest driver rejects num_gpus == 0, so a host that cannot describe
+    /// one must fail here, where the reason can be given.
+    #[test]
+    fn a_host_with_no_driver_is_refused_with_a_reason() {
+        let empty = Fixture::new(&[]);
+        let err = NvGpuDevice::build_device_config(empty.path())
+            .expect_err("a host with no driver must not yield a config");
+        assert!(
+            format!("{err:#}").contains("driver version"),
+            "unhelpful error: {err:#}"
+        );
+
+        let no_gpus = Fixture::new(&[("version", VERSION_LINE), ("gpus/.keep", "")]);
+        assert!(NvGpuDevice::build_device_config(no_gpus.path()).is_err());
+    }
+
+    /// An information file longer than the window must be truncated, and the
+    /// length written must match what was actually copied.
+    #[test]
+    fn an_over_long_information_file_is_truncated_honestly() {
+        let big = "Model: X\n".repeat(500);
+        let f = Fixture::new(&[
+            ("version", VERSION_LINE),
+            ("gpus/0000:01:00.0/information", big.as_str()),
+        ]);
+        let cfg = NvGpuDevice::build_device_config(f.path()).expect("config");
+        assert_eq!(u32_at(&cfg, 72 + 20), 448, "info_len must match the copy");
+        // The next slot must not have been written into.
+        assert_eq!(&cfg[72 + 476..72 + 476 + 4], &[0, 0, 0, 0]);
+    }
+
+    /// A guest maps device config with PAGE_SIZE as its maximum and truncates
+    /// the rest without saying so, so this is not a budget but a wall.
+    #[test]
+    fn config_fits_in_one_page() {
+        assert!(
+            CONFIG_LEN <= 4096,
+            "config is {CONFIG_LEN} bytes; a guest cannot read past 4096"
+        );
+    }
+
     #[test]
     fn pci_identity_matches_the_guest_driver() {
         assert_eq!(VIRTIO_ID_GPU_NV, 45);
