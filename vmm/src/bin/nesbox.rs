@@ -253,6 +253,10 @@ fn main() -> Result<()> {
     // or removed. Its shared window is a real memory slot, taken after the
     // ones guest RAM already occupies.
     let mut stats_gpu = None;
+    // One allocator for both windowed devices. Two would each start numbering
+    // at the first slot past guest RAM and hand out the same numbers.
+    let memory_slots = MemorySlots::new(vm.vm_fd.clone(), vm.ram_slot_count);
+
     if let Some(gpu_cfg) = &config.gpu {
         // The VRAM limit is enforced inside virglrenderer, which reads it from
         // the environment: the refusal has to happen where it can be reported to
@@ -266,7 +270,7 @@ fn main() -> Result<()> {
             unsafe { std::env::set_var("NESTRI_VRAM_LIMIT_MIB", mib.to_string()) };
         }
 
-        let slots = MemorySlots::new(vm.vm_fd.clone(), vm.ram_slot_count);
+        let slots = memory_slots.clone();
         let window_slots = slots.clone();
         let gpu_device = Arc::new(GpuDevice::new(
             &GpuConfig {
@@ -331,8 +335,11 @@ fn main() -> Result<()> {
     // a share is added or removed: a guest that enumerates a different slot
     // across boots binds its driver to a different device.
     if let Some(forward) = &config.gpu_forward {
-        let device = NvGpuDevice::new(&forward.socket, &forward.proc_nvidia, vm.mem.clone())
-            .with_context(|| format!("GPU forwarding backend at {}", forward.socket.display()))?;
+        let device = Arc::new(
+            NvGpuDevice::new(&forward.socket, &forward.proc_nvidia, vm.mem.clone()).with_context(
+                || format!("GPU forwarding backend at {}", forward.socket.display()),
+            )?,
+        );
         let vectors = irq
             .allocate_msi_vectors(3)
             .context("virtio-gpu-nv MSI-X vectors")?;
@@ -340,8 +347,28 @@ fn main() -> Result<()> {
             .legacy_irqfd(acpi_slot_gsi(next_slot))
             .context("virtio-gpu-nv INTx")?;
         device.bind_interrupts(vectors, irq.clone(), intx);
-        let bdf = pci_bus.add_device(device)?;
-        info!("virtio-gpu-nv at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
+        device.bind_mapper(memory_slots.clone());
+        let bdf = pci_bus.add_device_arc(device.clone())?;
+        // The window has to appear wherever the bus put BAR 2, so the device
+        // only learns its address now.
+        let shm_addr = pci_bus
+            .bar_address(bdf, NvGpuDevice::shm_bar())
+            .context("virtio-gpu-nv has no BAR 2")?;
+        device.set_shm_guest_addr(shm_addr);
+        // Reserved and registered once. A failure here is not fatal: the
+        // backend is simply never offered a request channel, and every mapping
+        // stays where the guest cannot reach it -- which is where this device
+        // was before the window existed.
+        if let Err(err) = memory_slots.open_window(shm_addr, NvGpuDevice::shm_bar_size()) {
+            log::warn!(
+                "virtio-gpu-nv window not reserved ({err:#}); device memory will not be \
+                 mappable by the guest"
+            );
+        }
+        info!(
+            "virtio-gpu-nv at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
+            bdf.0, bdf.1, bdf.2
+        );
         next_slot += 1;
     }
 

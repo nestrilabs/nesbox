@@ -27,14 +27,19 @@
 //! without moving anything else.
 
 use crate::common::*;
+use crate::gpu::HostMemoryMapper;
 use anyhow::{Context, Result};
 use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
-use pci::{MsiRouter, MsiVector, PciDevice};
-use std::os::fd::AsRawFd;
+use pci::{BarType, MsiRouter, MsiVector, PciDevice};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
-use vhost::vhost_user::{Frontend, VhostUserFrontend};
+use vhost::vhost_user::message::{
+    VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
+};
+use vhost::vhost_user::{
+    Frontend, FrontendReqHandler, HandlerResult, VhostUserFrontend, VhostUserFrontendReqHandler,
+};
 use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd;
@@ -77,6 +82,104 @@ const _: () = assert!(
     "device config does not fit in BAR 0"
 );
 
+/// BAR 2 is the shared window device memory appears in. BAR 1 is skipped
+/// because BAR 0 is 32-bit and BAR 2's high half occupies BAR 3.
+const SHM_BAR: usize = 2;
+
+/// The shared-memory id the guest driver looks the window up by. Zero is the
+/// "undefined" id, which a guest discards without a word.
+const NV_SHM_ID: u8 = 1;
+
+/// Size of the window, which must cover every offset the backend's allocator
+/// can hand out -- its three zones total exactly this.
+///
+/// Nothing is committed for it here. The reservation is PROT_NONE and the
+/// pages arrive only as the backend asks for them, one mapping at a time.
+const SHM_SIZE: u64 = 1 << 30; // 1 GiB
+
+/// Places backend mappings into the shared window.
+///
+/// The backend holds the real device descriptors, but it cannot do this
+/// placement itself. `MAP_FIXED` rewrites the calling process's page tables and
+/// nothing else, so a mapping made over there would never appear in the memory
+/// slot registered from here -- the guest would read the window's own zero
+/// pages and see no device at all. The descriptor therefore travels up and the
+/// mapping is made in this address space, which is the one the slot describes.
+struct WindowMapper {
+    mapper: Arc<dyn HostMemoryMapper>,
+    /// Guest physical base of BAR 2, known only once the bus assigns it.
+    guest_base: Mutex<Option<u64>>,
+}
+
+impl WindowMapper {
+    fn place(&self, req: &VhostUserMMap, fd: RawFd) -> std::io::Result<()> {
+        // Copied out first: the message is `repr(packed)`, so a reference to a
+        // field of it is unaligned and cannot be formatted or borrowed.
+        let (shm_offset, len, fd_offset, flags) =
+            (req.shm_offset, req.len, req.fd_offset, req.flags);
+
+        let base = self
+            .guest_base
+            .lock()
+            .unwrap()
+            .ok_or_else(|| std::io::Error::other("BAR 2 has no address yet"))?;
+
+        let guest_addr = base
+            .checked_add(shm_offset)
+            .ok_or_else(|| std::io::Error::other("window offset overflows"))?;
+
+        let host = self.mapper.host_addr(guest_addr, len).ok_or_else(|| {
+            std::io::Error::other(format!("{shm_offset:#x}+{len:#x} is outside the window"))
+        })?;
+
+        let prot = if flags & VhostUserMMapFlags::WRITABLE.bits() != 0 {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+
+        // SAFETY: `host` is inside the reservation this mapper owns, and the
+        // length was checked against it above.
+        let p = unsafe {
+            libc::mmap(
+                host as *mut libc::c_void,
+                len as usize,
+                prot,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd,
+                fd_offset as i64,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        log::debug!("window: placed {shm_offset:#x}+{len:#x} (guest {guest_addr:#x})");
+        Ok(())
+    }
+}
+
+impl VhostUserFrontendReqHandler for WindowMapper {
+    fn shmem_map(&self, req: &VhostUserMMap, fd: &dyn AsRawFd) -> HandlerResult<u64> {
+        self.place(req, fd.as_raw_fd()).map(|()| 0)
+    }
+
+    fn shmem_unmap(&self, req: &VhostUserMMap) -> HandlerResult<u64> {
+        // Overwrite rather than unmap: leaving a hole would let a later fault
+        // in this range reach no VMA at all, and the slot still describes it.
+        let base = self
+            .guest_base
+            .lock()
+            .unwrap()
+            .ok_or_else(|| std::io::Error::other("BAR 2 has no address yet"))?;
+        let (shm_offset, len) = (req.shm_offset, req.len);
+        let guest_addr = base.saturating_add(shm_offset);
+        self.mapper
+            .withdraw(guest_addr, len)
+            .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+        Ok(0)
+    }
+}
+
 struct Inner {
     com: ComCfg,
     qs: u16,
@@ -88,6 +191,9 @@ struct Inner {
     cfg: [u8; 256],
     msix_cap: u16,
     frontend: Frontend,
+    /// Present once a mapper is bound. Without it the backend is never given a
+    /// request channel and keeps its mappings to itself.
+    window: Option<Arc<WindowMapper>>,
     kick_fds: Vec<EventFd>,
     running: bool,
     /// Device config as the backend reported it at creation.
@@ -128,12 +234,27 @@ impl Inner {
                 .frontend
                 .get_protocol_features()
                 .context("VHOST_USER_GET_PROTOCOL_FEATURES")?;
-            // Only the ones we implement: there is no backend-request channel
-            // here, so BACKEND_REQ stays unacknowledged.
-            let wanted = VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::REPLY_ACK;
+            // Only the ones we implement. BACKEND_REQ opens the channel the
+            // backend asks for mappings on, and SHMEM is what gates the
+            // mapping request itself -- the backend refuses to send one
+            // without it, so asking for the channel alone achieves nothing.
+            let mut wanted =
+                VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::REPLY_ACK;
+            // The backend only gets a request channel if there is a window for
+            // it to place mappings in. Without one it must keep every mapping
+            // to itself, which is the state this device shipped in.
+            if self.window.is_some() {
+                wanted |= VhostUserProtocolFeatures::BACKEND_REQ
+                    | VhostUserProtocolFeatures::SHMEM;
+            }
+            let agreed = offered & wanted;
             self.frontend
-                .set_protocol_features(offered & wanted)
+                .set_protocol_features(agreed)
                 .context("VHOST_USER_SET_PROTOCOL_FEATURES")?;
+
+            if agreed.contains(VhostUserProtocolFeatures::BACKEND_REQ) {
+                self.start_backend_requests()?;
+            }
         }
 
         let regions = self.memory_regions()?;
@@ -206,6 +327,44 @@ impl Inner {
     }
 
     /// Describe guest RAM to the backend, including the fd it must map.
+    /// Hand the backend a channel it can send mapping requests on, and serve
+    /// it until the connection closes.
+    fn start_backend_requests(&mut self) -> Result<()> {
+        let window = self
+            .window
+            .clone()
+            .context("a request channel was negotiated without a window")?;
+
+        let mut handler =
+            FrontendReqHandler::new(window).context("creating the backend request channel")?;
+        // Without this the handler never sends the acknowledgement, while the
+        // backend -- which negotiated REPLY_ACK on the same connection -- sets
+        // need-reply on every request and blocks waiting for one. The symptom
+        // is not a protocol error but a hang, and then a torn stream.
+        handler.set_reply_ack_flag(true);
+        self.frontend
+            .set_backend_request_fd(&handler.get_tx_raw_fd())
+            .context("VHOST_USER_SET_BACKEND_REQ_FD")?;
+
+        std::thread::Builder::new()
+            .name("nvgpu-window".into())
+            .spawn(move || {
+                loop {
+                    match handler.handle_request() {
+                        Ok(_) => {}
+                        Err(e) => {
+                            // The backend closing is an ordinary shutdown, not
+                            // a fault; anything else is worth a line.
+                            log::debug!("nvgpu window request channel closed: {e}");
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("spawning the window request thread")?;
+        Ok(())
+    }
+
     fn memory_regions(&self) -> Result<Vec<VhostUserMemoryRegionInfo>> {
         self.mem
             .iter()
@@ -304,6 +463,7 @@ impl NvGpuDevice {
         );
         Ok(Self {
             inner: Mutex::new(Inner {
+                window: None,
                 com: ComCfg::default(),
                 qs: 0,
                 queues: new_queues(),
@@ -444,6 +604,35 @@ impl NvGpuDevice {
         Ok(cfg)
     }
 
+    /// Give the device somewhere to put the mappings the backend asks for.
+    ///
+    /// Without this the backend is never offered a request channel, and every
+    /// mapping stays in its own address space where the guest cannot reach it.
+    pub fn bind_mapper(&self, mapper: Arc<dyn HostMemoryMapper>) {
+        self.inner.lock().unwrap().window = Some(Arc::new(WindowMapper {
+            mapper,
+            guest_base: Mutex::new(None),
+        }));
+    }
+
+    /// Tell the device where the bus put BAR 2, which it cannot know earlier.
+    pub fn set_shm_guest_addr(&self, addr: u64) {
+        if let Some(w) = &self.inner.lock().unwrap().window {
+            *w.guest_base.lock().unwrap() = Some(addr);
+        }
+    }
+
+    /// The window's size, for the caller that has to reserve it.
+    pub fn shm_bar_size() -> u64 {
+        SHM_SIZE
+    }
+
+    /// Which BAR the window is, for the caller that has to ask the bus for its
+    /// address.
+    pub fn shm_bar() -> usize {
+        SHM_BAR
+    }
+
     pub fn bind_interrupts(
         &self,
         vectors: Vec<MsiVector>,
@@ -469,6 +658,8 @@ impl NvGpuDevice {
         cfg.add_virtio_notify_cap(0, NV_OFF_NOTIFY as u32, 0x100, NOTIFY_MULT);
         cfg.add_virtio_cap(3, 0, NV_OFF_ISR as u32, 1);
         cfg.add_virtio_cap(4, 0, NV_OFF_DEVICE as u32, CONFIG_LEN as u32);
+        cfg.set_bar_mem64(SHM_BAR, SHM_SIZE);
+        cfg.add_virtio_shm_cap(NV_SHM_ID, SHM_BAR as u8, 0, SHM_SIZE);
         let msix_cap = cfg.add_msix_cap(
             MSIX_VECTORS - 1,
             NV_OFF_MSIX_TABLE as u32,
@@ -613,7 +804,11 @@ impl PciDevice for NvGpuDevice {
             self.bar0_read(o, d);
             true
         } else {
-            false
+            // BAR 2 is backed by real memory and the guest reaches it without
+            // trapping, so an access arriving here is to a page the backend has
+            // not placed anything in.
+            d.fill(0);
+            bi == SHM_BAR
         }
     }
     fn write_bar(&self, bi: usize, o: u64, d: &[u8]) -> bool {
@@ -621,11 +816,22 @@ impl PciDevice for NvGpuDevice {
             self.bar0_write(o, d);
             true
         } else {
-            false
+            bi == SHM_BAR
         }
     }
     fn bar_size(&self, bi: usize) -> u64 {
-        if bi == 0 { NV_BAR0_SIZE } else { 0 }
+        match bi {
+            0 => NV_BAR0_SIZE,
+            SHM_BAR => SHM_SIZE,
+            _ => 0,
+        }
+    }
+    fn bar_type(&self, bi: usize) -> BarType {
+        if bi == SHM_BAR {
+            BarType::Mem64
+        } else {
+            BarType::Mem32
+        }
     }
 }
 

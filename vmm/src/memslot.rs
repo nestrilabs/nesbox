@@ -91,6 +91,14 @@ impl MemorySlots {
     /// A failure is reported and not fatal. Every resource then takes the
     /// per-resource path, which is what this VMM did before the window existed.
     pub fn open_window(&self, guest_base: u64, size: u64) -> Result<()> {
+        // One window per allocator. A second would replace the first's record
+        // while its slot stayed registered, so the first device's mappings
+        // would be placed against an address range nothing describes any more.
+        anyhow::ensure!(
+            self.window.lock().unwrap().is_none(),
+            "a window is already open; this allocator holds one"
+        );
+
         // SAFETY: a fresh anonymous reservation at an address the kernel picks.
         // Nothing else can hold it, and `PROT_NONE` means nothing can read or
         // write it until a later `MAP_FIXED` gives part of it contents.
