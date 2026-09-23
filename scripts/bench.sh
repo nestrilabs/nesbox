@@ -27,6 +27,8 @@ RENDERER=${NESBOX_RENDERER_LIB:-$ART/virgl-nvalid/lib}
 NODE=$(bench_render_node)
 
 COST=${BENCH_COST:-400}
+PROBE_ENV=${BENCH_PROBE_ENV:-}
+PROBE_ARGS=${BENCH_PROBE_ARGS:-}
 SECS=${BENCH_SECONDS:-20}
 WARMUP=${BENCH_WARMUP:-8}
 OUT=""
@@ -73,11 +75,27 @@ JSON
         echo 'mount -t devtmpfs devtmpfs /dev 2>/dev/null; mount -t tmpfs tmpfs /tmp'
         echo 'mount -t virtiofs probe /mnt || echo BENCH-SHARE-FAIL'
         sleep 2
-        echo "/mnt/nesprobe --cost $COST --seconds $SECS --warmup $WARMUP; echo BENCH-EXIT=\$?"
-        sleep $((SECS + WARMUP + 12))
+        # BENCH_PROBE_ENV and BENCH_PROBE_ARGS exist to compare two drivers, or
+        # two probe settings, through the same harness. Both default to empty,
+        # so a plain run is the run every committed number was taken with.
+        echo "${PROBE_ENV:+env $PROBE_ENV }/mnt/nesprobe --cost $COST --seconds $SECS --warmup $WARMUP $PROBE_ARGS; echo BENCH-EXIT=\$?"
+        # Tell the guest to stop. Without this the guest's shell sits at a
+        # prompt forever and only `timeout` below ends the run -- and that
+        # kills `script`, not the VMM it started, which leaves a guest running
+        # against the GPU for as long as the machine is up. A sweep of fifteen
+        # runs left fifteen of them, each spinning a probe, and every figure
+        # taken after the first was measuring contention with the ones before.
+        echo 'sync; poweroff -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo o > /proc/sysrq-trigger; }'
+        sleep 6
     } | LD_LIBRARY_PATH=$RENDERER timeout $((SECS + WARMUP + 70)) \
           script -qec "env RUST_LOG=warn ./target/release/nesbox $RUN/g.json" /dev/null \
           2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -d '\r'
+
+    # And make sure of it. `timeout` cannot reach past `script` to the VMM, so
+    # a guest that ignored the poweroff would survive this function. Matched on
+    # this run's own config path, so it can touch nothing else.
+    pkill -f "nesbox $RUN/g.json" 2>/dev/null
+    sleep 1
 }
 
 # Markers are matched at the start of a line. The guest console echoes each
@@ -110,6 +128,7 @@ section_gpu() {
     cat <<JSON
 {
   "cost": $COST, "seconds": $SECS, "warmup_seconds": $WARMUP,
+  "probe_args": "$PROBE_ARGS", "probe_env": "$PROBE_ENV",
   "completed": $(probe_ok "$log" && echo true || echo false),
   "frames": $(jnum "$(probe_scalar "$log" frames)"),
   "fps": $(jnum "$(probe_scalar "$log" fps)"),
