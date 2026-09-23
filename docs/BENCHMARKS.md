@@ -10,6 +10,14 @@ tell which was which.
 Companions: [`PROGRESS.md`](../PROGRESS.md) §5–6 for traps and known gaps,
 [`tools/nesprobe/`](../tools/nesprobe/) for the probe.
 
+**Two hosts have been run, and both results are committed.**
+[`benchmarks/ns3.json`](../benchmarks/ns3.json) is the Vega laptop this document
+is written around. [`benchmarks/nestripc-1.json`](../benchmarks/nestripc-1.json)
+is an **RDNA 4 desktop** — Ryzen 9 5950X, RX 9060 XT, `performance` governor —
+and it is a full run: gpu, scaling, seccomp and envelope. Where this document
+says a figure is Vega's, the RDNA 4 file is the place to check what it looks
+like on a card that is not.
+
 ---
 
 ## 1. The reference host
@@ -54,7 +62,8 @@ a figure from a different host is a different figure, not a confirmation.
 >
 > **The RDNA 4 host is the validation, not a repeat.** It is a better-configured
 > machine, and re-running this suite there is the point of `scripts/` being one
-> command each — see §15 item 1.
+> command each. **That run has happened** — `benchmarks/nestripc-1.json`, and
+> §16 for what it says.
 | libdrm | 2.4.134 |
 | virglrenderer | fork at `7fcfce4` **+ the patch in §6** |
 | Guest kernel | 7.2.0+ |
@@ -64,7 +73,8 @@ a figure from a different host is a different figure, not a confirmation.
 carve-out and should not be read as capacity numbers. What generalises from this
 host is *mechanism and shape*. What does not is any absolute byte or frame figure.
 
-**Nothing here is an RDNA 4 result.**
+**Nothing in this section is an RDNA 4 result** — that host has its own file and
+its own section (§16).
 
 ---
 
@@ -463,7 +473,8 @@ unless there is a solo number to compare with.
 
 - **Do not carry any absolute figure to another GPU.** Vega iGPU, no dedicated VRAM,
   one synthetic workload.
-- **Do not read any of this as an RDNA 4 result.**
+- **Do not read any of this as an RDNA 4 result.** That host was run separately;
+  its numbers are in `benchmarks/nestripc-1.json` and §16, and they are its own.
 - **Do not compare figures across warm-up conventions.** Anything measured before
   `--warmup` existed has a p99 that is really the GPU clock ramp (§8.2).
 - **Do not treat `nesprobe` as a stand-in for an application.** It says what the
@@ -1037,7 +1048,9 @@ because it made anything here faster.
 
 ## 15. Open, in the order that matters
 
-1. **RDNA 4.** Untested. Everything above is Vega.
+1. **RDNA 4.** ~~Untested.~~ **Run** — `benchmarks/nestripc-1.json`, §16.
+   Everything in §1–§14 is still Vega, and stays that way: the RDNA 4 figures
+   are reported beside them, not merged into them.
 2. **Frame counts from a real application.** `nesprobe` counts its own; an
    application cannot. A Vulkan layer that reports present timing would generalise.
 3. **Where the ~1.4 ms fixed per-frame cost goes** — virtio round-trips, host

@@ -33,6 +33,19 @@ struct Args {
     /// So a p99 measured without this is a measurement of the clock ramp, not of
     /// the stack. Discarding one frame is not enough; the window is seconds long.
     warmup: u64,
+    /// Memory-budget queries to make per frame, as an engine does.
+    ///
+    /// Off by default, because it is not part of the calibrated load and every
+    /// figure recorded before it existed was taken without it.
+    ///
+    /// It exists because the probe's own loop touches a narrow part of the
+    /// driver: it submits and waits, and asks the driver nothing else. A real
+    /// engine asks for the memory budget as it decides what to keep resident,
+    /// and on an amdgpu native context that question is a synchronous round
+    /// trip to the host -- measured elsewhere in this project at ~300 per frame
+    /// against 20 for the submissions themselves. A probe that never asks it
+    /// cannot see that cost, and cannot see a driver change that removes it.
+    budget_queries: u32,
 }
 
 impl Default for Args {
@@ -45,6 +58,7 @@ impl Default for Args {
             fps: 0,
             device: 0,
             warmup: 5,
+            budget_queries: 0,
         }
     }
 }
@@ -87,6 +101,10 @@ fn parse_args() -> Args {
                 a.device = val(i) as usize;
                 i += 2
             }
+            "--budget-queries" => {
+                a.budget_queries = val(i) as u32;
+                i += 2
+            }
             "--warmup" => {
                 a.warmup = val(i);
                 i += 2
@@ -94,6 +112,7 @@ fn parse_args() -> Args {
             "-h" | "--help" => {
                 println!("nesprobe [--cost N] [--width W] [--height H] [--seconds S]");
                 println!("         [--fps F] [--device N] [--warmup S]");
+                println!("         [--budget-queries N]   per-frame VK_EXT_memory_budget queries");
                 std::process::exit(0)
             }
             other => {
@@ -119,6 +138,9 @@ fn find_memory_type(
 struct Probe {
     _entry: Entry,
     instance: Instance,
+    /// Kept for --budget-queries, which asks the driver about memory on a
+    /// physical device rather than a logical one.
+    pd: vk::PhysicalDevice,
     device: Device,
     queue: vk::Queue,
     pool: vk::CommandPool,
@@ -399,6 +421,7 @@ impl Probe {
         Ok(Self {
             _entry: entry,
             instance,
+            pd,
             device,
             queue,
             pool,
@@ -417,6 +440,24 @@ impl Probe {
     }
 
     /// One frame: clear, draw a fullscreen triangle, wait for the GPU.
+    /// Ask the driver for the memory budget, the way an engine does when it is
+    /// deciding what to keep resident.
+    ///
+    /// Chained exactly as a consumer would chain it: without the budget struct
+    /// attached, a driver answers out of what it already knows and never looks
+    /// at the heaps.
+    fn budget_query(&self) {
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+        // Chained by hand: ash models this struct without a push_next, so the
+        // p_next is set directly. The budget struct outlives the call.
+        props2.p_next = &mut budget as *mut _ as *mut std::ffi::c_void;
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties2(self.pd, &mut props2)
+        };
+    }
+
     fn frame(&self, cost: u32) -> Result<(), vk::Result> {
         let d = &self.device;
         unsafe {
@@ -510,11 +551,12 @@ fn main() {
     };
 
     println!(
-        "nesprobe: {} | {}x{} | cost={} | fps={} | {}s",
+        "nesprobe: {} | {}x{} | cost={} | budget_queries={} | fps={} | {}s",
         probe.device_name,
         args.width,
         args.height,
         args.cost,
+        args.budget_queries,
         if args.fps == 0 {
             "unpaced".to_string()
         } else {
@@ -562,6 +604,9 @@ fn main() {
             }
         }
         let t0 = Instant::now();
+        for _ in 0..args.budget_queries {
+            probe.budget_query();
+        }
         if let Err(e) = probe.frame(args.cost) {
             eprintln!("nesprobe: frame {frames} failed: {e}");
             break;
