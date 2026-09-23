@@ -165,7 +165,10 @@ impl Inner {
         self.tap.set_vnet_hdr_size(hdr_size)?;
         self.tap.set_offload(offloads)?;
 
-        self.backend.set_owner().context("VHOST_SET_OWNER")?;
+        // The vhost worker is created here, on whichever vCPU thread wrote the
+        // activation, and it keeps that thread's affinity for good.
+        crate::affinity::with_io_affinity("virtio-net", || self.backend.set_owner())
+            .context("VHOST_SET_OWNER")?;
         self.backend
             .set_features(acked & self.backend_features)
             .context("VHOST_SET_FEATURES")?;

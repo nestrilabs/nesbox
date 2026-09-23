@@ -259,8 +259,18 @@ What is missing is as important:
 - **No management API.** Configuration is a JSON file and the process is the
   interface. A read-only metrics socket exists ([STATS.md](docs/STATS.md)); there
   is no way to *control* a running box over it.
-- **No snapshots** and no live migration. vCPU threads can be confined to a set of
-  host CPUs with `cpu_affinity`, which places them but does not cap them.
+- **No snapshots** and no live migration.
+- **CPU placement is the caller's.** vCPU threads can be confined to a set of
+  host CPUs with `cpu_affinity`, which places them but does not cap them, or
+  pinned one to a CPU with `vcpu_pins`, optionally as sibling pairs with
+  `threads_per_core: 2`. `io_affinity` keeps the VMM's own threads, and the
+  kernel's vhost workers, off the guest's CPUs. `dedicated` tells KVM and the
+  guest that the pinned CPUs are the guest's alone: halting and spin-waiting
+  stop exiting to the host, and the guest leaves paravirtual spinlocks. That
+  is only true on CPUs the host has isolated, and nesbox cannot check it. A
+  host that isolates CPUs at runtime with a cpuset partition passes
+  `vcpu_cgroup_fd` and `io_cgroup_fd`, descriptors it opened on the two
+  cgroups' `cgroup.threads`, and nesbox moves its own threads between them.
 - **Performance numbers live in [BENCHMARKS.md](docs/BENCHMARKS.md)**, measured on
   one host; this README quotes none of them.
 

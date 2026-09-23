@@ -41,15 +41,60 @@ fn host_phys_addr_bits(kvm: &Kvm) -> Result<u8> {
     Ok(bits)
 }
 
+/// Stop a halting or spin-waiting vCPU from exiting to the host.
+///
+/// On a dedicated CPU both exits are pure cost. A guest `HLT` then halts the
+/// physical core, and an interrupt for the guest wakes it without the host
+/// scheduler or a VM entry in between; a `PAUSE` loop stops trapping, which
+/// only ever helped a host deciding whether to run someone else instead. The
+/// host sees each vCPU thread as permanently busy, which is true of a CPU that
+/// belongs to the guest.
+///
+/// Best effort: a host that allows neither leaves the guest working exactly as
+/// an undedicated one does, which is worth a warning and not a refusal.
+fn disable_idle_exits(vm_fd: &VmFd) {
+    use kvm_bindings::{
+        KVM_CAP_X86_DISABLE_EXITS, KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE,
+        kvm_enable_cap,
+    };
+    let allowed = vm_fd.check_extension_raw(KVM_CAP_X86_DISABLE_EXITS.into());
+    let wanted = KVM_X86_DISABLE_EXITS_HLT | KVM_X86_DISABLE_EXITS_PAUSE;
+    let mask = wanted & u32::try_from(allowed).unwrap_or(0);
+    if mask != wanted {
+        log::warn!(
+            "dedicated: this host lets exits {mask:#x} be disabled of {wanted:#x} wanted; \
+             the rest still trap"
+        );
+    }
+    if mask == 0 {
+        return;
+    }
+    let mut cap = kvm_enable_cap {
+        cap: KVM_CAP_X86_DISABLE_EXITS,
+        ..Default::default()
+    };
+    cap.args[0] = u64::from(mask);
+    match vm_fd.enable_cap(&cap) {
+        Ok(()) => log::info!("dedicated: HLT/PAUSE exits disabled ({mask:#x})"),
+        Err(e) => log::warn!("dedicated: could not disable exits: {e}"),
+    }
+}
+
 impl Vm {
     pub fn new(
-        mem_size_mib: usize,
-        vcpu_count: u8,
+        machine: &crate::config::MachineConfig,
         kernel_path: &std::path::Path,
         cmdline_str: &str,
     ) -> Result<Self> {
+        let mem_size_mib = machine.mem_size_mib;
+        let vcpu_count = machine.vcpu_count;
         let kvm = Kvm::new().context("Failed to open KVM")?;
         let vm_fd = Arc::new(kvm.create_vm().context("Failed to create VM")?);
+
+        // Before any vCPU exists: KVM refuses the capability once one does.
+        if machine.dedicated {
+            disable_idle_exits(&vm_fd);
+        }
 
         // Create IRQ chip
         vm_fd
@@ -154,7 +199,16 @@ impl Vm {
                 .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
                 .context("Failed to get supported CPUID")?;
             let vendor = crate::cpuid::vendor_of(&cpuid);
-            crate::cpuid::patch_topology(&mut cpuid, u32::from(cpu_id), vcpu_count, vendor);
+            crate::cpuid::patch_topology(
+                &mut cpuid,
+                u32::from(cpu_id),
+                vcpu_count,
+                machine.threads_per_core,
+                vendor,
+            );
+            if machine.dedicated && !crate::cpuid::advertise_dedicated(&mut cpuid) && cpu_id == 0 {
+                log::warn!("dedicated: KVM's CPUID leaves are absent, so the guest is not told");
+            }
             vcpu_fd.set_cpuid2(&cpuid).context("Failed to set CPUID")?;
 
             // Only the bootstrap processor starts executing the kernel. The

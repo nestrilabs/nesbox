@@ -12,11 +12,13 @@
 //! decisions about a topology that does not exist, which is the opposite of
 //! what this guest wants.
 //!
-//! What is published instead: one package, one die, `vcpu_count` cores, one
-//! thread each. That is honest for the placement nesbox is built for -- a set
-//! of whole cores inside a single L3 domain, with the host free to move vCPUs
-//! within it -- and it means the guest never believes two of its CPUs are
-//! hyperthread siblings.
+//! What is published instead: one package, one die, and either one thread per
+//! core or two. One is honest for a set of whole cores inside a single L3
+//! domain, with the host free to move vCPUs within it, and it means the guest
+//! never believes two of its CPUs are hyperthread siblings. Two is honest only
+//! when the caller pins each pair of vCPUs to two threads of one host core, and
+//! it is what lets a guest with more vCPUs than cores spread work across cores
+//! before doubling up.
 //!
 //! Modelled on Cloud Hypervisor's `update_cpuid_topology`
 //! (`cloudhypervisor-for-llm-ref/arch/src/x86_64/mod.rs`), which is the
@@ -132,23 +134,35 @@ const fn topology_level(level: u32, level_type: u32) -> u32 {
 
 /// Rewrite the topology leaves for one vCPU.
 ///
-/// `vcpu_id` is also the x2APIC id: with one thread per core and one package
-/// there is nothing to shift, so the ids stay dense from zero and match the
-/// ACPI MADT entries built alongside them.
-pub fn patch_topology(cpuid: &mut CpuId, vcpu_id: u32, vcpu_count: u8, vendor: Vendor) {
-    let cores = u32::from(vcpu_count.max(1));
+/// `vcpu_id` is also the x2APIC id, and the ids stay dense from zero so they
+/// match the ACPI MADT entries built alongside them. With two threads per core
+/// that still works: the SMT field is one bit wide, so id `2k` and `2k+1` are
+/// threads 0 and 1 of core `k` with no gap to leave.
+///
+/// `threads_per_core` is 1 or 2. At 1 the guest is told every vCPU is a whole
+/// core. At 2, vCPUs `2k` and `2k+1` are siblings, which is only true if the
+/// caller pinned them to two threads of one host core.
+pub fn patch_topology(
+    cpuid: &mut CpuId,
+    vcpu_id: u32,
+    vcpu_count: u8,
+    threads_per_core: u8,
+    vendor: Vendor,
+) {
+    let logical = u32::from(vcpu_count.max(1));
+    let threads = u32::from(threads_per_core.clamp(1, 2));
+    let cores = logical.div_ceil(threads);
     let x2apic_id = vcpu_id;
 
-    // Bits needed to hold a core index. Zero threads-per-core width, because
-    // there is one thread per core and nothing to address below the core.
-    let thread_width = 0u32;
-    let core_width = u32::BITS - (cores - 1).leading_zeros();
+    // Bits of the x2APIC id below the core index, and below the package.
+    let thread_width = u32::BITS - (threads - 1).leading_zeros();
+    let package_shift = thread_width + (u32::BITS - (cores - 1).leading_zeros());
 
     // ── Leaf 1: the oldest way to ask ────────────────────────────────────
     // EBX[23:16] is logical processors per package.
     let mut ebx = get(cpuid, 1, 0, Reg::Ebx);
     ebx &= !(0xff << 16);
-    ebx |= (cores & 0xff) << 16;
+    ebx |= (logical & 0xff) << 16;
     set(cpuid, 1, 0, Reg::Ebx, ebx);
 
     // EDX bit 28 (HTT) means "this package reports more than one logical
@@ -157,65 +171,81 @@ pub fn patch_topology(cpuid: &mut CpuId, vcpu_id: u32, vcpu_count: u8, vendor: V
     let edx = get(cpuid, 1, 0, Reg::Edx) | (1 << 28);
     set(cpuid, 1, 0, Reg::Edx, edx);
 
-    // ── Leaf 0xb: extended topology ──────────────────────────────────────
-    // Level 0 is the SMT level: one thread, so the shift is zero.
-    set(cpuid, 0xb, 0, Reg::Eax, thread_width);
-    set(cpuid, 0xb, 0, Reg::Ebx, 1);
-    set(cpuid, 0xb, 0, Reg::Ecx, topology_level(0, LEVEL_SMT));
-    set(cpuid, 0xb, 0, Reg::Edx, x2apic_id);
+    // ── Leaves 0xb and 0x1f: extended topology ───────────────────────────
+    // Both, because 0x1f takes precedence where it exists: leaving the host's
+    // values there would let a guest that prefers it read the host's package
+    // after 0xb told it the truth, and a half-patched pair is worse than
+    // either alone.
+    for leaf in [0xb, 0x1f] {
+        // Level 0, SMT: how many threads a core has.
+        set(cpuid, leaf, 0, Reg::Eax, thread_width);
+        set(cpuid, leaf, 0, Reg::Ebx, threads);
+        set(cpuid, leaf, 0, Reg::Ecx, topology_level(0, LEVEL_SMT));
+        set(cpuid, leaf, 0, Reg::Edx, x2apic_id);
 
-    // Level 1 is the core level: every logical processor in the package.
-    set(cpuid, 0xb, 1, Reg::Eax, core_width);
-    set(cpuid, 0xb, 1, Reg::Ebx, cores);
-    set(cpuid, 0xb, 1, Reg::Ecx, topology_level(1, LEVEL_CORE));
-    set(cpuid, 0xb, 1, Reg::Edx, x2apic_id);
+        // Level 1, core: every logical processor in the package.
+        set(cpuid, leaf, 1, Reg::Eax, package_shift);
+        set(cpuid, leaf, 1, Reg::Ebx, logical);
+        set(cpuid, leaf, 1, Reg::Ecx, topology_level(1, LEVEL_CORE));
+        set(cpuid, leaf, 1, Reg::Edx, x2apic_id);
 
-    // A terminating subleaf. Enumeration stops at the first level of type 0,
-    // and without one a guest walks off the end of what we defined into
-    // whatever the host reported for subleaf 2.
-    set(cpuid, 0xb, 2, Reg::Eax, 0);
-    set(cpuid, 0xb, 2, Reg::Ebx, 0);
-    set(cpuid, 0xb, 2, Reg::Ecx, topology_level(2, LEVEL_INVALID));
-    set(cpuid, 0xb, 2, Reg::Edx, x2apic_id);
+        // A terminating subleaf. Enumeration stops at the first level of type
+        // 0, and without one a guest walks off the end of what we defined into
+        // whatever the host reported for subleaf 2.
+        set(cpuid, leaf, 2, Reg::Eax, 0);
+        set(cpuid, leaf, 2, Reg::Ebx, 0);
+        set(cpuid, leaf, 2, Reg::Ecx, topology_level(2, LEVEL_INVALID));
+        set(cpuid, leaf, 2, Reg::Edx, x2apic_id);
+    }
 
-    // ── Leaf 0x1f: the same thing, with die and module levels ────────────
-    // Patched even though this guest has one die, because leaving the host's
-    // values here would let a guest that prefers 0x1f read a 16-core package
-    // from it after 0xb told it the truth. 0x1f takes precedence where both
-    // exist, so a half-patched pair is worse than either alone.
-    set(cpuid, 0x1f, 0, Reg::Eax, thread_width);
-    set(cpuid, 0x1f, 0, Reg::Ebx, 1);
-    set(cpuid, 0x1f, 0, Reg::Ecx, topology_level(0, LEVEL_SMT));
-    set(cpuid, 0x1f, 0, Reg::Edx, x2apic_id);
-
-    set(cpuid, 0x1f, 1, Reg::Eax, core_width);
-    set(cpuid, 0x1f, 1, Reg::Ebx, cores);
-    set(cpuid, 0x1f, 1, Reg::Ecx, topology_level(1, LEVEL_CORE));
-    set(cpuid, 0x1f, 1, Reg::Edx, x2apic_id);
-
-    set(cpuid, 0x1f, 2, Reg::Eax, 0);
-    set(cpuid, 0x1f, 2, Reg::Ebx, 0);
-    set(cpuid, 0x1f, 2, Reg::Ecx, topology_level(2, LEVEL_INVALID));
-    set(cpuid, 0x1f, 2, Reg::Edx, x2apic_id);
-
-    patch_cache_sharing(cpuid, cores, vendor);
+    patch_cache_sharing(cpuid, logical, cores, threads, vendor);
 
     if vendor == Vendor::Amd {
-        // 0x8000_0008 ECX[7:0] is "number of physical cores minus one", and
-        // Linux's AMD topology path reads it before falling back to 0xb.
+        // 0x8000_0008 ECX[7:0] is "number of threads in the package, minus
+        // one", and Linux's AMD topology path reads it before falling back to
+        // 0xb.
         let mut ecx = get(cpuid, 0x8000_0008, 0, Reg::Ecx);
         ecx &= !0xff;
-        ecx |= (cores - 1) & 0xff;
+        ecx |= (logical - 1) & 0xff;
         set(cpuid, 0x8000_0008, 0, Reg::Ecx, ecx);
 
-        // 0x8000_001e: extended APIC id, and EBX[15:8] is threads per compute
-        // unit minus one -- zero here, one thread per core.
+        // 0x8000_001e: extended APIC id; EBX[7:0] is the core id and EBX[15:8]
+        // threads per core, minus one.
         set(cpuid, 0x8000_001e, 0, Reg::Eax, x2apic_id);
-        set(cpuid, 0x8000_001e, 0, Reg::Ebx, x2apic_id & 0xff);
+        let core_id = (x2apic_id >> thread_width) & 0xff;
+        set(
+            cpuid,
+            0x8000_001e,
+            0,
+            Reg::Ebx,
+            ((threads - 1) << 8) | core_id,
+        );
         // Node id 0, one node per processor.
         set(cpuid, 0x8000_001e, 0, Reg::Ecx, 0);
         set(cpuid, 0x8000_001e, 0, Reg::Edx, 0);
     }
+}
+
+/// `KVM_CPUID_FEATURES`, and the hint in its EDX that says a vCPU owns its CPU.
+const KVM_CPUID_SIGNATURE: u32 = 0x4000_0000;
+const KVM_CPUID_FEATURES: u32 = 0x4000_0001;
+const KVM_HINTS_REALTIME: u32 = 1 << 0;
+
+/// Tell the guest its vCPUs are never preempted.
+///
+/// The guest then uses plain spinlocks rather than paravirtual ones and loads
+/// its polling idle driver. Right only for a vCPU pinned to a CPU nothing else
+/// runs on; see `MachineConfig::dedicated`.
+///
+/// Returns false, and changes nothing, when KVM's leaves are not there to
+/// carry it: the hint is meaningless to a guest that cannot see it is on KVM.
+pub fn advertise_dedicated(cpuid: &mut CpuId) -> bool {
+    if get(cpuid, KVM_CPUID_SIGNATURE, 0, Reg::Eax) < KVM_CPUID_FEATURES {
+        return false;
+    }
+    let edx = get(cpuid, KVM_CPUID_FEATURES, 0, Reg::Edx) | KVM_HINTS_REALTIME;
+    set(cpuid, KVM_CPUID_FEATURES, 0, Reg::Edx, edx);
+    true
 }
 
 #[cfg(test)]
@@ -299,10 +329,68 @@ mod tests {
         assert_eq!(vendor_of(&host_like_cpuid()), Vendor::Amd);
     }
 
+    /// Two threads per core: the SMT level is one bit wide and two threads
+    /// deep, and the package holds every vCPU.
+    #[test]
+    fn with_two_threads_per_core_the_smt_level_says_so() {
+        let mut c = host_like_cpuid();
+        patch_topology(&mut c, 3, 6, 2, Vendor::Amd);
+        for leaf in [0xb, 0x1f] {
+            assert_eq!(reg(&c, leaf, 0, Reg::Eax), 1, "one bit of thread id");
+            assert_eq!(reg(&c, leaf, 0, Reg::Ebx), 2, "two threads a core");
+            // Six logical ids, 0..=5, need three bits below the package.
+            assert_eq!(reg(&c, leaf, 1, Reg::Eax), 3);
+            assert_eq!(reg(&c, leaf, 1, Reg::Ebx), 6);
+            assert_eq!(reg(&c, leaf, 1, Reg::Edx), 3, "x2APIC id is the vCPU index");
+        }
+        assert_eq!((reg(&c, 1, 0, Reg::Ebx) >> 16) & 0xff, 6);
+    }
+
+    /// vCPUs `2k` and `2k+1` are the two threads of core `k`, on AMD's own
+    /// topology leaf too: Linux reads the core id from there before 0xb.
+    #[test]
+    fn amd_pairs_vcpus_into_cores() {
+        for (vcpu, core) in [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2)] {
+            let mut c = host_like_cpuid();
+            patch_topology(&mut c, vcpu, 6, 2, Vendor::Amd);
+            let ebx = reg(&c, 0x8000_001e, 0, Reg::Ebx);
+            assert_eq!(ebx & 0xff, core, "vCPU {vcpu}");
+            assert_eq!((ebx >> 8) & 0xff, 1, "two threads, minus one");
+            assert_eq!(reg(&c, 0x8000_0008, 0, Reg::Ecx) & 0xff, 5, "six threads");
+        }
+    }
+
+    /// An odd count leaves the last core with one thread rather than inventing
+    /// a vCPU to fill it.
+    #[test]
+    fn an_odd_count_with_siblings_rounds_the_core_count_up() {
+        let mut c = host_like_cpuid();
+        patch_topology(&mut c, 4, 5, 2, Vendor::Intel);
+        assert_eq!(reg(&c, 0xb, 1, Reg::Ebx), 5);
+        // Five ids need three bits: one of thread, two of core (three cores).
+        assert_eq!(reg(&c, 0xb, 1, Reg::Eax), 3);
+    }
+
+    #[test]
+    fn the_dedicated_hint_needs_kvm_leaves_to_carry_it() {
+        let mut c = host_like_cpuid();
+        assert!(!advertise_dedicated(&mut c), "no KVM signature, no hint");
+        assert_eq!(reg(&c, KVM_CPUID_FEATURES, 0, Reg::Edx), 0);
+
+        set(&mut c, KVM_CPUID_SIGNATURE, 0, Reg::Eax, KVM_CPUID_FEATURES);
+        set(&mut c, KVM_CPUID_FEATURES, 0, Reg::Edx, 1 << 3);
+        assert!(advertise_dedicated(&mut c));
+        assert_eq!(
+            reg(&c, KVM_CPUID_FEATURES, 0, Reg::Edx),
+            (1 << 3) | KVM_HINTS_REALTIME,
+            "the hint is added, nothing already there is lost"
+        );
+    }
+
     #[test]
     fn leaf_1_reports_the_guest_core_count_not_the_host() {
         let mut c = host_like_cpuid();
-        patch_topology(&mut c, 0, 7, Vendor::Amd);
+        patch_topology(&mut c, 0, 7, 1, Vendor::Amd);
         assert_eq!(
             (reg(&c, 1, 0, Reg::Ebx) >> 16) & 0xff,
             7,
@@ -316,7 +404,7 @@ mod tests {
     #[test]
     fn no_two_vcpus_are_hyperthread_siblings() {
         let mut c = host_like_cpuid();
-        patch_topology(&mut c, 0, 7, Vendor::Amd);
+        patch_topology(&mut c, 0, 7, 1, Vendor::Amd);
         for leaf in [0xb, 0x1f] {
             assert_eq!(
                 reg(&c, leaf, 0, Reg::Ebx),
@@ -331,7 +419,7 @@ mod tests {
     #[test]
     fn the_core_level_covers_every_vcpu() {
         let mut c = host_like_cpuid();
-        patch_topology(&mut c, 0, 7, Vendor::Amd);
+        patch_topology(&mut c, 0, 7, 1, Vendor::Amd);
         for leaf in [0xb, 0x1f] {
             assert_eq!(reg(&c, leaf, 1, Reg::Ebx), 7);
             // 3 bits hold 0..=7.
@@ -350,7 +438,7 @@ mod tests {
     #[test]
     fn enumeration_terminates() {
         let mut c = host_like_cpuid();
-        patch_topology(&mut c, 0, 7, Vendor::Amd);
+        patch_topology(&mut c, 0, 7, 1, Vendor::Amd);
         for leaf in [0xb, 0x1f] {
             assert_eq!(
                 reg(&c, leaf, 2, Reg::Ecx) >> 8 & 0xff,
@@ -365,7 +453,7 @@ mod tests {
     fn each_vcpu_gets_its_own_x2apic_id() {
         for id in 0..7u32 {
             let mut c = host_like_cpuid();
-            patch_topology(&mut c, id, 7, Vendor::Amd);
+            patch_topology(&mut c, id, 7, 1, Vendor::Amd);
             assert_eq!(reg(&c, 0xb, 1, Reg::Edx), id);
             assert_eq!(reg(&c, 0x8000_001e, 0, Reg::Eax), id);
         }
@@ -374,7 +462,7 @@ mod tests {
     #[test]
     fn amd_extended_leaves_are_patched_and_intel_is_left_alone() {
         let mut amd = host_like_cpuid();
-        patch_topology(&mut amd, 0, 7, Vendor::Amd);
+        patch_topology(&mut amd, 0, 7, 1, Vendor::Amd);
         assert_eq!(
             reg(&amd, 0x8000_0008, 0, Reg::Ecx) & 0xff,
             6,
@@ -387,7 +475,7 @@ mod tests {
         );
 
         let mut intel = host_like_cpuid();
-        patch_topology(&mut intel, 0, 7, Vendor::Intel);
+        patch_topology(&mut intel, 0, 7, 1, Vendor::Intel);
         assert_eq!(
             reg(&intel, 0x8000_0008, 0, Reg::Ecx) & 0xff,
             15,
@@ -400,7 +488,7 @@ mod tests {
     #[test]
     fn a_single_vcpu_guest_is_one_core_zero_width() {
         let mut c = host_like_cpuid();
-        patch_topology(&mut c, 0, 1, Vendor::Amd);
+        patch_topology(&mut c, 0, 1, 1, Vendor::Amd);
         assert_eq!(reg(&c, 0xb, 1, Reg::Eax), 0, "no bits needed for one core");
         assert_eq!(reg(&c, 0xb, 1, Reg::Ebx), 1);
         assert_eq!((reg(&c, 1, 0, Reg::Ebx) >> 16) & 0xff, 1);
@@ -415,7 +503,7 @@ mod tests {
             c.as_slice().iter().filter(|e| e.function == 0x1f).count(),
             0
         );
-        patch_topology(&mut c, 0, 7, Vendor::Amd);
+        patch_topology(&mut c, 0, 7, 1, Vendor::Amd);
         assert_eq!(
             c.as_slice().iter().filter(|e| e.function == 0x1f).count(),
             3
@@ -436,10 +524,11 @@ mod tests {
 /// AMD's `0x8000_001d` and Intel's leaf 4 carry the field at the same place:
 /// EAX[25:14] is the count of logical processors sharing the cache, minus one.
 ///
-/// L1 and L2 become private to their core. The last level stays shared by
-/// every vCPU, which is true by construction when a guest is placed inside a
-/// single L3 domain, so all of its CPUs really do share one.
-fn patch_cache_sharing(cpuid: &mut CpuId, cores: u32, vendor: Vendor) {
+/// L1 and L2 become private to their core, shared by its threads when it has
+/// two. The last level stays shared by every vCPU, which is true by
+/// construction when a guest is placed inside a single L3 domain, so all of
+/// its CPUs really do share one.
+fn patch_cache_sharing(cpuid: &mut CpuId, logical: u32, cores: u32, threads: u32, vendor: Vendor) {
     let leaf = match vendor {
         Vendor::Amd => 0x8000_001d,
         Vendor::Intel => 4,
@@ -465,9 +554,9 @@ fn patch_cache_sharing(cpuid: &mut CpuId, cores: u32, vendor: Vendor) {
         }
         let level = (eax >> 5) & 0x7;
 
-        // Everything below the last level is private to one core here, because
-        // each vCPU is a whole core with one thread.
-        let sharing = if level >= 3 { cores } else { 1 };
+        // Everything below the last level is private to one core, and so
+        // shared only by that core's threads.
+        let sharing = if level >= 3 { logical } else { threads };
 
         let mut new_eax = eax & !(0xfff << 14);
         new_eax |= ((sharing - 1) & 0xfff) << 14;
@@ -499,9 +588,20 @@ mod cache_tests {
     fn low_level_caches_become_private_to_their_core() {
         let mut c = host_like_cpuid();
         assert_eq!(sharing(&c, 0), 2, "fixture starts SMT-shared");
-        patch_topology(&mut c, 0, 8, Vendor::Amd);
+        patch_topology(&mut c, 0, 8, 1, Vendor::Amd);
         assert_eq!(sharing(&c, 0), 1, "L1d must be private");
         assert_eq!(sharing(&c, 2), 1, "L2 must be private");
+    }
+
+    /// With siblings, L1 and L2 are shared by exactly the two threads of a core
+    /// -- the host's own pairing, which pinning made true in the guest.
+    #[test]
+    fn with_siblings_low_level_caches_are_shared_by_the_pair() {
+        let mut c = host_like_cpuid();
+        patch_topology(&mut c, 0, 6, 2, Vendor::Amd);
+        assert_eq!(sharing(&c, 0), 2);
+        assert_eq!(sharing(&c, 2), 2);
+        assert_eq!(sharing(&c, 3), 6, "L3 is still every vCPU");
     }
 
     /// The last level really is shared by every vCPU -- a guest is placed inside
@@ -510,7 +610,7 @@ mod cache_tests {
     #[test]
     fn the_last_level_is_shared_by_every_vcpu() {
         let mut c = host_like_cpuid();
-        patch_topology(&mut c, 0, 8, Vendor::Amd);
+        patch_topology(&mut c, 0, 8, 1, Vendor::Amd);
         assert_eq!(sharing(&c, 3), 8);
     }
 
@@ -519,7 +619,7 @@ mod cache_tests {
     #[test]
     fn cache_type_and_level_are_left_alone() {
         let mut c = host_like_cpuid();
-        patch_topology(&mut c, 0, 8, Vendor::Amd);
+        patch_topology(&mut c, 0, 8, 1, Vendor::Amd);
         let eax = get(&c, 0x8000_001d, 3, Reg::Eax);
         assert_eq!(eax & 0x1f, 3, "still unified");
         assert_eq!((eax >> 5) & 0x7, 3, "still level 3");
@@ -528,7 +628,7 @@ mod cache_tests {
     #[test]
     fn the_terminator_is_not_treated_as_a_cache() {
         let mut c = host_like_cpuid();
-        patch_topology(&mut c, 0, 8, Vendor::Amd);
+        patch_topology(&mut c, 0, 8, 1, Vendor::Amd);
         assert_eq!(get(&c, 0x8000_001d, 4, Reg::Eax), 0, "terminator rewritten");
     }
 
@@ -536,7 +636,7 @@ mod cache_tests {
     #[test]
     fn intel_uses_leaf_4_and_amd_leaf_is_untouched() {
         let mut c = host_like_cpuid();
-        patch_topology(&mut c, 0, 8, Vendor::Intel);
+        patch_topology(&mut c, 0, 8, 1, Vendor::Intel);
         assert_eq!(sharing(&c, 0), 2, "AMD leaf must be left alone for Intel");
     }
 }

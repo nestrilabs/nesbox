@@ -68,7 +68,10 @@ impl Inner {
         }
         let mem = self.mem.clone().context("guest memory not attached")?;
 
-        self.backend.set_owner().context("VHOST_SET_OWNER")?;
+        // See the same call in net.rs: the vhost worker is born with this
+        // thread's affinity, and this thread is a vCPU.
+        crate::affinity::with_io_affinity("virtio-vsock", || self.backend.set_owner())
+            .context("VHOST_SET_OWNER")?;
 
         let acked = self.com.df & self.features();
         self.backend

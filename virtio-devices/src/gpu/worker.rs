@@ -180,13 +180,17 @@ impl Worker {
         }
     }
 
-    /// Confine this thread to the CPUs the guest's vCPUs were given.
+    /// Confine this thread to the CPUs it was given, which is the I/O set.
     ///
     /// A warning rather than a failure, for the same reason the vCPU threads
     /// treat it that way: placement is an optimisation, and a box that runs on
     /// the wrong cores is better than one that does not start. A set naming
     /// CPUs this host does not have is the usual cause and is worth seeing.
     fn confine(&self) {
+        // First, and whatever the set: this thread is spawned on activation,
+        // from a vCPU thread, so under a cpuset partition it is born inside
+        // it, and the affinity below would be refused.
+        crate::affinity::leave_vcpu_cgroup("virtio-gpu");
         if self.cpu_affinity.is_empty() {
             return;
         }

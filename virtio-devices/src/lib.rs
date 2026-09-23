@@ -1,3 +1,4 @@
+pub mod affinity;
 mod blk;
 pub mod common;
 mod console;

@@ -303,18 +303,73 @@ pub struct MachineConfig {
     /// Host CPUs the vCPU threads may run on. Empty or absent means no
     /// affinity is set and the host scheduler places them freely.
     ///
-    /// One set shared by every vCPU thread, rather than a pin per vCPU. On a
-    /// chiplet CPU the win is keeping a guest inside one L3 domain, and a set
-    /// gets that while still letting the host balance within it. Pinning
-    /// one-to-one would also mean deciding which vCPUs land on SMT siblings,
-    /// and the guest cannot currently be told which of its CPUs are siblings
-    /// -- nesbox's ACPI tables do not describe CPU topology -- so it would
-    /// schedule against a layout it cannot see.
+    /// One set shared by every vCPU thread, which keeps a guest inside one L3
+    /// domain while still letting the host balance within it. `vcpu_pins`
+    /// replaces it for the vCPUs when set.
     ///
     /// Applied verbatim. Which CPUs belong to a guest is the caller's decision;
     /// this end only carries it out, the same way `vcpu_count` works.
     #[serde(default)]
     pub cpu_affinity: Vec<usize>,
+    /// One host CPU per vCPU, in vCPU order. Empty means no pins, and the
+    /// vCPUs share `cpu_affinity` instead.
+    ///
+    /// A pin is only better than a set when nothing else runs on the pinned
+    /// CPU: a pinned vCPU cannot escape to an idle core when a host task lands
+    /// on its own. So this is for CPUs the host has set aside for the guest, and
+    /// is what `dedicated` requires.
+    #[serde(default)]
+    pub vcpu_pins: Vec<usize>,
+    /// SMT threads per guest core: 1 or 2. With 2, vCPUs `2k` and `2k+1` are
+    /// told they are siblings, and must be pinned to two threads of one host
+    /// core for that to be true.
+    ///
+    /// The guest's scheduler spreads work across cores before doubling up on
+    /// siblings, but only if it knows which CPUs are siblings. Told nothing, it
+    /// treats two threads of one core as two cores and happily puts two busy
+    /// threads on one of them. Requires `vcpu_pins`, since otherwise nothing
+    /// keeps the host's siblings where the guest was told they are.
+    #[serde(default = "default_threads_per_core")]
+    pub threads_per_core: u8,
+    /// Host CPUs for every thread that is not a vCPU: device workers, the
+    /// stats server, virtiofsd and the kernel's vhost workers. Empty means the
+    /// same set as `cpu_affinity`.
+    ///
+    /// These threads serve the guest, but they are not the guest. Kept on the
+    /// guest's own CPUs they compete with its vCPUs, and under pins they would
+    /// land on one vCPU's core and halve it.
+    #[serde(default)]
+    pub io_affinity: Vec<usize>,
+    /// The pinned CPUs belong to this guest alone, and nothing else on the host
+    /// will run on them.
+    ///
+    /// This is a promise the caller makes; nesbox cannot check it. On the
+    /// strength of it, a halting vCPU halts the physical core instead of
+    /// exiting to the host, spin-waits stop exiting, and the guest is told its
+    /// vCPUs are never preempted, which moves it off paravirtual spinlocks. All
+    /// of that is right only when the promise holds. With another task sharing
+    /// a pinned CPU, a guest spinning on a lock whose holder is preempted spins
+    /// until the host scheduler lets the holder run again.
+    #[serde(default)]
+    pub dedicated: bool,
+    /// An inherited descriptor, open for writing on the `cgroup.threads` of
+    /// the cgroup that owns the pinned CPUs. Each vCPU thread moves itself
+    /// there through it before pinning.
+    ///
+    /// For a host that sets CPUs aside at runtime with an isolated cpuset
+    /// partition rather than at boot: an isolated CPU is not in this process's
+    /// cpuset, so a pin onto it is refused until the thread is inside the
+    /// partition. A descriptor rather than a path because the kernel checks a
+    /// cgroup move against whoever opened the file, so whoever set the
+    /// partition up can open it and hand it on, and nesbox needs neither the
+    /// privilege nor a view of the cgroup filesystem to use it.
+    #[serde(default)]
+    pub vcpu_cgroup_fd: Option<i32>,
+    /// The same for the cgroup this process started in, which holds the I/O
+    /// CPUs. Kernel workers that a vCPU thread creates are born in the vCPU
+    /// cgroup, on the pinned CPUs, and are moved back out through this.
+    #[serde(default)]
+    pub io_cgroup_fd: Option<i32>,
 }
 
 fn default_vcpus() -> u8 {
@@ -323,6 +378,9 @@ fn default_vcpus() -> u8 {
 fn default_mem_size() -> usize {
     2048
 }
+fn default_threads_per_core() -> u8 {
+    1
+}
 
 impl Default for MachineConfig {
     fn default() -> Self {
@@ -330,6 +388,76 @@ impl Default for MachineConfig {
             vcpu_count: default_vcpus(),
             mem_size_mib: default_mem_size(),
             cpu_affinity: Vec::new(),
+            vcpu_pins: Vec::new(),
+            threads_per_core: default_threads_per_core(),
+            io_affinity: Vec::new(),
+            dedicated: false,
+            vcpu_cgroup_fd: None,
+            io_cgroup_fd: None,
+        }
+    }
+}
+
+impl MachineConfig {
+    /// Refuse a placement that cannot be carried out as written.
+    ///
+    /// Each of these would otherwise run, and run wrong without saying so: a
+    /// guest told it has siblings it does not have, a vCPU left unpinned in a
+    /// box that promised the guest it was dedicated.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.vcpu_pins.is_empty() {
+            anyhow::ensure!(
+                self.vcpu_pins.len() == usize::from(self.vcpu_count),
+                "vcpu_pins names {} CPUs for {} vCPUs",
+                self.vcpu_pins.len(),
+                self.vcpu_count
+            );
+            let mut sorted = self.vcpu_pins.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            anyhow::ensure!(
+                sorted.len() == self.vcpu_pins.len(),
+                "vcpu_pins names one CPU twice, so two vCPUs would share it"
+            );
+        }
+        anyhow::ensure!(
+            matches!(self.threads_per_core, 1 | 2),
+            "threads_per_core must be 1 or 2, not {}",
+            self.threads_per_core
+        );
+        anyhow::ensure!(
+            self.threads_per_core == 1 || !self.vcpu_pins.is_empty(),
+            "threads_per_core = 2 needs vcpu_pins: without them nothing keeps two \
+             vCPUs on one host core"
+        );
+        anyhow::ensure!(
+            !self.dedicated || !self.vcpu_pins.is_empty(),
+            "dedicated needs vcpu_pins: a CPU cannot be dedicated to a vCPU that is \
+             not pinned to it"
+        );
+        for (name, fd) in [
+            ("vcpu_cgroup_fd", self.vcpu_cgroup_fd),
+            ("io_cgroup_fd", self.io_cgroup_fd),
+        ] {
+            if let Some(fd) = fd {
+                anyhow::ensure!(fd > 2, "{name} {fd} is one of stdin, stdout and stderr");
+            }
+        }
+        anyhow::ensure!(
+            self.vcpu_cgroup_fd.is_some() == self.io_cgroup_fd.is_some(),
+            "vcpu_cgroup_fd and io_cgroup_fd come together: a thread that can \
+             step into the partition but not back out leaves kernel workers \
+             pinned inside it"
+        );
+        Ok(())
+    }
+
+    /// Where the threads that are not vCPUs go.
+    pub fn io_cpus(&self) -> &[usize] {
+        if self.io_affinity.is_empty() {
+            &self.cpu_affinity
+        } else {
+            &self.io_affinity
         }
     }
 }
@@ -365,6 +493,78 @@ mod machine_config_tests {
         let back: MachineConfig =
             serde_json::from_str(&serde_json::to_string(&mc).expect("serialises")).expect("parses");
         assert_eq!(back.cpu_affinity, mc.cpu_affinity);
+    }
+
+    /// A config from before placement grew pins means exactly what it meant
+    /// then: a shared set, one thread per core, nothing dedicated.
+    #[test]
+    fn an_old_config_keeps_its_old_meaning() {
+        let json = r#"{ "vcpu_count": 4, "mem_size_mib": 8192, "cpu_affinity": [0,1,2,3] }"#;
+        let mc: MachineConfig = serde_json::from_str(json).expect("parses");
+        assert!(mc.vcpu_pins.is_empty());
+        assert_eq!(mc.threads_per_core, 1);
+        assert!(!mc.dedicated);
+        assert_eq!(mc.io_cpus(), &[0, 1, 2, 3], "io threads follow the set");
+        mc.validate().expect("an old config is valid");
+    }
+
+    fn pinned(pins: &[usize]) -> MachineConfig {
+        MachineConfig {
+            vcpu_count: pins.len() as u8,
+            vcpu_pins: pins.to_vec(),
+            ..MachineConfig::default()
+        }
+    }
+
+    #[test]
+    fn pins_must_cover_every_vcpu_exactly_once() {
+        let mut short = pinned(&[2, 3]);
+        short.vcpu_count = 4;
+        assert!(short.validate().is_err());
+        assert!(pinned(&[2, 2]).validate().is_err());
+        pinned(&[2, 3, 10, 11])
+            .validate()
+            .expect("distinct and complete");
+    }
+
+    #[test]
+    fn siblings_and_dedication_need_pins() {
+        let smt = MachineConfig {
+            threads_per_core: 2,
+            ..MachineConfig::default()
+        };
+        assert!(smt.validate().is_err());
+        let dedicated = MachineConfig {
+            dedicated: true,
+            ..MachineConfig::default()
+        };
+        assert!(dedicated.validate().is_err());
+
+        let both = MachineConfig {
+            threads_per_core: 2,
+            dedicated: true,
+            ..pinned(&[2, 10, 3, 11])
+        };
+        both.validate().expect("pinned, so both can be honoured");
+    }
+
+    #[test]
+    fn three_threads_per_core_is_refused() {
+        let mc = MachineConfig {
+            threads_per_core: 3,
+            ..pinned(&[0, 1, 2])
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn io_affinity_wins_over_the_guest_set_when_given() {
+        let mc = MachineConfig {
+            cpu_affinity: vec![2, 3],
+            io_affinity: vec![0, 8],
+            ..MachineConfig::default()
+        };
+        assert_eq!(mc.io_cpus(), &[0, 8]);
     }
 }
 
