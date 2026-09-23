@@ -159,7 +159,7 @@ impl MemorySlots {
     }
 }
 
-impl virtio_devices::gpu::HostMemoryMapper for MemorySlots {
+impl virtio_devices::HostMemoryMapper for MemorySlots {
     fn host_addr(&self, guest_addr: u64, size: u64) -> Option<u64> {
         let window = self.window.lock().unwrap();
         let w = window.as_ref()?;

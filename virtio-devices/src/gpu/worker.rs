@@ -37,7 +37,8 @@ use super::protocol::{
     virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
 use super::virtio_gpu::{VirtioGpu, VirtioGpuRing};
-use super::{GpuQueues, HostMemoryMapper};
+use super::GpuQueues;
+use crate::memmap::HostMemoryMapper;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------

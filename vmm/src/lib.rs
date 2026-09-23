@@ -10,9 +10,16 @@ pub mod lifecycle;
 pub mod memslot;
 pub mod power;
 pub mod regs;
+/// Checks the loaded virglrenderer enforces the VRAM budget. Meaningless
+/// without a renderer to check.
+#[cfg(feature = "virgl")]
 pub mod renderer;
 pub mod seccomp;
 pub mod serial;
+/// The metrics surface. Currently shaped entirely around `GpuDevice`, so it
+/// compiles only with `virgl`; making it source-agnostic is what a
+/// virtio-nvgpu stats surface needs first.
+#[cfg(feature = "virgl")]
 pub mod stats;
 pub mod virtiofsd;
 pub mod vm;

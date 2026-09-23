@@ -29,7 +29,8 @@ use super::protocol::{
 };
 use super::vram::VramAccountant;
 use super::window::WindowQuota;
-use super::{GpuError, GpuQueues, HostMemoryMapper, Result, VirtioShmRegion};
+use super::{GpuError, GpuQueues, Result, VirtioShmRegion};
+use crate::memmap::HostMemoryMapper;
 
 // ---------------------------------------------------------------------------
 // Helpers

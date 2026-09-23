@@ -15,10 +15,8 @@ use crate::gpu::display::DisplayInfo;
 use crate::gpu::metrics::{GpuMetrics, GpuSnapshot};
 use crate::gpu::uapi::virtio_gpu_config;
 use crate::gpu::worker::Worker;
-use crate::gpu::{
-    CTL_INDEX, Descriptor, GpuQueues, HostMemoryMapper, NUM_QUEUES, QUEUE_SIZE, VirtioShmRegion,
-    uapi,
-};
+use crate::gpu::{CTL_INDEX, Descriptor, GpuQueues, NUM_QUEUES, QUEUE_SIZE, VirtioShmRegion, uapi};
+use crate::memmap::HostMemoryMapper;
 use anyhow::{Context, Result};
 use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
 use pci::{BarType, Doorbell, MsiRouter, MsiVector, PciDevice};

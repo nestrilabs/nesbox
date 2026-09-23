@@ -23,7 +23,15 @@ log = "0.4"
 env_logger = "0.11"
 
 # internal crates
-virtio-devices = { path = "../virtio-devices" }
+virtio-devices = { path = "../virtio-devices", default-features = false }
 pci = { path = "../pci" }
 termios = "0.3.3"
 libc = "0.2.189"
+
+[features]
+default = ["virgl"]
+# The virtio-gpu device, rutabaga and the virglrenderer link. Off builds a VMM
+# that can only forward NVIDIA ioctls -- no C renderer, no Mesa on the host.
+# `gpu` and `stats-socket` in a config are then refused by name rather than
+# ignored, which is the same rule `deny_unknown_fields` follows.
+virgl = ["virtio-devices/virgl"]

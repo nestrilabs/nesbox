@@ -12,13 +12,16 @@ use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
 use termios::*;
+#[cfg(feature = "virgl")]
 use virtio_devices::gpu::display::DisplayInfo;
 use virtio_devices::{
-    BlkConfig, BlkDevice, ConsoleDevice, FsDevice, GpuConfig, GpuDevice, NetConfig, NetDevice,
-    NvGpuDevice, VsockDevice,
+    BlkConfig, BlkDevice, ConsoleDevice, FsDevice, NetConfig, NetDevice, NvGpuDevice, VsockDevice,
 };
+#[cfg(feature = "virgl")]
+use virtio_devices::{GpuConfig, GpuDevice};
 
 /// BAR index the GPU puts its shared memory window in.
+#[cfg(feature = "virgl")]
 const GPU_SHM_BAR: usize = 2;
 
 const USAGE: &str = "Usage:
@@ -106,6 +109,31 @@ fn main() -> Result<()> {
     // renderer gets loaded is LD_LIBRARY_PATH's decision. Checked before the
     // device is built so a limit that would silently do nothing stops the boot
     // rather than becoming a number in a config nobody rechecks.
+    // A build without `virgl` cannot create this device at all, so a config
+    // naming one is refused by name here rather than silently ignored -- the
+    // same rule `deny_unknown_fields` follows for a key this build does not
+    // know. Silently booting a guest with no GPU is the failure mode that cost
+    // a day on the second machine.
+    #[cfg(not(feature = "virgl"))]
+    {
+        if config.gpu.is_some() {
+            anyhow::bail!(
+                "this nesbox was built without the `virgl` feature, so it has no \
+                 virtio-gpu device; remove `gpu` from the config or rebuild with it"
+            );
+        }
+        // The metrics surface reports virtio-gpu counters and nothing else, so
+        // without that device it would serve an empty object. Refused here with
+        // the rest of config validation, before anything is opened: a config
+        // this build cannot honour should fail before it half-boots a guest.
+        if config.stats_socket.is_some() {
+            anyhow::bail!(
+                "this nesbox was built without the `virgl` feature; the stats \
+                 socket reports virtio-gpu counters only and has nothing to serve"
+            );
+        }
+    }
+    #[cfg(feature = "virgl")]
     nesbox_vmm::renderer::check(config.gpu.as_ref().and_then(|g| g.vram_limit_mib))?;
 
     // Create KVM VM
@@ -252,11 +280,13 @@ fn main() -> Result<()> {
     // Added before virtio-fs so its slot does not shift when a share is added
     // or removed. Its shared window is a real memory slot, taken after the
     // ones guest RAM already occupies.
+    #[cfg(feature = "virgl")]
     let mut stats_gpu = None;
     // One allocator for both windowed devices. Two would each start numbering
     // at the first slot past guest RAM and hand out the same numbers.
     let memory_slots = MemorySlots::new(vm.vm_fd.clone(), vm.ram_slot_count);
 
+    #[cfg(feature = "virgl")]
     if let Some(gpu_cfg) = &config.gpu {
         // The VRAM limit is enforced inside virglrenderer, which reads it from
         // the environment: the refusal has to happen where it can be reported to
@@ -321,6 +351,7 @@ fn main() -> Result<()> {
     // ── Metrics surface ───────────────────────────────────────────────────
     // Started before the vCPUs, so a supervisor that is already polling sees a
     // box come up rather than getting connection refused for the first second.
+    #[cfg(feature = "virgl")]
     if let Some(path) = config.stats_socket.clone() {
         nesbox_vmm::stats::serve(path, nesbox_vmm::stats::StatsSource::new(stats_gpu))?;
     }

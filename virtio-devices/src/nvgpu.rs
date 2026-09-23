@@ -27,7 +27,7 @@
 //! without moving anything else.
 
 use crate::common::*;
-use crate::gpu::HostMemoryMapper;
+use crate::memmap::HostMemoryMapper;
 use anyhow::{Context, Result};
 use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
 use pci::{BarType, MsiRouter, MsiVector, PciDevice};

@@ -103,6 +103,17 @@ cargo build --release
 # The jailer is a host-side tool, run *before* nesbox and never inside the
 # jail it builds -- see docs/SECURITY.md and build/README.md.
 
+# On a host that only forwards NVIDIA ioctls, build without the renderer:
+cargo build --release --no-default-features
+# This drops the `virgl` feature, and with it rutabaga, virglrenderer and the
+# Mesa stack that comes with them -- five host libraries and ~14 MiB of binary
+# that such a host would never call. It also removes the build-time need for
+# libvirglrenderer >= 1.3.0, which is newer than several distributions ship.
+#
+# The virtio-gpu device and the stats socket go with it. A config naming `gpu`
+# or `stats-socket` is then refused by name during validation, before anything
+# is opened -- never ignored.
+
 sudo ./scripts/nestri-net-setup.sh
 
 # once per host: IP forwarding and NAT so guests can reach the network.
