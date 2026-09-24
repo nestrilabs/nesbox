@@ -122,8 +122,9 @@ fn move_to_cgroup(fd: i32, tid: libc::pid_t) -> std::io::Result<()> {
 
 /// Run `f` with the calling thread moved to the I/O set, then put it back.
 ///
-/// For the one step that creates a kernel worker from inside a vCPU thread:
-/// the worker takes the affinity the thread has at that moment, and keeps it.
+/// For the step that creates a worker from inside a vCPU thread, whether a
+/// kernel worker or a thread of ours: the worker takes the affinity the thread
+/// has at that moment, and keeps it.
 /// With no I/O set recorded, `f` runs where the thread already is.
 ///
 /// Under a cpuset partition the worker also takes the thread's cgroup, so the
@@ -252,6 +253,34 @@ mod tests {
             assert_eq!(members(&current().expect("readable")), vec![first]);
             apply(&saved).expect("restorable");
             assert_eq!(members(&current().expect("readable")), before);
+        })
+        .join()
+        .expect("thread ran");
+    }
+
+    /// The other half: a thread spawned while its parent is on the I/O set
+    /// keeps that set after the parent is put back. This is what makes
+    /// spawning inside `with_io_affinity` place a worker a vCPU starts.
+    #[test]
+    fn a_thread_spawned_while_confined_stays_confined() {
+        std::thread::spawn(|| {
+            let saved = current().expect("readable");
+            let first = members(&saved)[0];
+            apply(&cpu_set(&[first]).expect("nameable")).expect("a CPU this thread may use");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let child = std::thread::spawn(move || {
+                go_rx.recv().unwrap();
+                tx.send(members(&current().expect("readable"))).unwrap();
+            });
+            apply(&saved).expect("restorable");
+            go_tx.send(()).unwrap();
+            assert_eq!(
+                rx.recv().unwrap(),
+                vec![first],
+                "the child kept its birth set"
+            );
+            child.join().unwrap();
         })
         .join()
         .expect("thread ran");
