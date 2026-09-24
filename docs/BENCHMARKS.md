@@ -1103,8 +1103,9 @@ most of the frame. A 60 Hz frame is 16.7 ms, which is the far end of this table.
 An NVIDIA guest does not use this path at all — it runs
 [virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu), which forwards the
 driver's ioctls instead of proxying submissions. Measured the same way on an RTX
-3060: −0.3% at 39 ms a frame, −0.8% at 9.9 ms, +1.9% at 2.0 ms, and +121% at
-0.5 ms. **The two designs are close to free where a game lives and expensive in
+3060: −0.4% at 39 ms a frame, −0.7% at 9.9 ms, +1.7% at 2.0 ms, and +7.1% at
+0.5 ms. Four guests share that card evenly — 103.7 fps between them against
+102.9 for one — and four encode H.264 at once at 60 Hz. **The two designs are close to free where a game lives and expensive in
 opposite corners**: the native context pays per submission and nothing per idle
 frame; virtio-nvgpu pays nothing per submission and waits for the GPU between
 frames. Its numbers and method are in that repository's `BENCHMARKS.md`.

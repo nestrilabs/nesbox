@@ -25,7 +25,7 @@ median of three 30-second runs after an 8-second warm-up discard:
 | GPU | how the guest reaches it | frame time vs bare metal | CPU vs bare metal |
 |---|---|---|---|
 | **RX 9060 XT** (RDNA 4) | amdgpu native context, in-process | **99–102%** at ≥3.4 ms/frame | — |
-| **RTX 3060** | [virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu), vhost-user | **98–100%** at ≥2 ms/frame | 0.39 s vs 0.40 s |
+| **RTX 3060** | [virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu), vhost-user | **98–100%** at ≥2 ms/frame | 0.37 s vs 0.40 s |
 
 A 60 Hz frame is 16.7 ms and a 144 Hz frame is 6.9 ms, so "a game's frame" sits
 well inside the range where the difference is under 2%. Below about 2 ms a frame
@@ -34,8 +34,13 @@ both paths cost real percentages, for opposite reasons — see
 these numbers do **not** support. (No other hypervisor was benchmarked, so
 nothing here says "faster than" anything.)
 
-Also measured, on one card, four guests at a time: throughput rises and each
-guest's frame time stays even. §5 of the same document.
+**Four guests on one card**, measured on both: on the RTX 3060 they take
+25.84, 26.49, 25.57 and 25.79 fps — 103.7 together against 102.9 for a single
+guest — with p50 frame times of 39.165, 39.164, 39.168 and 39.165 ms, and four
+of them encode H.264 at once at exactly 60 Hz. On the Vega iGPU, throughput
+rises with the guest count and each guest's frame time stays even (§5).
+
+Four is what was run, not a limit found.
 
 ## What it is
 
