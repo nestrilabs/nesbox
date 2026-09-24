@@ -374,14 +374,22 @@ pub struct MachineConfig {
     #[serde(default)]
     pub hugepages: HugePages,
     /// Fault in every page of guest RAM on a background thread once the VM is
-    /// built, instead of on the guest's first touch.
+    /// built, instead of on the guest's first touch, and collapse it into huge
+    /// pages. On unless turned off.
     ///
     /// A first touch allocates and zeroes a page with the vCPU stopped, and for
     /// a huge page that is a stall long enough to land in a frame. Prefaulted,
-    /// that cost is paid while the guest boots. The price is density: the
-    /// host commits all of guest RAM up front, where untouched memory would
-    /// otherwise cost nothing.
-    #[serde(default)]
+    /// that cost is paid while the guest boots. It is also the only way a host
+    /// on the kernel's default shmem policy, `never`, gets huge pages at all,
+    /// since collapsing needs the memory present.
+    ///
+    /// The price is that the host commits all of guest RAM at boot rather than
+    /// as the guest reaches it. That matters only to a host that overcommits,
+    /// running guests whose RAM adds up to more than it has on the bet that
+    /// they will not all use it; prefaulted, that bet is lost at boot. A guest
+    /// that runs for long fills most of its RAM with page cache anyway, and
+    /// nothing hands memory back to the host once touched.
+    #[serde(default = "default_prefault")]
     pub prefault: bool,
 }
 
@@ -419,6 +427,9 @@ fn default_vcpus() -> u8 {
 fn default_mem_size() -> usize {
     2048
 }
+fn default_prefault() -> bool {
+    true
+}
 fn default_threads_per_core() -> u8 {
     1
 }
@@ -436,7 +447,7 @@ impl Default for MachineConfig {
             vcpu_cgroup_fd: None,
             io_cgroup_fd: None,
             hugepages: HugePages::default(),
-            prefault: false,
+            prefault: default_prefault(),
         }
     }
 }
@@ -495,7 +506,7 @@ impl MachineConfig {
         if let Some(page) = self.hugepages.hugetlb_size() {
             let page_mib = page >> 20;
             anyhow::ensure!(
-                self.mem_size_mib as u64 % page_mib == 0,
+                (self.mem_size_mib as u64).is_multiple_of(page_mib),
                 "mem_size_mib {} is not a whole number of {page_mib} MiB huge pages",
                 self.mem_size_mib
             );
@@ -612,13 +623,13 @@ mod machine_config_tests {
     fn hugepages_parse_and_default_to_transparent() {
         let mc: MachineConfig = serde_json::from_str(r#"{ "mem_size_mib": 4096 }"#).unwrap();
         assert_eq!(mc.hugepages, HugePages::Transparent);
-        assert!(!mc.prefault);
+        assert!(mc.prefault, "prefault is on unless turned off");
         let mc: MachineConfig = serde_json::from_str(
-            r#"{ "mem_size_mib": 4096, "hugepages": "1g", "prefault": true }"#,
+            r#"{ "mem_size_mib": 4096, "hugepages": "1g", "prefault": false }"#,
         )
         .unwrap();
         assert_eq!(mc.hugepages, HugePages::Huge1G);
-        assert!(mc.prefault);
+        assert!(!mc.prefault);
         assert!(serde_json::from_str::<MachineConfig>(r#"{ "hugepages": "4k" }"#).is_err());
     }
 
