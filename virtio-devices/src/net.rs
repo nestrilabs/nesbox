@@ -108,6 +108,22 @@ impl Inner {
             | VIRTIO_NET_F_HOST_TSO6
             | VIRTIO_NET_F_HOST_ECN
             | VIRTIO_NET_F_HOST_UFO
+            | self.ring_features()
+    }
+
+    /// Ring features, offered only where the kernel backend has them.
+    ///
+    /// Unlike the offloads, which the tap carries out, these change the layout
+    /// both ends of the ring read, so vhost has to be told. Offering one the
+    /// backend lacks would have the mask in `activate` strip it on the way
+    /// down, leaving the guest and vhost disagreeing about the ring.
+    ///
+    /// EVENT_IDX lets each side name the ring index at which it next wants a
+    /// kick or an interrupt, instead of only switching notifications on and
+    /// off wholesale, so fewer of either are sent under load. INDIRECT_DESC
+    /// lets a large frame take one ring slot.
+    fn ring_features(&self) -> u64 {
+        self.backend_features & (VIRTIO_F_RING_EVENT_IDX | VIRTIO_F_RING_INDIRECT_DESC)
     }
 
     /// Which tap offloads follow from what the guest accepted.
