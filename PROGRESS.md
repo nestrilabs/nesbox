@@ -362,7 +362,7 @@ Do not re-derive these.
   What is still open:
 
   - ~~**The `O_DIRECT` path has never run.**~~ **Verified 2026-08-28 on
-    `nestripc-1`**, which has both filesystems this box actually uses: xfs on
+    the RDNA 4 desktop**, which has both filesystems this box actually uses: xfs on
     `/mnt/INSTANCES` (offset alignment 4096, so the guest is given a 4096 block)
     and ext4 on `/` (alignment 512, guest given 512). Reads come back
     byte-identical to the host image on both, a read-write guest writes and
@@ -380,7 +380,7 @@ Do not re-derive these.
     at startup; read it.
   - ~~**The other half of what `O_DIRECT` is for is unmeasured.**~~ **Measured
     2026-08-28**, once the `io` controller was delegated to the user session on
-    `nestripc-1` (`Delegate=pids memory cpu io` in a `user@.service` drop-in --
+    the RDNA 4 desktop (`Delegate=pids memory cpu io` in a `user@.service` drop-in --
     it is not the default, and without it an unprivileged `io.max` has nothing
     to attach to). Against a **warm** host cache and a 20 MB/s cap: buffered
     reads ran at 13.3 GB/s, ignoring the cap entirely; direct reads ran at

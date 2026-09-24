@@ -11,8 +11,8 @@ Companions: [`PROGRESS.md`](../PROGRESS.md) §5–6 for traps and known gaps,
 [`tools/nesprobe/`](../tools/nesprobe/) for the probe.
 
 **Two hosts have been run, and both results are committed.**
-[`benchmarks/ns3.json`](../benchmarks/ns3.json) is the Vega laptop this document
-is written around. [`benchmarks/nestripc-1.json`](../benchmarks/nestripc-1.json)
+[`benchmarks/vega-ryzen5-7530u-igpu.json`](../benchmarks/vega-ryzen5-7530u-igpu.json) is the Vega laptop this document
+is written around. [`benchmarks/rdna4-rx-9060-xt.json`](../benchmarks/rdna4-rx-9060-xt.json)
 is an **RDNA 4 desktop** — Ryzen 9 5950X, RX 9060 XT, `performance` governor —
 and it is a full run: gpu, scaling, seccomp and envelope. Where this document
 says a figure is Vega's, the RDNA 4 file is the place to check what it looks
@@ -62,7 +62,7 @@ a figure from a different host is a different figure, not a confirmation.
 >
 > **The RDNA 4 host is the validation, not a repeat.** It is a better-configured
 > machine, and re-running this suite there is the point of `scripts/` being one
-> command each. **That run has happened** — `benchmarks/nestripc-1.json`, and
+> command each. **That run has happened** — `benchmarks/rdna4-rx-9060-xt.json`, and
 > §16 for what it says.
 | libdrm | 2.4.134 |
 | virglrenderer | fork at `7fcfce4` **+ the patch in §6** |
@@ -474,7 +474,7 @@ unless there is a solo number to compare with.
 - **Do not carry any absolute figure to another GPU.** Vega iGPU, no dedicated VRAM,
   one synthetic workload.
 - **Do not read any of this as an RDNA 4 result.** That host was run separately;
-  its numbers are in `benchmarks/nestripc-1.json` and §16, and they are its own.
+  its numbers are in `benchmarks/rdna4-rx-9060-xt.json` and §16, and they are its own.
 - **Do not compare figures across warm-up conventions.** Anything measured before
   `--warmup` existed has a p99 that is really the GPU clock ramp (§8.2).
 - **Do not treat `nesprobe` as a stand-in for an application.** It says what the
@@ -658,7 +658,7 @@ is the same missing `O_DIRECT` that makes every guest byte cost host memory twic
 
 #### 12.2.1 With `O_DIRECT`, the same cap holds — and holds exactly
 
-Measured 2026-08-28 on `nestripc-1` (Ryzen 9 5950X; image on xfs, Samsung 850
+Measured 2026-08-28 on the RDNA 4 desktop (Ryzen 9 5950X; image on xfs, Samsung 850
 EVO, `/dev/sda`). Same cap, same 300 MiB `iflag=direct` guest read, and the host
 page cache **deliberately warmed over that exact region before every run** —
 warm is the case that failed above.
@@ -832,7 +832,7 @@ against 4993–6553, `par8` 15790–17895 against 5162–5592 — neither overla
 `rand4k` is 210–224 against 211–218, which is the same number twice. A second
 independent five-run set gave 1.56x, 3.19x and 0.99x.
 
-**The same comparison on `nestripc-1`**, the target machine -- AMD Ryzen 9
+**The same comparison on the RDNA 4 desktop**, the target machine -- AMD Ryzen 9
 5950X, 16 cores / 32 threads, image on xfs -- with both binaries forced to
 buffered so that only the datapath differs:
 `seq1m` **12582 against 7315 MB/s, 1.72x**; `par8` **26843 against 8659 MB/s,
@@ -870,7 +870,7 @@ is measured in §14.1, on a host that has filesystems that will do it.
 
 ## 14.1 `O_DIRECT`, on a host whose filesystems support it
 
-Measured 2026-08-28 on **`nestripc-1`**, which is the machine this is for: AMD
+Measured 2026-08-28 on **the RDNA 4 desktop**, which is the machine this is for: AMD
 Ryzen 9 5950X, 16 cores / 32 threads, 62 GiB, kernel 7.2.0-1-cachyos, `/` ext4
 on NVMe and `/mnt/INSTANCES` xfs on a Samsung 850 EVO SATA SSD. Guest: 4 vCPUs,
 2 GiB.
@@ -949,7 +949,7 @@ userspace, an eventfd write, a thread wakeup, and an interrupt.
 **Measured by removing the wakeup.** A worker can spin on its ring for a
 moment before sleeping (`"poll_us"` on a drive), which turns that wakeup into a
 memory read and can see a request before its notify has finished trapping. The
-difference between the two is what the path costs. `nestripc-1`, 8000 x 4 KiB
+difference between the two is what the path costs. the RDNA 4 desktop, 8000 x 4 KiB
 reads, one at a time:
 
 | what the read hits | `poll_us: 0` | polling | recovered |
@@ -1048,7 +1048,7 @@ because it made anything here faster.
 
 ## 15. Open, in the order that matters
 
-1. **RDNA 4.** ~~Untested.~~ **Run** — `benchmarks/nestripc-1.json`, §16.
+1. **RDNA 4.** ~~Untested.~~ **Run** — `benchmarks/rdna4-rx-9060-xt.json`, §16.
    Everything in §1–§14 is still Vega, and stays that way: the RDNA 4 figures
    are reported beside them, not merged into them.
 2. **Frame counts from a real application.** `nesprobe` counts its own; an
@@ -1071,3 +1071,75 @@ because it made anything here faster.
    both the SATA SSD with nothing else running. The `/` NVMe was only used for a
    correctness check, and no storage number here has ever been taken with a
    guest rendering.
+
+---
+
+## 16. RDNA 4, and a guest against its own host
+
+Everything above is the Vega laptop (§1). This section is a different machine —
+**RX 9060 XT, Ryzen 9 5950X, `performance` governor** — and a different
+question: not what a guest costs in the abstract, but what it costs *against the
+same box running the same load on bare metal*, minutes apart.
+
+Full result: [`benchmarks/rdna4-rx-9060-xt.json`](../benchmarks/rdna4-rx-9060-xt.json).
+
+`nesprobe`, 1920×1080, 30 s per run after an 8 s discard, **three reps** of every
+point, median of three, spread beside it:
+
+| `--cost` | host p50 | guest p50 | Δ p50 | Δ p99 | verdict |
+|---|---|---|---|---|---|
+| 8000 | 13.685 ms | 13.388 ms | −2.2% | −1.5% | within noise |
+| 2000 | 3.389 | 3.417 | +0.8% | +0.0% | within noise |
+| 400 | 0.714 | 0.751 | +5.2% | +6.4% | real |
+| 100 | 0.211 | 0.377 | +78.7% | +67.4% | real |
+| 0 | 0.091 | 0.120 | +31.9% | +38.2% | real |
+
+**The native context's cost is per submission, and it disappears as soon as the
+GPU is the bottleneck.** At 13 ms a frame it cannot be measured; at 0.2 ms it is
+most of the frame. A 60 Hz frame is 16.7 ms, which is the far end of this table.
+
+### The NVIDIA path, for comparison
+
+An NVIDIA guest does not use this path at all — it runs
+[virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu), which forwards the
+driver's ioctls instead of proxying submissions. Measured the same way on an RTX
+3060: −0.3% at 39 ms a frame, −0.8% at 9.9 ms, +1.9% at 2.0 ms, and +121% at
+0.5 ms. **The two designs are close to free where a game lives and expensive in
+opposite corners**: the native context pays per submission and nothing per idle
+frame; virtio-nvgpu pays nothing per submission and waits for the GPU between
+frames. Its numbers and method are in that repository's `BENCHMARKS.md`.
+
+### Re-taking this
+
+```sh
+# the guest side, one cost at a time, straight from this repo
+BENCH_COST=400 BENCH_SECONDS=30 BENCH_WARMUP=8 scripts/bench.sh --only gpu
+
+# the host side, the same probe on bare metal
+tools/nesprobe/target/release/nesprobe --cost 400 --seconds 30 --warmup 8
+```
+
+Then compare the two medians **from the same machine**. Repeat each point three
+times: the durable figure is a median with a spread beside it, and a difference
+smaller than the spread is not a difference.
+
+> ### Check for a guest nobody shut down
+>
+> Until `f924c28`, `bench.sh` never told its guest to power off, and the
+> `timeout` around the run kills `script` rather than the VMM it started. Every
+> run left a guest alive holding the GPU. A fifteen-run sweep left fifteen of
+> them; the machine ended at a load average of eight, and the numbers looked
+> ordinary — a little slower each run, with one point 74% off, which reads as an
+> interesting result rather than as a fault. An entire set was thrown away.
+>
+> `ps` for `release/nesbox`, and look at the load average, before believing a
+> GPU number.
+
+### What this does not support
+
+- **No comparison with another hypervisor.** None was run, here or anywhere in
+  this document. "Faster than X" is not a claim this data can carry.
+- **No absolute figure travels.** Millisecond numbers belong to this machine;
+  ratios belong to the software.
+- **No claim about a real game.** `nesprobe` is a synthetic load with a dial on
+  it, which is exactly why it can be compared — and exactly why it is not a game.

@@ -2,7 +2,6 @@
   "schema": 1,
   "disclaimer": "One host, one GPU, one synthetic workload. Ratios compare a guest to this same host and are the durable results; absolute figures are this machine's and not the hardware's. No comparison against another hypervisor was run, so nothing here supports a claim of being faster than one.",
   "provenance": {
-    "host": "nestripc-1",
     "kernel": "7.2.0-1-cachyos",
     "cpu": {
       "model": "AMD Ryzen 9 5950X 16-Core Processor",
@@ -38,7 +37,8 @@
       "nesbox_dirty": true,
       "virglrenderer": "d2723512",
       "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)"
-    }
+    },
+    "machine": "rdna4-rx-9060-xt"
   },
   "not_measured": {
     "network": "no iperf3 in the guest image; adding one is image work",

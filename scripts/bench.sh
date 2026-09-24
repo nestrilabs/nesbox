@@ -5,7 +5,7 @@
 #   scripts/bench.sh --only gpu
 #   scripts/bench.sh --list
 #
-# Writes benchmarks/<host>.json. Commit it: a committed result is what turns "it
+# Writes benchmarks/<gpu>.json. Commit it: a committed result is what turns "it
 # feels slower" into a diff.
 #
 # This script runs no measurement of its own. Every number comes from a harness
@@ -284,8 +284,10 @@ fi
 say "benchmarking on $(uname -n), render node $NODE"
 for s in "${to_run[@]}"; do RESULTS[$s]=$("section_$s"); done
 
-HOSTSLUG=$(uname -n | tr -cd 'A-Za-z0-9._-')
-[[ -n $OUT ]] || OUT="benchmarks/${HOSTSLUG:-unknown}.json"
+# Named for the GPU, not the machine: a result belongs to a card, and a
+# hostname in a public repository names a box that is often somebody else's.
+SLUG=$(bench_machine_slug | tr -cd 'A-Za-z0-9._-')
+[[ -n $OUT ]] || OUT="benchmarks/${SLUG:-unknown}.json"
 mkdir -p "$(dirname "$OUT")"
 
 {

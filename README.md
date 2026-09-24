@@ -1,10 +1,41 @@
 # nesbox
 
-**A microVM hypervisor for cloud streaming — GPU included.**
+**A fast microVM with GPU sharing. Guests render within 2% of bare metal, on the
+same card, at the same CPU cost — and boot to userspace in about a second.**
 
 nesbox runs a Linux guest with a real GPU attached, built for cloud gaming: boot
-a VM, hand it a game, stream the result. Each VM boots to userspace in about a
-second and shares one bare-metal GPU with its neighbours.
+a VM, hand it a game, stream the result. Many guests share one bare-metal card;
+none of them has a driver for it.
+
+## Is this what you are looking for?
+
+**Yes, if** you want many short-lived Linux VMs sharing one GPU, each rendering
+or encoding, isolated from each other, started in the time it takes to launch a
+process — and you can build your own guest kernel and Mesa.
+
+**No, if** you want a general-purpose hypervisor, a desktop VM with a display
+attached, Windows guests, or GPU passthrough of a whole card to one VM. nesbox
+does none of those and is not trying to.
+
+## The numbers
+
+Guest against **the same machine's bare metal**, same headless Vulkan load,
+median of three 30-second runs after an 8-second warm-up discard:
+
+| GPU | how the guest reaches it | frame time vs bare metal | CPU vs bare metal |
+|---|---|---|---|
+| **RX 9060 XT** (RDNA 4) | amdgpu native context, in-process | **99–102%** at ≥3.4 ms/frame | — |
+| **RTX 3060** | [virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu), vhost-user | **98–100%** at ≥2 ms/frame | 0.39 s vs 0.40 s |
+
+A 60 Hz frame is 16.7 ms and a 144 Hz frame is 6.9 ms, so "a game's frame" sits
+well inside the range where the difference is under 2%. Below about 2 ms a frame
+both paths cost real percentages, for opposite reasons — see
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §16, which also states plainly what
+these numbers do **not** support. (No other hypervisor was benchmarked, so
+nothing here says "faster than" anything.)
+
+Also measured, on one card, four guests at a time: throughput rises and each
+guest's frame time stays even. §5 of the same document.
 
 ## What it is
 
@@ -70,8 +101,10 @@ and nothing it does not.
 ### Host
 
 - Linux with KVM (`/dev/kvm`)
-- An **Intel or AMD GPU** with a DRM render node (`/dev/dri/renderD128`)
-- `libvirglrenderer` built with the DRM native context for your GPU
+- A GPU with a DRM render node (`/dev/dri/renderD128`) — **Intel or AMD** for
+  the native-context path below, or **NVIDIA** through `virtio-nvgpu`
+- for Intel or AMD: `libvirglrenderer` built with the DRM native context for
+  your GPU
 - `virtiofsd`, for shared directories
 - Host networking prepared once, by `scripts/nestri-net-setup.sh`. It makes the
   bridge and the persistent taps guests attach to. **nesbox itself needs no
@@ -80,11 +113,17 @@ and nothing it does not.
 
 > [!IMPORTANT]
 >
-> **Nvidia GPUs are not currently supported.**
-> We are developing `virtio-nvgpu`, a custom virtio driver for Nvidia hardware
-> [here](https://github.com/nestrilabs/virtio-nvgpu).
-> This work requires dedicated engineering time. If you would like to help fund
-> or contribute to it, please reach out.
+> **NVIDIA works, by a different route.** The native-context path above is for
+> Intel and AMD. An NVIDIA guest instead runs
+> [virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu), a vhost-user
+> device that forwards the driver's own ioctls, and needs NVIDIA's user-mode
+> libraries inside the guest rather than Mesa. It renders, presents and encodes
+> — the numbers above are from it — and it is young: one card, one driver
+> version, one guest at a time. Build nesbox with `--no-default-features` for
+> such a host; see below.
+>
+> Contributions and funding both help, and the second is why the first is
+> slower than it could be. Please reach out.
 
 ### Guest
 
@@ -247,8 +286,11 @@ Roughly in priority order:
   usage; lifecycle control over a socket is what is still missing.
 - **Shader cache mounting** — a persistent host directory for virglrenderer, to
   avoid recompiling shaders every boot.
-- **Nvidia GPU support (`virtio-nvgpu`)** — active development; requires
-  funding. Contributions and sponsorship welcome.
+- **NVIDIA, beyond one card and one guest** — `virtio-nvgpu` renders, presents
+  and encodes today, and the numbers at the top of this file are from it. What
+  it has not done is share a card between two guests, run on more than one
+  driver version, or run for longer than a few minutes at a time. That is the
+  work, and contributions and sponsorship both help it along.
 - **SR-IOV support** — dedicated GPU instances per VM where full hardware
   isolation is required.
 - **Multi-GPU support** — select a GPU per VM, or stripe across cards.

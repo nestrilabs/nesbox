@@ -49,6 +49,30 @@ _gpu_ids() {
         "${drv:-unknown}"
 }
 
+# A name for the machine, taken from the GPU in it rather than from its
+# hostname.
+#
+# A result belongs to a card, not to a box: "rdna4-rx-9060-xt" tells a reader
+# what they need and "somebody-desktop-2" tells them nothing, while naming a
+# machine that is often not ours to name. Falls back to the PCI id, and then to
+# "unknown", so this never blocks a run.
+bench_machine_slug() {
+    local node vendor device driver name
+    node=$(bench_render_node)
+    read -r vendor device driver <<<"$(_gpu_ids "$node")"
+    name=$(lspci -mm 2>/dev/null | awk -F'"' '/VGA|3D|Display/ { print $6; exit }')
+    name=${name%% [*}
+    name=$(printf '%s' "$name" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-')
+    name=${name%-}
+    if [ -n "$name" ]; then
+        printf '%s' "$name"
+    elif [ -n "${vendor:-}" ]; then
+        printf '%s' "${vendor}${device:+-$device}"
+    else
+        printf 'unknown'
+    fi
+}
+
 bench_provenance_json() {
     local node vendor device driver
     node=$(bench_render_node)
@@ -81,7 +105,7 @@ bench_provenance_json() {
 
     cat <<JSON
 {
-  "host": $(_json_str "$(uname -n)"),
+  "machine": $(_json_str "$(bench_machine_slug)"),
   "kernel": $(_json_str "$(uname -r)"),
   "cpu": {
     "model": $(_json_str "$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo)"),

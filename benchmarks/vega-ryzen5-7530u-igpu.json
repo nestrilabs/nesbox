@@ -2,7 +2,6 @@
   "schema": 1,
   "disclaimer": "One host, one GPU, one synthetic workload. Ratios compare a guest to this same host and are the durable results; absolute figures are this machine's and not the hardware's. No comparison against another hypervisor was run, so nothing here supports a claim of being faster than one.",
   "provenance": {
-    "host": "ns3",
     "kernel": "7.1.8-1-cachyos",
     "cpu": {
       "model": "AMD Ryzen 5 7530U with Radeon Graphics",
@@ -38,7 +37,8 @@
       "nesbox_dirty": true,
       "virglrenderer": "7fcfce4",
       "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
-    }
+    },
+    "machine": "vega-ryzen5-7530u-igpu"
   },
   "not_measured": {
     "network": "no iperf3 in the guest image; adding one is image work",
