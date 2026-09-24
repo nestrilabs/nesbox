@@ -438,6 +438,7 @@ fn main() -> Result<()> {
             &shared.tag,
             &shared.path_on_host,
             shared.read_only,
+            shared.guest_owner,
             &runtime_dir,
         )?;
         let fs_device = FsDevice::new(&shared.tag, daemon.socket_path(), vm.mem.clone())?;

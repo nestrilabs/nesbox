@@ -232,6 +232,16 @@ pub struct SharedDirectory {
     /// "only the downloader writes here" true by construction.
     #[serde(default)]
     pub read_only: bool,
+    /// `[uid, gid]` the guest should see as owning what this process owns.
+    ///
+    /// virtiofsd passes host ids straight through, so without this a guest
+    /// user sees a directory the host made for it as somebody else's -- and
+    /// Wine, for one, refuses a prefix it does not own. Set, virtiofsd maps
+    /// these guest ids to whatever uid and gid this VMM runs as, both ways:
+    /// the guest sees its own files, the host stores them as the VMM's user,
+    /// and nobody needs the privilege to `chown` anything.
+    #[serde(default)]
+    pub guest_owner: Option<[u32; 2]>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -776,10 +786,8 @@ mod whole_config_tests {
     /// the commoner one.
     #[test]
     fn a_misspelled_key_is_refused_rather_than_ignored() {
-        let err = serde_json::from_str::<VmConfig>(
-            r#"{ "machine_config": { "vcpu_count": 2 } }"#,
-        )
-        .expect_err("machine_config is not machine-config");
+        let err = serde_json::from_str::<VmConfig>(r#"{ "machine_config": { "vcpu_count": 2 } }"#)
+            .expect_err("machine_config is not machine-config");
         assert!(err.to_string().contains("machine_config"), "got: {err}");
     }
 
@@ -795,8 +803,10 @@ mod whole_config_tests {
                  ] }"#,
         )
         .expect("every key here is one this build understands");
-        assert_eq!(c.gpu_forward.expect("gpu-forward kept").socket,
-                   PathBuf::from("/tmp/nvgpu.sock"));
+        assert_eq!(
+            c.gpu_forward.expect("gpu-forward kept").socket,
+            PathBuf::from("/tmp/nvgpu.sock")
+        );
         assert!(c.shared_directories[0].read_only);
     }
 }

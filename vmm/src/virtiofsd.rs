@@ -82,6 +82,22 @@ fn resolve(path_env: Option<OsString>, fallbacks: &[&str]) -> Result<PathBuf> {
     )
 }
 
+/// The arguments that make `guest` own, in the guest, what `host` owns here.
+///
+/// `map` is bidirectional and 1:1: a file the host user owns reads as the
+/// guest's, and a file the guest user creates is stored as the host's. Done
+/// inside virtiofsd rather than with a user namespace, so it needs no
+/// privilege -- which is the point: the alternative was a `chown` to the
+/// guest's uid, and that needs `CAP_CHOWN`.
+fn translate_args(guest: [u32; 2], host: [u32; 2]) -> [String; 4] {
+    [
+        "--translate-uid".to_string(),
+        format!("map:{}:{}:1", guest[0], host[0]),
+        "--translate-gid".to_string(),
+        format!("map:{}:{}:1", guest[1], host[1]),
+    ]
+}
+
 /// A running virtiofsd, killed on drop.
 pub struct Virtiofsd {
     child: Child,
@@ -99,6 +115,7 @@ impl Virtiofsd {
         tag: &str,
         shared_dir: &Path,
         read_only: bool,
+        guest_owner: Option<[u32; 2]>,
         runtime_dir: &Path,
     ) -> Result<Self> {
         anyhow::ensure!(
@@ -138,6 +155,11 @@ impl Virtiofsd {
             .stdout(Stdio::null());
         if read_only {
             cmd.arg("--readonly");
+        }
+        if let Some(guest) = guest_owner {
+            // SAFETY: neither call has preconditions or can fail.
+            let host = unsafe { [libc::getuid(), libc::getgid()] };
+            cmd.args(translate_args(guest, host));
         }
 
         let child = cmd
@@ -214,6 +236,22 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         dir
+    }
+
+    /// The guest's ids come first and the host's second: `map` is
+    /// `<guest base>:<host base>:<count>`, and the reverse order would hand the
+    /// host's uid to the guest and store its files as a uid nobody has.
+    #[test]
+    fn a_guest_owner_maps_the_guests_ids_onto_this_processs() {
+        assert_eq!(
+            translate_args([1001, 1001], [1000, 985]),
+            [
+                "--translate-uid",
+                "map:1001:1000:1",
+                "--translate-gid",
+                "map:1001:985:1"
+            ]
+        );
     }
 
     #[test]
