@@ -271,6 +271,13 @@ What is missing is as important:
   host that isolates CPUs at runtime with a cpuset partition passes
   `vcpu_cgroup_fd` and `io_cgroup_fd`, descriptors it opened on the two
   cgroups' `cgroup.threads`, and nesbox moves its own threads between them.
+- **Huge pages are best-effort unless reserved.** By default guest RAM asks
+  for transparent huge pages and silently gets 4 KiB pages once host memory
+  is fragmented. `hugepages: "2m"` or `"1g"` backs it from the host's hugetlb
+  pool instead, reserved in full when the box starts, so a short pool refuses
+  the box rather than failing it later; sizing the pool is the caller's job.
+  `prefault: true` faults all of guest RAM in on a background thread, so no
+  vCPU stalls on a page's first touch, at the cost of committing it all.
 - **Performance numbers live in [BENCHMARKS.md](docs/BENCHMARKS.md)**, measured on
   one host; this README quotes none of them.
 

@@ -6,7 +6,8 @@ use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use std::os::fd::FromRawFd;
 use std::sync::Arc;
-use vm_memory::{Address, FileOffset, GuestMemoryBackend, GuestMemoryMmap};
+use vm_memory::mmap::MmapRegionBuilder;
+use vm_memory::{Address, FileOffset, GuestMemoryBackend, GuestMemoryMmap, GuestRegionMmap};
 
 pub struct Vm {
     pub kvm: Kvm,
@@ -124,9 +125,11 @@ impl Vm {
         // Guest RAM is backed by a memfd and mapped shared, so vhost-user
         // backends such as virtiofsd can map it into their own address space.
         // Anonymous private memory would leave them unable to see it.
-        let mem_file = create_memfd(mem_size).context("Failed to create guest memory file")?;
+        let hugetlb = machine.hugepages.hugetlb_size();
+        let mem_file =
+            create_memfd(mem_size, hugetlb).context("Failed to create guest memory file")?;
         let mut file_offset = 0u64;
-        let ranges = regions
+        let mapped = regions
             .iter()
             .map(|&(start, size)| {
                 let offset = file_offset;
@@ -134,25 +137,30 @@ impl Vm {
                 let file = mem_file
                     .try_clone()
                     .context("Failed to clone the guest memory file")?;
-                Ok((start, size, Some(FileOffset::new(file, offset))))
+                map_ram(FileOffset::new(file, offset), size, start, hugetlb)
             })
             .collect::<Result<Vec<_>>>()?;
-        let mem = GuestMemoryMmap::from_ranges_with_files(&ranges)
-            .context("Failed to create guest memory")?;
+        let mem = GuestMemoryMmap::from_regions(mapped).context("Failed to create guest memory")?;
         let mem = Arc::new(mem);
 
         for (slot, &(start, size)) in regions.iter().enumerate() {
             let host_addr = mem
                 .get_host_address(start)
                 .context("Failed to get host address")?;
-            let huge = advise_huge(host_addr, size);
+            // A hugetlb mapping has its page size already; the advice is for
+            // shmem, and would only be refused.
+            let pages = match hugetlb {
+                Some(page) => format!(", {} MiB hugetlb pages", page >> 20),
+                None if advise_huge(host_addr, size) => ", huge pages requested".to_owned(),
+                None => String::new(),
+            };
             log::info!(
-                "RAM slot {}: guest {:#x}..{:#x} ({} MiB){}",
+                "RAM slot {}: guest {:#x}..{:#x} ({} MiB{})",
                 slot,
                 start.raw_value(),
                 start.raw_value() + size as u64,
                 size / (1024 * 1024),
-                if huge { "  huge pages requested" } else { "" }
+                pages
             );
             unsafe {
                 vm_fd
@@ -165,6 +173,10 @@ impl Vm {
                     })
                     .context("Failed to set user memory region")?;
             }
+        }
+
+        if machine.prefault {
+            spawn_prefault(mem.clone(), regions.clone());
         }
 
         // Load kernel
@@ -236,19 +248,115 @@ impl Vm {
     }
 }
 
-/// Create an anonymous, sealable shared memory file of `size` bytes.
-fn create_memfd(size: u64) -> Result<std::fs::File> {
+/// Create an anonymous shared memory file of `size` bytes, on hugetlb pages of
+/// `hugetlb` bytes when given.
+fn create_memfd(size: u64, hugetlb: Option<u64>) -> Result<std::fs::File> {
     let name = c"nesbox-guest-ram";
+    let flags = match hugetlb {
+        None => libc::MFD_CLOEXEC,
+        Some(page) if page == 1 << 30 => libc::MFD_CLOEXEC | libc::MFD_HUGETLB | libc::MFD_HUGE_1GB,
+        Some(_) => libc::MFD_CLOEXEC | libc::MFD_HUGETLB | libc::MFD_HUGE_2MB,
+    };
     // SAFETY: `name` is a valid NUL-terminated string and the flags are valid.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("memfd_create");
+        let err = std::io::Error::last_os_error();
+        return match hugetlb {
+            // EINVAL is the kernel saying it has no pool of that size at all,
+            // which is a host that was never set up for it rather than a bug.
+            Some(page) if err.raw_os_error() == Some(libc::EINVAL) => Err(err)
+                .with_context(|| format!("this host has no {} MiB hugetlb pages", page >> 20)),
+            _ => Err(err).context("memfd_create"),
+        };
     }
     // SAFETY: memfd_create just handed us this fd and nothing else owns it.
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
     file.set_len(size)
         .context("failed to size the guest memory file")?;
     Ok(file)
+}
+
+/// Map one region of guest RAM from the memory file, shared so vhost-user
+/// backends see the same pages.
+///
+/// vm-memory's own file mapping passes `MAP_NORESERVE`. For shmem that changes
+/// nothing, but for hugetlb it means no pool pages are set aside when the
+/// mapping is made: a pool that runs dry then shows up when the next page is
+/// first touched -- `KVM_RUN` failing on a vCPU, or SIGBUS on a device thread --
+/// in the middle of a session, rather than as a box that will not start. Without it the kernel reserves every page of the region
+/// here and refuses the mapping if the pool is short. Reserving takes pages off
+/// the free count without zeroing them, so it costs nothing at boot.
+fn map_ram(
+    file: FileOffset,
+    size: usize,
+    start: vm_memory::GuestAddress,
+    hugetlb: Option<u64>,
+) -> Result<GuestRegionMmap> {
+    let flags = match hugetlb {
+        Some(_) => libc::MAP_SHARED,
+        None => libc::MAP_SHARED | libc::MAP_NORESERVE,
+    };
+    let region = MmapRegionBuilder::new_with_bitmap(size, ())
+        .with_file_offset(file)
+        .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+        .with_mmap_flags(flags)
+        .with_hugetlbfs(hugetlb.is_some())
+        .build();
+    let region = match (region, hugetlb) {
+        (Ok(region), _) => region,
+        (Err(e), Some(page)) => {
+            let kib = page >> 10;
+            return Err(e).with_context(|| {
+                format!(
+                    "could not reserve {} MiB of {} MiB hugetlb pages for guest RAM; \
+                     the pool is set by /sys/kernel/mm/hugepages/hugepages-{kib}kB/nr_hugepages \
+                     and what is left of it is free_hugepages minus resv_hugepages",
+                    size >> 20,
+                    page >> 20
+                )
+            });
+        }
+        (Err(e), None) => return Err(e).context("Failed to map guest memory"),
+    };
+    GuestRegionMmap::new(region, start).context("guest RAM region wraps the address space")
+}
+
+/// Fault in all of guest RAM on a thread of its own.
+///
+/// `MADV_POPULATE_WRITE` allocates each page as a write would, without writing,
+/// so it is safe to race with the guest: a page the guest reached first is left
+/// as it is. The thread inherits the I/O CPUs from whoever builds the VM, so
+/// the zeroing does not compete with the vCPUs.
+fn spawn_prefault(mem: Arc<GuestMemoryMmap>, regions: Vec<layout::RamRegion>) {
+    let spawned = std::thread::Builder::new()
+        .name("prefault".into())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            for &(start, size) in &regions {
+                let Ok(host_addr) = mem.get_host_address(start) else {
+                    continue;
+                };
+                // SAFETY: a range of a mapping `mem` owns and keeps alive for
+                // the duration of the call. POPULATE_WRITE writes nothing.
+                let ret =
+                    unsafe { libc::madvise(host_addr.cast(), size, libc::MADV_POPULATE_WRITE) };
+                if ret != 0 {
+                    log::warn!(
+                        "prefault: guest RAM at {:#x} left to fault on first touch: {}",
+                        start.raw_value(),
+                        std::io::Error::last_os_error()
+                    );
+                    return;
+                }
+            }
+            log::info!(
+                "prefault: guest RAM faulted in after {:?}",
+                started.elapsed()
+            );
+        });
+    if let Err(e) = spawned {
+        log::warn!("prefault: could not start the thread, so guest RAM faults on first touch: {e}");
+    }
 }
 
 pub fn run_vcpu_loop(

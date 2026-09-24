@@ -167,7 +167,10 @@ not enforce a GTT limit because GTT is host system memory and that is supposed t
 be capped for the process. Nothing here caps it. nesbox now reports the limits
 actually in force at startup — walking up the cgroup hierarchy, because an
 ancestor's limit bounds us while our own file still reads `max` — and warns when
-there is no `memory.max` above it at all.
+there is no `memory.max` above it at all. Guest RAM on hugetlb pages
+(`hugepages: "2m"` or `"1g"`) is outside `memory.max` entirely unless cgroup v2
+is mounted with `memory_hugetlb_accounting`; the pool's size and the `hugetlb`
+controller are what bound it.
 
 ## What this does not do yet
 

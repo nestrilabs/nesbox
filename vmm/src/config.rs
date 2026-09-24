@@ -370,6 +370,47 @@ pub struct MachineConfig {
     /// cgroup, on the pinned CPUs, and are moved back out through this.
     #[serde(default)]
     pub io_cgroup_fd: Option<i32>,
+    /// What page size backs guest RAM. `transparent` if absent.
+    #[serde(default)]
+    pub hugepages: HugePages,
+    /// Fault in every page of guest RAM on a background thread once the VM is
+    /// built, instead of on the guest's first touch.
+    ///
+    /// A first touch allocates and zeroes a page with the vCPU stopped, and for
+    /// a huge page that is a stall long enough to land in a frame. Prefaulted,
+    /// that cost is paid while the guest boots. The price is density: the
+    /// host commits all of guest RAM up front, where untouched memory would
+    /// otherwise cost nothing.
+    #[serde(default)]
+    pub prefault: bool,
+}
+
+/// The page size behind guest RAM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum HugePages {
+    /// Transparent huge pages, asked for and taken where the kernel has them.
+    /// Nothing needs reserving, and nothing is guaranteed: once host memory is
+    /// fragmented the guest quietly runs on 4 KiB pages.
+    #[default]
+    #[serde(rename = "transparent")]
+    Transparent,
+    /// 2 MiB pages from the host's hugetlb pool.
+    #[serde(rename = "2m")]
+    Huge2M,
+    /// 1 GiB pages from the host's hugetlb pool.
+    #[serde(rename = "1g")]
+    Huge1G,
+}
+
+impl HugePages {
+    /// The hugetlb page size in bytes, or `None` for transparent pages.
+    pub fn hugetlb_size(self) -> Option<u64> {
+        match self {
+            HugePages::Transparent => None,
+            HugePages::Huge2M => Some(2 << 20),
+            HugePages::Huge1G => Some(1 << 30),
+        }
+    }
 }
 
 fn default_vcpus() -> u8 {
@@ -394,6 +435,8 @@ impl Default for MachineConfig {
             dedicated: false,
             vcpu_cgroup_fd: None,
             io_cgroup_fd: None,
+            hugepages: HugePages::default(),
+            prefault: false,
         }
     }
 }
@@ -449,6 +492,14 @@ impl MachineConfig {
              step into the partition but not back out leaves kernel workers \
              pinned inside it"
         );
+        if let Some(page) = self.hugepages.hugetlb_size() {
+            let page_mib = page >> 20;
+            anyhow::ensure!(
+                self.mem_size_mib as u64 % page_mib == 0,
+                "mem_size_mib {} is not a whole number of {page_mib} MiB huge pages",
+                self.mem_size_mib
+            );
+        }
         Ok(())
     }
 
@@ -555,6 +606,41 @@ mod machine_config_tests {
             ..pinned(&[0, 1, 2])
         };
         assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn hugepages_parse_and_default_to_transparent() {
+        let mc: MachineConfig = serde_json::from_str(r#"{ "mem_size_mib": 4096 }"#).unwrap();
+        assert_eq!(mc.hugepages, HugePages::Transparent);
+        assert!(!mc.prefault);
+        let mc: MachineConfig = serde_json::from_str(
+            r#"{ "mem_size_mib": 4096, "hugepages": "1g", "prefault": true }"#,
+        )
+        .unwrap();
+        assert_eq!(mc.hugepages, HugePages::Huge1G);
+        assert!(mc.prefault);
+        assert!(serde_json::from_str::<MachineConfig>(r#"{ "hugepages": "4k" }"#).is_err());
+    }
+
+    /// A pool page cannot be split, so RAM that ends mid-page cannot be backed.
+    #[test]
+    fn hugetlb_ram_must_be_whole_pages() {
+        let with = |mem_size_mib, hugepages| MachineConfig {
+            mem_size_mib,
+            hugepages,
+            ..MachineConfig::default()
+        };
+        with(4096, HugePages::Huge1G)
+            .validate()
+            .expect("four pages");
+        assert!(with(3584, HugePages::Huge1G).validate().is_err());
+        with(3584, HugePages::Huge2M)
+            .validate()
+            .expect("1792 pages");
+        assert!(with(1025, HugePages::Huge2M).validate().is_err());
+        with(1025, HugePages::Transparent)
+            .validate()
+            .expect("transparent pages impose nothing");
     }
 
     #[test]
