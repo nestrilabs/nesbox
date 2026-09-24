@@ -9,3 +9,7 @@ tools/nesprobe/target
 
 # build/'s own output — an unpacked jail image, not source
 /build/output/
+
+# Scratch VM configs. They name paths on one machine; examples/ holds the
+# ones meant to be read.
+/test-*.json
