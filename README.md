@@ -123,9 +123,10 @@ and nothing it does not.
 > [virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu), a vhost-user
 > device that forwards the driver's own ioctls, and needs NVIDIA's user-mode
 > libraries inside the guest rather than Mesa. It renders, presents and encodes
-> — the numbers above are from it — and it is young: one card, one driver
-> version, one guest at a time. Build nesbox with `--no-default-features` for
-> such a host; see below.
+> — the numbers above are from it — and it is young: measured on driver
+> **595.99.02**, with ABI profiles for 535.129.03, 580.178.04 and 595.71.05 and
+> anything older refused. Four guests share one card; more has not been tried.
+> Build nesbox with `--no-default-features` for such a host; see below.
 >
 > Contributions and funding both help, and the second is why the first is
 > slower than it could be. Please reach out.
