@@ -137,7 +137,13 @@ impl Vm {
                 let file = mem_file
                     .try_clone()
                     .context("Failed to clone the guest memory file")?;
-                map_ram(FileOffset::new(file, offset), size, start, hugetlb)
+                map_ram(
+                    FileOffset::new(file, offset),
+                    size,
+                    start,
+                    hugetlb,
+                    mem_size,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let mem = GuestMemoryMmap::from_regions(mapped).context("Failed to create guest memory")?;
@@ -291,6 +297,7 @@ fn map_ram(
     size: usize,
     start: vm_memory::GuestAddress,
     hugetlb: Option<u64>,
+    total: u64,
 ) -> Result<GuestRegionMmap> {
     let flags = match hugetlb {
         Some(_) => libc::MAP_SHARED,
@@ -308,11 +315,14 @@ fn map_ram(
             let kib = page >> 10;
             return Err(e).with_context(|| {
                 format!(
-                    "could not reserve {} MiB of {} MiB hugetlb pages for guest RAM; \
-                     the pool is set by /sys/kernel/mm/hugepages/hugepages-{kib}kB/nr_hugepages \
-                     and what is left of it is free_hugepages minus resv_hugepages",
+                    "guest RAM needs {} MiB of {} MiB hugetlb pages, and the pool ran short \
+                     reserving the {} MiB at {:#x}; the pool is set by \
+                     /sys/kernel/mm/hugepages/hugepages-{kib}kB/nr_hugepages and what is left \
+                     of it is free_hugepages minus resv_hugepages",
+                    total >> 20,
+                    page >> 20,
                     size >> 20,
-                    page >> 20
+                    start.raw_value()
                 )
             });
         }
