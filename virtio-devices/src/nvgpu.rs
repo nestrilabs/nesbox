@@ -346,22 +346,30 @@ impl Inner {
             .set_backend_request_fd(&handler.get_tx_raw_fd())
             .context("VHOST_USER_SET_BACKEND_REQ_FD")?;
 
-        std::thread::Builder::new()
-            .name("nvgpu-window".into())
-            .spawn(move || {
-                loop {
-                    match handler.handle_request() {
-                        Ok(_) => {}
-                        Err(e) => {
-                            // The backend closing is an ordinary shutdown, not
-                            // a fault; anything else is worth a line.
-                            log::debug!("nvgpu window request channel closed: {e}");
-                            break;
+        // Spawned from the I/O set, because this runs on whichever vCPU thread
+        // wrote DRIVER_OK and a thread is born with its parent's CPUs and
+        // cgroup. Left on a pinned vCPU's CPU, every mapping request would wait
+        // for the host to take that CPU from the guest -- which, dedicated, it
+        // never gives back by halting -- while the backend blocks on the reply
+        // and the guest's map ioctl blocks on the backend.
+        crate::affinity::with_io_affinity("nvgpu-window", || {
+            std::thread::Builder::new()
+                .name("nvgpu-window".into())
+                .spawn(move || {
+                    loop {
+                        match handler.handle_request() {
+                            Ok(_) => {}
+                            Err(e) => {
+                                // The backend closing is an ordinary shutdown,
+                                // not a fault; anything else is worth a line.
+                                log::debug!("nvgpu window request channel closed: {e}");
+                                break;
+                            }
                         }
                     }
-                }
-            })
-            .context("spawning the window request thread")?;
+                })
+        })
+        .context("spawning the window request thread")?;
         Ok(())
     }
 

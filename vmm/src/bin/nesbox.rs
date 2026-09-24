@@ -81,6 +81,10 @@ fn main() -> Result<()> {
     let config_str = std::fs::read_to_string(&config_path).context("Failed to read config")?;
     let config: config::VmConfig =
         serde_json::from_str(&config_str).context("Invalid JSON config")?;
+    config
+        .machine_config
+        .validate()
+        .context("Invalid machine_config")?;
 
     // Raw mode belongs to the guest console and nothing else, and is entered
     // only once the config has parsed: raw mode turns off echo, line buffering
@@ -136,10 +140,33 @@ fn main() -> Result<()> {
     #[cfg(feature = "virgl")]
     nesbox_vmm::renderer::check(config.gpu.as_ref().and_then(|g| g.vram_limit_mib))?;
 
+    // ── Where the threads that are not vCPUs go ───────────────────────────
+    // Set on this thread before anything is spawned, so the block and console
+    // workers, the stats server, every virtiofsd and the watcher all inherit
+    // it. The vCPU threads each replace it with their own below; what they
+    // spawn on activation is handled by `affinity::with_io_affinity`.
+    //
+    // The affinity this process started with is kept for vCPU threads that
+    // were given no placement of their own, so an I/O set alone does not
+    // quietly confine the guest to it too.
+    let started_on = virtio_devices::affinity::current().ok();
+    let io_cpus = config.machine_config.io_cpus().to_vec();
+    virtio_devices::affinity::set_io_cpus(&io_cpus);
+    if let (Some(vcpu), Some(io)) = (
+        config.machine_config.vcpu_cgroup_fd,
+        config.machine_config.io_cgroup_fd,
+    ) {
+        virtio_devices::affinity::set_cgroup_fds(virtio_devices::affinity::CgroupFds { vcpu, io });
+    }
+    if let Some(set) = virtio_devices::affinity::cpu_set(&io_cpus)
+        && let Err(e) = virtio_devices::affinity::apply(&set)
+    {
+        eprintln!("io_affinity: could not confine the VMM's own threads: {e}");
+    }
+
     // Create KVM VM
     let vm = vm::Vm::new(
-        config.machine_config.mem_size_mib,
-        config.machine_config.vcpu_count,
+        &config.machine_config,
         &config.boot_source.kernel_image_path,
         &config.boot_source.boot_args,
     )?;
@@ -310,10 +337,13 @@ fn main() -> Result<()> {
                 window_limit_bytes: gpu_cfg.host_visible_window_mib.map_or(0, |m| m * (1 << 20)),
                 window_max_mappings: gpu_cfg.host_visible_max_mappings.unwrap_or(0),
                 poll_us: gpu_cfg.poll_us,
-                // The same set the vCPU threads get: the worker is the other
-                // half of every forwarded command, and placing one without the
-                // other leaves the handoff crossing dies anyway.
-                cpu_affinity: config.machine_config.cpu_affinity.clone(),
+                // The I/O set, which is the guest's own set unless the caller
+                // named a separate one. Either way it stays in the guest's L3
+                // domain: the worker is the other half of every forwarded
+                // command, and a handoff crossing dies costs on every one. It
+                // confines itself explicitly because it is spawned on
+                // activation, from a vCPU thread whose pin it would inherit.
+                cpu_affinity: io_cpus.clone(),
             },
             vm.mem.clone(),
         )?);
@@ -465,10 +495,18 @@ fn main() -> Result<()> {
     nesbox_vmm::seccomp::apply_baseline(seccomp_mode).context("could not confine the VMM")?;
 
     // ── Run vCPUs ─────────────────────────────────────────────────────────
-    // The CPU set every vCPU thread is confined to, if the config named one.
-    // Built once here rather than per thread: it is the same set for all of
-    // them, and cpu_set_t is Copy.
-    let cpuset = build_cpuset(&config.machine_config.cpu_affinity);
+    // Where each vCPU thread goes: its own pin if it has one, otherwise the
+    // shared set, otherwise back to where the process started -- this thread
+    // may already be on the I/O set, and a vCPU inheriting that would put the
+    // guest on the CPUs meant for serving it. cpu_set_t is Copy.
+    let shared =
+        virtio_devices::affinity::cpu_set(&config.machine_config.cpu_affinity).or(started_on);
+    let placements: Vec<Option<libc::cpu_set_t>> = (0..vm.vcpus.len())
+        .map(|i| match config.machine_config.vcpu_pins.get(i) {
+            Some(&cpu) => virtio_devices::affinity::cpu_set(&[cpu]),
+            None => shared,
+        })
+        .collect();
 
     let handles: Vec<_> = vm
         .vcpus
@@ -480,14 +518,28 @@ fn main() -> Result<()> {
             let serial = serial.clone();
             let power = power.clone();
             let shutdown = shutdown.clone();
+            let placement = placements[vcpu_id];
+            let cgroup_fd = config.machine_config.vcpu_cgroup_fd;
             std::thread::Builder::new()
                 // Named so the threads are identifiable from the host. Without
                 // this they are anonymous, and anything done to place them --
                 // by us or by an operator with taskset -- cannot be checked.
                 .name(format!("vcpu{vcpu_id}"))
                 .spawn(move || {
-                    if let Some(set) = cpuset {
-                        set_affinity_or_warn(vcpu_id, &set);
+                    // Into the partition first: until then its CPUs are not in
+                    // this thread's cpuset, and the pin below is refused.
+                    if let Some(fd) = cgroup_fd
+                        && let Err(e) = virtio_devices::affinity::join_cgroup(fd)
+                    {
+                        eprintln!("vcpu{vcpu_id}: could not join the vCPU cgroup: {e}");
+                    }
+                    if let Some(set) = placement
+                        && let Err(e) = virtio_devices::affinity::apply(&set)
+                    {
+                        // A warning rather than a failure: placement is an
+                        // optimisation, and a guest on the wrong cores is
+                        // better than one that does not boot.
+                        eprintln!("vcpu{vcpu_id}: could not set CPU affinity: {e}");
                     }
                     // NOT confined further, and the reason is structural.
                     //
@@ -521,8 +573,19 @@ fn main() -> Result<()> {
         let shutdown = shutdown.clone();
         let vcpu_threads: Vec<_> = handles.iter().map(|h| h.as_pthread_t()).collect();
         std::thread::spawn(move || {
+            // KVM's own workers appear with the first KVM_RUN, on a vCPU's
+            // CPU: moved at half a second, and again at five for one created
+            // late.
+            let mut ticks = 0u32;
             while !shutdown.is_requested() {
                 std::thread::sleep(std::time::Duration::from_millis(50));
+                ticks = ticks.saturating_add(1);
+                if ticks == 10 || ticks == 100 {
+                    let moved = virtio_devices::affinity::rehome_kvm_workers();
+                    if moved > 0 {
+                        log::debug!("moved {moved} KVM worker(s) to the I/O CPUs");
+                    }
+                }
             }
             for thread in vcpu_threads {
                 // SAFETY: the vCPU threads are joined below, so these ids stay
@@ -572,53 +635,6 @@ extern "C" fn stop_handler(_: libc::c_int) {
 static SHUTDOWN: std::sync::OnceLock<Arc<Shutdown>> = std::sync::OnceLock::new();
 
 /// SIGTERM and SIGINT ask the VM to stop; SIGUSR1 just interrupts KVM_RUN.
-/// Build the CPU set the vCPU threads are confined to, or `None` for "wherever
-/// the host likes".
-///
-/// Returns `None` for an empty list rather than an empty `cpu_set_t`: an empty
-/// set is not "no restriction", it is "no CPU at all", and `sched_setaffinity`
-/// rejects it. Reading an absent config field as that would be a hang, not a
-/// default.
-fn build_cpuset(cpus: &[usize]) -> Option<libc::cpu_set_t> {
-    if cpus.is_empty() {
-        return None;
-    }
-    // SAFETY: all-zeros is a valid cpu_set_t, and CPU_ZERO makes that explicit.
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    unsafe { libc::CPU_ZERO(&mut set) };
-    for cpu in cpus {
-        // CPU_SET is out-of-bounds for anything past CPU_SETSIZE, so a config
-        // naming a CPU this host does not have is dropped rather than
-        // corrupting the set beside it. sched_setaffinity would reject the
-        // whole call for an unknown CPU anyway; skipping keeps the CPUs that
-        // do exist usable.
-        if *cpu < libc::CPU_SETSIZE as usize {
-            // SAFETY: FFI call, index bounds checked above.
-            unsafe { libc::CPU_SET(*cpu, &mut set) };
-        } else {
-            eprintln!("cpu_affinity: ignoring CPU {cpu}, past CPU_SETSIZE");
-        }
-    }
-    Some(set)
-}
-
-/// Confine the calling thread to `set`.
-///
-/// A warning rather than a failure: placement is an optimisation, and a guest
-/// that runs on the wrong cores is better than one that does not boot. The
-/// usual cause is a config naming CPUs this host does not have, which is worth
-/// seeing but not worth dying over.
-fn set_affinity_or_warn(vcpu_id: usize, set: &libc::cpu_set_t) {
-    // SAFETY: FFI call; pid 0 is the calling thread, and the size matches.
-    let ret = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set) };
-    if ret != 0 {
-        eprintln!(
-            "vcpu{vcpu_id}: could not set CPU affinity: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
 fn install_signal_handlers(shutdown: Arc<Shutdown>) -> Result<()> {
     let _ = SHUTDOWN.set(shutdown);
     // SAFETY: both handlers are async-signal-safe.

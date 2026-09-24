@@ -46,6 +46,8 @@ struct Inner {
     cfg: [u8; 256],
     msix_cap: u16,
     backend: VhostVsockBackend<Arc<GuestMemoryMmap>>,
+    /// Features the kernel backend reports, as `VHOST_GET_FEATURES` gives them.
+    backend_features: u64,
     /// One kick eventfd per queue, signalled when the guest notifies.
     kick_fds: Vec<EventFd>,
     running: bool,
@@ -53,9 +55,17 @@ struct Inner {
 
 impl Inner {
     fn features(&self) -> u64 {
-        // Keep the negotiated set minimal: the ring layout the backend and the
-        // guest must agree on, and nothing optional.
+        // The ring layout the backend and the guest must agree on, so each
+        // optional bit only where the kernel backend reports it. EVENT_IDX
+        // lets each side name the ring index at which it next wants a kick or
+        // an interrupt, so fewer are sent under load; INDIRECT_DESC lets a
+        // packet take one ring slot.
+        //
+        // The event queue stays with us and is never posted to. EVENT_IDX
+        // does not change that: an interrupt the guest did not ask for is
+        // always allowed, and nothing here waits on a kick from that queue.
         VIRTIO_F_VERSION_1
+            | (self.backend_features & (VIRTIO_F_RING_EVENT_IDX | VIRTIO_F_RING_INDIRECT_DESC))
     }
 
     /// Hand the queues to the kernel and start moving packets.
@@ -68,7 +78,10 @@ impl Inner {
         }
         let mem = self.mem.clone().context("guest memory not attached")?;
 
-        self.backend.set_owner().context("VHOST_SET_OWNER")?;
+        // See the same call in net.rs: the vhost worker is born with this
+        // thread's affinity, and this thread is a vCPU.
+        crate::affinity::with_io_affinity("virtio-vsock", || self.backend.set_owner())
+            .context("VHOST_SET_OWNER")?;
 
         let acked = self.com.df & self.features();
         self.backend
@@ -183,6 +196,7 @@ impl VsockDevice {
         anyhow::ensure!(cid > VMADDR_CID_HOST, "guest cid must be greater than 2");
         let backend = VhostVsockBackend::new(mem.clone())
             .context("failed to open /dev/vhost-vsock — is the vhost_vsock module loaded?")?;
+        let backend_features = backend.get_features().context("VHOST_GET_FEATURES")?;
         let kick_fds = (0..NUM_QUEUES)
             .map(|_| EventFd::new(0).context("failed to create vsock kick eventfd"))
             .collect::<Result<Vec<_>>>()?;
@@ -202,6 +216,7 @@ impl VsockDevice {
                 cfg,
                 msix_cap,
                 backend,
+                backend_features,
                 kick_fds,
                 running: false,
             }),
