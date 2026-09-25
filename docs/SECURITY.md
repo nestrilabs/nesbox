@@ -64,10 +64,16 @@ by the VMM itself.
   nothing checked.
 - **`chroot` fights the requirements** *if the jail is built to exclude the
   host.* `tools/jailer` takes the opposite approach: bind-mount in the DRM
-  render node, `/dev/kvm`, any vhost device nodes, `/sys`, `/proc` and the
-  metrics socket path a box needs, at the same path inside the jail, then
+  render node, `/dev/kvm`, any vhost device nodes, `/sys`, `/proc`, the
+  metrics socket path and a GPU forwarding backend's socket a box needs, at
+  the same path inside the jail, then
   chroot. Nothing is discovered or guessed — every path is named on the
   jailer's own command line by whatever launches it.
+
+  A forwarding box gets the socket and **no NVIDIA device node**. The backend
+  on the other end of that socket holds the GPU's descriptors in its own
+  process, outside the jail, so this jail bounds nesbox and says nothing
+  about the backend. Confining the backend is its own unfinished work.
 
   That list is not only hardware, and pretending it was would have produced a
   jailed nesbox that cannot find its own kernel. nesbox opens its config file,

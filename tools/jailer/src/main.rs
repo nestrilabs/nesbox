@@ -42,6 +42,8 @@
 //!   * `boot-source.kernel_image_path`     the kernel nesbox loads
 //!   * `drives[].path_on_host`             every disk image
 //!   * `gpu.render-node`                   the DRM render node
+//!   * `gpu-forward.socket`                the forwarding backend's socket
+//!   * `gpu-forward.proc-nvidia`           only if it is outside /proc
 //!   * `network`, if present               /dev/net/tun and /dev/vhost-net
 //!   * `vsock`, if present                 /dev/vhost-vsock
 //!   * `stats-socket`, if present          the directory it is created in
@@ -130,10 +132,10 @@ const USAGE: &str = "Usage:
   jailer --config <box.json> --jail-root <path> --uid <uid> --gid <gid> [options]
 
 Runs nesbox inside a jail. Reads <box.json> to work out which host paths that
-box needs -- its kernel, its disk images, its render node, its tap and vhost
-devices, its virtiofs sources, its metrics directory -- bind-mounts them into
-<jail-root> at the same path, chroots, drops from root to <uid>:<gid>, and
-execs nesbox with the same config.
+box needs -- its kernel, its disk images, its render node or GPU forwarding
+socket, its tap and vhost devices, its virtiofs sources, its metrics
+directory -- bind-mounts them into <jail-root> at the same path, chroots,
+drops from root to <uid>:<gid>, and execs nesbox with the same config.
 
 Must run as root -- that is the whole point: it does the things nesbox's own
 seccomp filter refuses to let nesbox do to itself. Nothing it does stays
@@ -273,6 +275,8 @@ struct BoxConfig {
     drives: Vec<Drive>,
     #[serde(default)]
     gpu: Option<Gpu>,
+    #[serde(default)]
+    gpu_forward: Option<GpuForward>,
     /// Presence is all that matters: a box with a network opens `/dev/net/tun`
     /// and `/dev/vhost-net`, whatever the tap is called.
     #[serde(default)]
@@ -310,6 +314,23 @@ fn default_render_node() -> PathBuf {
     // missing the node nesbox will actually open is a black screen, not an
     // error.
     PathBuf::from("/dev/dri/renderD128")
+}
+
+/// No device node comes in for this one. The backend holds the GPU's
+/// descriptors in its own process, and nesbox only carries the transport, so a
+/// jailed nesbox with forwarding needs a socket and never `/dev/nvidia*`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct GpuForward {
+    socket: PathBuf,
+    #[serde(default = "default_proc_nvidia")]
+    proc_nvidia: PathBuf,
+}
+
+fn default_proc_nvidia() -> PathBuf {
+    // Kept in step with `vmm/src/config.rs`, for the same reason as the render
+    // node: nesbox reads this to describe the GPU to the guest.
+    PathBuf::from("/proc/driver/nvidia")
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,6 +380,18 @@ fn host_paths(config_path: &Path, cfg: &BoxConfig, extra: &[PathBuf]) -> Result<
     }
     if let Some(gpu) = &cfg.gpu {
         out.push(needed(&gpu.render_node, "gpu.render-node"));
+    }
+    if let Some(forward) = &cfg.gpu_forward {
+        // The socket itself, unlike stats-socket: the backend is already
+        // listening when nesbox starts, so the file exists, and binding it
+        // alone keeps whatever else shares its directory out of the jail.
+        out.push(needed(&forward.socket, "gpu-forward.socket"));
+        // /proc is always brought in whole, so only an override that points
+        // elsewhere -- a fixture tree, in practice -- needs a mount of its own.
+        // Binding one under /proc would be mounted before /proc and hidden.
+        if !forward.proc_nvidia.starts_with("/proc") {
+            out.push(needed(&forward.proc_nvidia, "gpu-forward.proc-nvidia"));
+        }
     }
     if cfg.network.is_some() {
         out.push(needed(TUN, "network is set, so nesbox opens a tap"));
@@ -1204,6 +1237,42 @@ mod tests {
             "the default has to match vmm/src/config.rs's, or nesbox opens a \
              node that is not in the jail"
         );
+    }
+
+    #[test]
+    fn gpu_forwarding_brings_in_its_socket_and_no_device_node() {
+        let cfg: BoxConfig = serde_json::from_str(
+            r#"{ "boot-source": { "kernel_image_path": "/k" },
+                 "gpu-forward": { "socket": "/run/nesbox/1/nvgpu.sock" } }"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed(&cfg),
+            vec![
+                PathBuf::from("/boxes/1/box.json"),
+                PathBuf::from("/dev/kvm"),
+                PathBuf::from("/k"),
+                PathBuf::from("/run/nesbox/1/nvgpu.sock"),
+            ],
+            "the default /proc/driver/nvidia is inside /proc, which is always \
+             brought in, and the GPU's own nodes belong to the backend"
+        );
+    }
+
+    #[test]
+    fn a_proc_nvidia_outside_proc_is_brought_in() {
+        let cfg: BoxConfig = serde_json::from_str(
+            r#"{ "boot-source": { "kernel_image_path": "/k" },
+                 "gpu-forward": { "socket": "/run/nvgpu.sock",
+                                  "proc-nvidia": "/srv/fixtures/nvidia" } }"#,
+        )
+        .expect("parses");
+        let paths = host_paths(Path::new("/boxes/1/box.json"), &cfg, &[]).expect("derives");
+        let fixture = paths
+            .iter()
+            .find(|n| n.path == Path::new("/srv/fixtures/nvidia"))
+            .expect("the override is bound");
+        assert_eq!(fixture.why, "gpu-forward.proc-nvidia");
     }
 
     #[test]
