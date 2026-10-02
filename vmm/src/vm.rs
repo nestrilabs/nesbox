@@ -747,6 +747,15 @@ pub fn run_vcpu_loop(
                     }
                     break;
                 }
+                exit @ (VcpuExit::InternalError | VcpuExit::Unknown | VcpuExit::SystemEvent(..)) => {
+                    // Re-entering after one of these only produces the same
+                    // exit again: the vCPU would spin at full speed while the
+                    // VM looks hung and the log stays silent.
+                    let what = format!("unrecoverable vCPU exit: {exit:?}");
+                    log::error!("{what}");
+                    shutdown.request(ExitReason::Error(what));
+                    break;
+                }
                 other => {
                     log::debug!("Unhandled vCPU exit: {:?}", other);
                 }
