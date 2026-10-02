@@ -91,8 +91,10 @@ pub struct GpuForward {
     pub socket: PathBuf,
     /// Where the host GPU driver publishes itself.
     ///
-    /// Overridable so the device can be exercised against a fixture tree
-    /// rather than a live driver.
+    /// The backend describes the device; this is read only to check that the
+    /// driver it describes is the one this host has loaded. Overridable so the
+    /// device can be exercised against a fixture tree rather than a live
+    /// driver.
     #[serde(default = "default_proc_nvidia")]
     pub proc_nvidia: PathBuf,
 }
