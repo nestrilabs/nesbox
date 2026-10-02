@@ -12,7 +12,7 @@ use crate::common::*;
 use crate::tap::{TUN_F_CSUM, TUN_F_TSO_ECN, TUN_F_TSO4, TUN_F_TSO6, TUN_F_UFO, Tap};
 use anyhow::{Context, Result};
 use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
-use pci::{MsiRouter, MsiVector, PciDevice};
+use pci::{Doorbell, MsiRouter, MsiVector, PciDevice};
 use std::sync::{Arc, Mutex};
 use vhost::net::VhostNet;
 use vhost::vhost_kern::net::Net as VhostNetBackend;
@@ -87,8 +87,11 @@ struct Inner {
     /// set makes `VHOST_SET_FEATURES` fail with EOPNOTSUPP, so the guest's
     /// acked features are masked with it before being passed down.
     backend_features: u64,
-    kick_fds: Vec<EventFd>,
+    kick_fds: Vec<Arc<EventFd>>,
     running: bool,
+    /// The kernel only accepts VHOST_SET_OWNER once for the life of the fd;
+    /// a second activation after a guest reset must not repeat it.
+    owned: bool,
 }
 
 impl Inner {
@@ -165,7 +168,10 @@ impl Inner {
 
         // The header size has to agree with the guest's view before any frame
         // crosses the tap, or every one of them is misparsed.
-        let hdr_size = if acked & VIRTIO_NET_F_MRG_RXBUF != 0 {
+        //
+        // A VERSION_1 driver always lays out the 12-byte header, whether or not
+        // it asked for merged buffers.
+        let hdr_size = if acked & (VIRTIO_NET_F_MRG_RXBUF | VIRTIO_F_VERSION_1) != 0 {
             VNET_HDR_SIZE_MRG
         } else {
             VNET_HDR_SIZE_PLAIN
@@ -183,8 +189,11 @@ impl Inner {
 
         // The vhost worker is created here, on whichever vCPU thread wrote the
         // activation, and it keeps that thread's affinity for good.
-        crate::affinity::with_io_affinity("virtio-net", || self.backend.set_owner())
-            .context("VHOST_SET_OWNER")?;
+        if !self.owned {
+            crate::affinity::with_io_affinity("virtio-net", || self.backend.set_owner())
+                .context("VHOST_SET_OWNER")?;
+            self.owned = true;
+        }
         self.backend
             .set_features(acked & self.backend_features)
             .context("VHOST_SET_FEATURES")?;
@@ -320,7 +329,7 @@ impl NetDevice {
         let backend_features = backend.get_features().context("VHOST_GET_FEATURES")?;
 
         let kick_fds = (0..NUM_QUEUES)
-            .map(|_| EventFd::new(0).context("failed to create net kick eventfd"))
+            .map(|_| EventFd::new(0).map(Arc::new).context("failed to create net kick eventfd"))
             .collect::<Result<Vec<_>>>()?;
 
         let mac = config.mac.unwrap_or_else(default_mac);
@@ -342,6 +351,7 @@ impl NetDevice {
                 backend_features,
                 kick_fds,
                 running: false,
+                owned: false,
             }),
         })
     }
@@ -485,6 +495,21 @@ impl NetDevice {
 }
 
 impl PciDevice for NetDevice {
+    /// A guest kick goes straight to the eventfd the backend waits on, with no
+    /// exit to userspace. `bar0_write` still handles the same offsets for a
+    /// host where registration fails.
+    fn doorbells(&self) -> Vec<Doorbell> {
+        let i = self.inner.lock().unwrap();
+        i.kick_fds
+            .iter()
+            .enumerate()
+            .map(|(idx, fd)| Doorbell {
+                bar_idx: 0,
+                offset: OFF_NOTIFY + idx as u64 * NOTIFY_MULT as u64,
+                fd: fd.clone(),
+            })
+            .collect()
+    }
     fn read_config(&self, o: u32, d: &mut [u8]) {
         let i = self.inner.lock().unwrap();
         read_cfg_space(&i.cfg, o, d);

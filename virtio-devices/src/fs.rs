@@ -8,7 +8,7 @@
 use crate::common::*;
 use anyhow::{Context, Result};
 use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
-use pci::{MsiRouter, MsiVector, PciDevice};
+use pci::{Doorbell, MsiRouter, MsiVector, PciDevice};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -46,7 +46,7 @@ struct Inner {
     cfg: [u8; 256],
     msix_cap: u16,
     frontend: Frontend,
-    kick_fds: Vec<EventFd>,
+    kick_fds: Vec<Arc<EventFd>>,
     running: bool,
 }
 
@@ -234,7 +234,7 @@ impl FsDevice {
             )
         })?;
         let kick_fds = (0..NUM_QUEUES)
-            .map(|_| EventFd::new(0).context("failed to create virtio-fs kick eventfd"))
+            .map(|_| EventFd::new(0).map(Arc::new).context("failed to create virtio-fs kick eventfd"))
             .collect::<Result<Vec<_>>>()?;
 
         let (cfg, msix_cap) = Self::build_pci_config();
@@ -398,6 +398,21 @@ impl FsDevice {
 }
 
 impl PciDevice for FsDevice {
+    /// A guest kick goes straight to the eventfd the backend waits on, with no
+    /// exit to userspace. `bar0_write` still handles the same offsets for a
+    /// host where registration fails.
+    fn doorbells(&self) -> Vec<Doorbell> {
+        let i = self.inner.lock().unwrap();
+        i.kick_fds
+            .iter()
+            .enumerate()
+            .map(|(idx, fd)| Doorbell {
+                bar_idx: 0,
+                offset: OFF_NOTIFY + idx as u64 * NOTIFY_MULT as u64,
+                fd: fd.clone(),
+            })
+            .collect()
+    }
     fn read_config(&self, o: u32, d: &mut [u8]) {
         let i = self.inner.lock().unwrap();
         read_cfg_space(&i.cfg, o, d);
