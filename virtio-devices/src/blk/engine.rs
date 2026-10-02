@@ -260,7 +260,18 @@ impl Engine for UringEngine {
         self.arm_kick();
 
         if block {
-            self.ring.submit_and_wait(1)?;
+            // A signal landing on this thread interrupts the wait without
+            // anything being wrong with the ring; ending the worker over it
+            // would strand every request the guest has outstanding.
+            loop {
+                match self.ring.submit_and_wait(1) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    other => {
+                        other?;
+                        break;
+                    }
+                };
+            }
         } else if self.unsubmitted > 0 {
             self.ring.submit()?;
         }
@@ -368,10 +379,16 @@ impl Engine for SyncEngine {
         }
         // Nothing in flight -- everything here completes inline -- so the only
         // thing left to wait for is the guest.
-        self.kick.read().map(|count| {
-            self.notifies += count;
-            true
-        })
+        loop {
+            match self.kick.read() {
+                Ok(count) => {
+                    self.notifies += count;
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn name(&self) -> &'static str {

@@ -280,6 +280,14 @@ impl Worker {
             if self.want_drain {
                 used += self.drain(&mut q);
             }
+            if used > 0 {
+                // The used index store above must be visible before the
+                // driver's interrupt-suppression word is read, or a driver
+                // that re-arms and then re-checks the ring can sleep on a
+                // completion nobody told it about. A release fence is only a
+                // compiler barrier for a store followed by a load on x86.
+                std::sync::atomic::fence(Ordering::SeqCst);
+            }
             if used > 0 && used_needs_interrupt(&self.mem, &q, batch_start, self.used_idx) {
                 let mut irq = self.irq.lock().unwrap();
                 irq.isr |= 1;
