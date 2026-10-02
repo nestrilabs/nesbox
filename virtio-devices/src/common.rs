@@ -372,6 +372,13 @@ pub fn set_avail_event(mem: &GuestMemoryMmap, q: &QState, idx: u16) {
 /// answers whether the batch passed it; without it, the answer is the avail
 /// ring's flag.
 pub fn used_needs_interrupt(mem: &GuestMemoryMmap, q: &QState, old: u16, new: u16) -> bool {
+    // The caller has just stored the new used index; this reads what the
+    // driver last wrote. x86 may satisfy that load before the store is
+    // visible, so the driver can read the old index, publish a used_event we
+    // then miss, and sleep waiting for an interrupt we decided it did not
+    // want. The spec asks for a full barrier between the two, as Linux's
+    // virtqueue_kick_prepare has.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     if !q.event_idx {
         return avail_wants_interrupt(mem, q);
     }

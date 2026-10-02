@@ -397,9 +397,13 @@ fn main() -> Result<()> {
     // across boots binds its driver to a different device.
     if let Some(forward) = &config.gpu_forward {
         let device = Arc::new(
-            NvGpuDevice::new(&forward.socket, &forward.proc_nvidia, vm.mem.clone()).with_context(
-                || format!("GPU forwarding backend at {}", forward.socket.display()),
-            )?,
+            NvGpuDevice::new(
+                &forward.socket,
+                &forward.proc_nvidia,
+                forward.vram_limit_mib,
+                vm.mem.clone(),
+            )
+            .with_context(|| format!("GPU forwarding backend at {}", forward.socket.display()))?,
         );
         let vectors = irq
             .allocate_msi_vectors(3)
