@@ -97,6 +97,15 @@ pub struct GpuForward {
     /// driver.
     #[serde(default = "default_proc_nvidia")]
     pub proc_nvidia: PathBuf,
+    /// Video memory this guest may hold, in MiB, as for `gpu`.
+    ///
+    /// The backend enforces it, since only the backend sees the guest's
+    /// allocations, and announces the limit it enforces. A guest is not
+    /// started unless the two agree: start the backend with
+    /// `--vram-limit-mib` set to the same number. Omitted, the guest may
+    /// allocate until the card is exhausted.
+    #[serde(default)]
+    pub vram_limit_mib: Option<u64>,
 }
 
 fn default_proc_nvidia() -> PathBuf {

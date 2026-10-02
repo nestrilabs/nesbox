@@ -66,13 +66,17 @@ const PCI_DEVICE_ID: u16 = 0x1040 + VIRTIO_ID_GPU_NV;
 /// PAGE_SIZE as its maximum and silently truncates anything longer, so a
 /// larger layout is not merely wasteful: every field past 4096 reads back out
 /// of range and takes the guest driver down inside virtio_cread_bytes.
-const CONFIG_LEN: usize = 4016;
+const CONFIG_LEN: usize = 4024;
+/// What a backend from before `vram_limit_mib` serves. Its config is the same
+/// up to here, and the missing field reads as 0, "no limit".
+const CONFIG_LEN_NO_VRAM_LIMIT: usize = 4016;
 
 // Fields of the device config this side checks before a guest sees it.
 const OFF_NUM_GPUS: usize = 32;
 const MAX_GPUS: u32 = 8;
 const OFF_NUM_FD_TRANSLATIONS: usize = 3880;
 const MAX_FD_TRANSLATIONS: u32 = 16;
+const OFF_VRAM_LIMIT_MIB: usize = 4016;
 
 // ── BAR 0 layout, local to this device ──────────────────────────────────────
 // Small regions first, config last and page aligned, so growing config moves
@@ -458,7 +462,12 @@ fn driver_version(proc_root: &Path) -> Option<String> {
 /// the module this host has loaded: the guest's userspace is staged from this
 /// host, and a backend describing some other driver is talking to a different
 /// host or a fixture.
-fn check_device_config(cfg: &[u8], host_version: &str) -> Result<()> {
+///
+/// The video memory limit is the backend's to enforce, since only it sees the
+/// guest's allocations; it is a flag on a process this one did not start. So
+/// the limit this VMM was configured with must be the one the backend
+/// announces, or the guest would run with a limit nobody is enforcing.
+fn check_device_config(cfg: &[u8], host_version: &str, vram_limit_mib: Option<u64>) -> Result<()> {
     anyhow::ensure!(
         cfg.len() == CONFIG_LEN,
         "the backend served {} bytes of device config; the guest driver reads {CONFIG_LEN}",
@@ -482,6 +491,30 @@ fn check_device_config(cfg: &[u8], host_version: &str) -> Result<()> {
         version == host_version,
         "the backend describes driver {version:?} but this host has {host_version} loaded"
     );
+    let announced = u64::from_le_bytes(
+        cfg[OFF_VRAM_LIMIT_MIB..OFF_VRAM_LIMIT_MIB + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    match vram_limit_mib {
+        Some(want) => anyhow::ensure!(
+            announced == want,
+            "configured with a {want} MiB video memory limit, but the backend {}; \
+             start it with --vram-limit-mib {want}",
+            if announced == 0 {
+                "enforces none".to_string()
+            } else {
+                format!("enforces {announced} MiB")
+            }
+        ),
+        None if announced != 0 => log::info!(
+            "virtio-gpu-nv: no video memory limit configured here; the backend enforces \
+             {announced} MiB"
+        ),
+        None => {
+            log::warn!("virtio-gpu-nv: no video memory limit; this guest may take the whole card")
+        }
+    }
     log::info!(
         "virtio-gpu-nv: driver {version}, {gpus} GPU(s), {fds} descriptor-carrying ioctl(s), \
          capabilities {:#x}",
@@ -496,7 +529,12 @@ pub struct NvGpuDevice {
 
 impl NvGpuDevice {
     /// Connect to a forwarding backend already listening on `socket_path`.
-    pub fn new(socket_path: &Path, proc_root: &Path, mem: Arc<GuestMemoryMmap>) -> Result<Self> {
+    pub fn new(
+        socket_path: &Path,
+        proc_root: &Path,
+        vram_limit_mib: Option<u64>,
+        mem: Arc<GuestMemoryMmap>,
+    ) -> Result<Self> {
         // Checked before connecting: a host with no driver loaded cannot have a
         // backend worth talking to, and the reason is clearer here.
         let host_version = driver_version(proc_root).with_context(|| {
@@ -514,7 +552,7 @@ impl NvGpuDevice {
                 )
             })?;
         let device_config = Self::fetch_device_config(&mut frontend)?;
-        check_device_config(&device_config, &host_version)?;
+        check_device_config(&device_config, &host_version, vram_limit_mib)?;
 
         let kick_fds = (0..NUM_QUEUES)
             .map(|_| EventFd::new(0).context("failed to create virtio-gpu-nv kick eventfd"))
@@ -573,15 +611,31 @@ impl NvGpuDevice {
                         | VhostUserProtocolFeatures::CONFIG),
             )
             .context("VHOST_USER_SET_PROTOCOL_FEATURES")?;
-        let (_, payload) = frontend
-            .get_config(
-                0,
-                CONFIG_LEN as u32,
-                VhostUserConfigFlags::empty(),
-                &[0u8; CONFIG_LEN],
-            )
-            .context("VHOST_USER_GET_CONFIG")?;
-        Ok(payload.to_vec())
+        let get = |frontend: &mut Frontend, len: usize| {
+            frontend
+                .get_config(
+                    0,
+                    len as u32,
+                    VhostUserConfigFlags::empty(),
+                    &vec![0u8; len],
+                )
+                .map(|(_, payload)| payload.to_vec())
+        };
+        // A backend answers a read longer than its config with an empty
+        // reply, which arrives as an error on a connection still usable. A
+        // backend from before the video memory limit is asked again for what
+        // it has, and the field it lacks is zero: no limit, which the check
+        // above refuses if one was configured.
+        match get(frontend, CONFIG_LEN) {
+            Ok(cfg) => Ok(cfg),
+            Err(e) => {
+                let mut cfg = get(frontend, CONFIG_LEN_NO_VRAM_LIMIT)
+                    .map_err(|_| e)
+                    .context("VHOST_USER_GET_CONFIG")?;
+                cfg.resize(CONFIG_LEN, 0);
+                Ok(cfg)
+            }
+        }
     }
 
     /// Give the device somewhere to put the mappings the backend asks for.
@@ -820,7 +874,12 @@ mod tests {
     use super::*;
 
     fn config(version: &str, gpus: u32, fds: u32) -> Vec<u8> {
+        config_with_vram(version, gpus, fds, 0)
+    }
+
+    fn config_with_vram(version: &str, gpus: u32, fds: u32, vram_mib: u64) -> Vec<u8> {
         let mut cfg = vec![0u8; CONFIG_LEN];
+        cfg[OFF_VRAM_LIMIT_MIB..OFF_VRAM_LIMIT_MIB + 8].copy_from_slice(&vram_mib.to_le_bytes());
         cfg[..version.len()].copy_from_slice(version.as_bytes());
         cfg[OFF_NUM_GPUS..OFF_NUM_GPUS + 4].copy_from_slice(&gpus.to_le_bytes());
         cfg[OFF_NUM_FD_TRANSLATIONS..OFF_NUM_FD_TRANSLATIONS + 4]
@@ -830,25 +889,53 @@ mod tests {
 
     #[test]
     fn a_well_formed_config_for_this_host_is_accepted() {
-        assert!(check_device_config(&config("615.71.09", 1, 5), "615.71.09").is_ok());
+        assert!(check_device_config(&config("615.71.09", 1, 5), "615.71.09", None).is_ok());
     }
 
     /// The guest driver indexes fixed arrays with these, so each bound is
     /// checked rather than passed on.
     #[test]
     fn counts_the_guest_driver_cannot_index_are_refused() {
-        assert!(check_device_config(&config("615.71.09", 0, 5), "615.71.09").is_err());
-        assert!(check_device_config(&config("615.71.09", 9, 5), "615.71.09").is_err());
-        assert!(check_device_config(&config("615.71.09", 1, 17), "615.71.09").is_err());
-        assert!(check_device_config(&config("615.71.09", 1, 5)[..4000], "615.71.09").is_err());
+        assert!(check_device_config(&config("615.71.09", 0, 5), "615.71.09", None).is_err());
+        assert!(check_device_config(&config("615.71.09", 9, 5), "615.71.09", None).is_err());
+        assert!(check_device_config(&config("615.71.09", 1, 17), "615.71.09", None).is_err());
+        assert!(
+            check_device_config(&config("615.71.09", 1, 5)[..4000], "615.71.09", None).is_err()
+        );
+    }
+
+    /// The limit is enforced by the backend, so a limit the backend does not
+    /// announce is a limit nobody enforces.
+    #[test]
+    fn a_configured_vram_limit_must_be_the_one_the_backend_enforces() {
+        let v = "615.71.09";
+        assert!(check_device_config(&config_with_vram(v, 1, 5, 4096), v, Some(4096)).is_ok());
+        let err = check_device_config(&config_with_vram(v, 1, 5, 0), v, Some(4096))
+            .expect_err("backend enforces none");
+        assert!(
+            format!("{err:#}").contains("--vram-limit-mib 4096"),
+            "{err:#}"
+        );
+        assert!(check_device_config(&config_with_vram(v, 1, 5, 2048), v, Some(4096)).is_err());
+    }
+
+    /// A backend stricter than this side asked for is no risk.
+    #[test]
+    fn a_backend_limit_with_none_configured_here_is_accepted() {
+        let v = "615.71.09";
+        assert!(check_device_config(&config_with_vram(v, 1, 5, 2048), v, None).is_ok());
+        assert!(check_device_config(&config(v, 1, 5), v, None).is_ok());
     }
 
     #[test]
     fn a_backend_describing_another_driver_is_refused_with_both_versions() {
-        let err = check_device_config(&config("595.104.02", 1, 5), "615.71.09")
+        let err = check_device_config(&config("595.104.02", 1, 5), "615.71.09", None)
             .expect_err("versions differ");
         let msg = format!("{err:#}");
-        assert!(msg.contains("595.104.02") && msg.contains("615.71.09"), "{msg}");
+        assert!(
+            msg.contains("595.104.02") && msg.contains("615.71.09"),
+            "{msg}"
+        );
     }
 
     #[test]
