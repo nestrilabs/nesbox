@@ -111,6 +111,9 @@ impl Drop for Bounce {
 /// One request in flight. The `iovec`s here are what the kernel is reading, so
 /// nothing in a live slot may be moved or rewritten until it completes.
 struct Slot {
+    /// The queue's generation when the request was taken. See
+    /// `Queue::generation`.
+    generation: u64,
     head: u16,
     op: Op,
     status_addr: u64,
@@ -557,6 +560,7 @@ impl Worker {
         } = req;
 
         let mut slot = Slot {
+            generation: self.queue.generation.load(Ordering::SeqCst),
             head,
             op,
             status_addr,
@@ -723,6 +727,14 @@ impl Worker {
             log::error!("virtio-blk: completion for an unknown token {token}");
             return 0;
         };
+
+        if slot.generation != self.queue.generation.load(Ordering::SeqCst) {
+            // Taken under a driver that has since reset the device. Its ring
+            // and buffers are not ours to write any more; only the slot comes
+            // back.
+            self.free.push(token);
+            return 0;
+        }
 
         let finish = |w: &mut Self, slot: Slot, status: u8| -> usize {
             let len = match (status, slot.op) {
