@@ -91,6 +91,11 @@ struct Queue {
     /// behind the queue lock: the whole point is that a notify never waits on a
     /// request already in flight.
     kick: Arc<EventFd>,
+    /// Bumped on every device reset. A request carries the value it was taken
+    /// under, and a completion that arrives under a later one belongs to a
+    /// driver that is gone: writing its status or used entry would land in
+    /// whatever the next driver has put in that memory.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 /// Interrupt state, shared by every worker.
@@ -175,6 +180,7 @@ impl BlkDevice {
                     ..Default::default()
                 }),
                 kick,
+                generation: std::sync::atomic::AtomicU64::new(0),
             });
             let w = worker::Worker::new(
                 mem.clone(),
@@ -342,6 +348,9 @@ impl BlkDevice {
                     // the next driver inherits this one's ring positions.
                     for queue in &self.queues {
                         let mut q = queue.state.lock().unwrap();
+                        queue
+                            .generation
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         *q = QState {
                             size: QUEUE_SIZE,
                             vec: VIRTQ_MSI_NO_VECTOR,
