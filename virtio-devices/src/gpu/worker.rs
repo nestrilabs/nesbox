@@ -130,8 +130,11 @@ impl Worker {
 
     fn work(mut self) {
         // Before anything else, and on this thread rather than the one that
-        // spawned it: `sched_setaffinity` with pid 0 acts on the caller.
+        // spawned it: `sched_setaffinity` with pid 0 acts on the caller. The
+        // priority is the same kind of thing, and it is inherited by the threads
+        // the renderer starts from here, its fence thread among them.
         self.confine();
+        crate::sched::raise_this_thread("virtio-gpu worker");
 
         let start = std::time::Instant::now();
         let Some(mut virtio_gpu) = VirtioGpu::new(

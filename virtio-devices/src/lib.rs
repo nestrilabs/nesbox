@@ -11,6 +11,7 @@ mod fs;
 #[cfg(feature = "virgl")]
 pub mod gpu;
 pub mod memmap;
+pub mod sched;
 mod net;
 mod nvgpu;
 pub mod tap;

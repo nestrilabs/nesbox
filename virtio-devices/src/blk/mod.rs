@@ -197,7 +197,10 @@ impl BlkDevice {
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("virtio-blk-{index}"))
-                    .spawn(move || w.run())
+                    .spawn(move || {
+                        crate::sched::lower_this_thread("virtio-blk worker");
+                        w.run()
+                    })
                     .context("failed to start a virtio-blk worker")?,
             );
             queues.push(queue);

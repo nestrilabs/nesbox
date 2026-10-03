@@ -83,6 +83,7 @@ pub fn serve(path: PathBuf, target: ControlTarget) -> Result<()> {
     std::thread::Builder::new()
         .name("nesbox-control".into())
         .spawn(move || {
+            virtio_devices::sched::lower_this_thread("control");
             for stream in listener.incoming() {
                 match stream {
                     Ok(mut s) => {
