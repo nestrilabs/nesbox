@@ -247,6 +247,10 @@ impl Worker {
         if self.poll_us > 0 {
             let began = Instant::now();
             let deadline = began + Duration::from_micros(self.poll_us);
+            // The clock is a call of its own and was a quarter of this loop;
+            // the deadline is microseconds away, so reading it every so many
+            // looks costs nothing in accuracy.
+            let mut looks = 0u32;
             loop {
                 if self.queues.ctl_has_work() || self.stop.load(Ordering::Acquire) {
                     // The doorbell is drained whether or not it was what told
@@ -259,7 +263,8 @@ impl Worker {
                     self.metrics.counters.spin.since(began);
                     return;
                 }
-                if Instant::now() >= deadline {
+                looks = looks.wrapping_add(1);
+                if looks % 32 == 0 && Instant::now() >= deadline {
                     break;
                 }
                 std::hint::spin_loop();

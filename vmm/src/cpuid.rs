@@ -163,6 +163,11 @@ pub fn patch_topology(
     let mut ebx = get(cpuid, 1, 0, Reg::Ebx);
     ebx &= !(0xff << 16);
     ebx |= (logical & 0xff) << 16;
+    // EBX[31:24] is the initial APIC id. KVM fills it from whichever host CPU
+    // the supported-CPUID call ran on, so without this every vCPU reports the
+    // same one.
+    ebx &= !(0xff << 24);
+    ebx |= (vcpu_id & 0xff) << 24;
     set(cpuid, 1, 0, Reg::Ebx, ebx);
 
     // EDX bit 28 (HTT) means "this package reports more than one logical
