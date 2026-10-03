@@ -109,6 +109,29 @@ const NV_SHM_ID: u8 = 1;
 /// pages arrive only as the backend asks for them, one mapping at a time.
 const SHM_SIZE: u64 = 1 << 30; // 1 GiB
 
+/// BAR 4 is the UVM aperture: one memory slot per CUDA semaphore pool.
+///
+/// A pool cannot go in the window. CUDA makes it at an address of its own
+/// choosing and maps the UVM file there at an offset equal to that address,
+/// and UVM takes the mapping at that host address and nowhere else. The window
+/// is one reservation at an address this process picked, so each pool is
+/// mapped at its own address instead and given a slot inside this BAR, at an
+/// offset the backend chose. Nothing backs the BAR until then.
+const APERTURE_BAR: usize = 4;
+const NV_SHM_ID_APERTURE: u8 = 2;
+const APERTURE_SIZE: u64 = 1 << 30;
+/// Pools start on 2 MiB boundaries of the aperture.
+const APERTURE_ALIGN: u64 = 2 << 20;
+/// One pool, and all of them together. CUDA makes them at a few MiB.
+const POOL_MAX_LEN: u64 = 64 << 20;
+const MAX_POOLS: usize = 64;
+const MAX_POOL_BYTES: u64 = 256 << 20;
+/// The host addresses a pool may name. Below 4 GiB is where this process's own
+/// small mappings sit; the mapping is made without replacing anything anyway,
+/// so the band is a second wall, not the only one.
+const POOL_HVA_MIN: u64 = 4 << 30;
+const POOL_HVA_MAX: u64 = 32 << 40;
+
 /// Places backend mappings into the shared window.
 ///
 /// The backend holds the real device descriptors, but it cannot do this
@@ -121,6 +144,47 @@ struct WindowMapper {
     mapper: Arc<dyn HostMemoryMapper>,
     /// Guest physical base of BAR 2, known only once the bus assigns it.
     guest_base: Mutex<Option<u64>>,
+    /// Guest physical base of BAR 4, likewise.
+    aperture_base: Mutex<Option<u64>>,
+    /// Pools placed in the aperture: offset -> (length, host address).
+    pools: Mutex<std::collections::BTreeMap<u64, (u64, u64)>>,
+}
+
+/// Whether a pool may be placed, given the ones already there.
+fn check_pool(
+    pools: &std::collections::BTreeMap<u64, (u64, u64)>,
+    hva: u64,
+    offset: u64,
+    len: u64,
+    flags: u64,
+) -> std::result::Result<(), i32> {
+    let page = 4096;
+    if flags != VhostUserMMapFlags::WRITABLE.bits()
+        || len == 0
+        || len % page != 0
+        || len > POOL_MAX_LEN
+        || hva % page != 0
+        || hva < POOL_HVA_MIN
+        || hva.checked_add(len).is_none_or(|end| end > POOL_HVA_MAX)
+        || offset % APERTURE_ALIGN != 0
+        || offset
+            .checked_add(len)
+            .is_none_or(|end| end > APERTURE_SIZE)
+    {
+        return Err(libc::EINVAL);
+    }
+    let hit = |s: u64, l: u64, a: u64| s < a + len && a < s + l;
+    if pools
+        .iter()
+        .any(|(&o, &(l, h))| hit(o, l, offset) || hit(h, l, hva))
+    {
+        return Err(libc::EEXIST);
+    }
+    let bytes: u64 = pools.values().map(|&(l, _)| l).sum();
+    if pools.len() >= MAX_POOLS || bytes + len > MAX_POOL_BYTES {
+        return Err(libc::ENOSPC);
+    }
+    Ok(())
 }
 
 impl WindowMapper {
@@ -170,12 +234,133 @@ impl WindowMapper {
     }
 }
 
+impl WindowMapper {
+    /// Map a UVM file at the pool's own address and give it a slot in the
+    /// aperture.
+    fn place_pool(&self, req: &VhostUserMMap, fd: RawFd) -> std::io::Result<()> {
+        let (hva, offset, len, flags) = (req.fd_offset, req.shm_offset, req.len, req.flags);
+        let base = self
+            .aperture_base
+            .lock()
+            .unwrap()
+            .ok_or_else(|| std::io::Error::other("BAR 4 has no address yet"))?;
+        let mut pools = self.pools.lock().unwrap();
+        if let Err(errno) = check_pool(&pools, hva, offset, len, flags) {
+            log::error!(
+                "refusing UVM pool {hva:#x}+{len:#x} at aperture offset {offset:#x}: errno {errno}"
+            );
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
+
+        // Never over anything of ours: MAP_FIXED_NOREPLACE fails rather than
+        // replace a mapping already at that address.
+        //
+        // SAFETY: the kernel refuses rather than replaces, so no existing
+        // mapping of this process is touched; the descriptor is borrowed for
+        // the call only.
+        let p = unsafe {
+            libc::mmap(
+                hva as *mut libc::c_void,
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED_NOREPLACE,
+                fd,
+                hva as i64,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            let e = std::io::Error::last_os_error();
+            log::error!("UVM pool {hva:#x}+{len:#x}: mmap: {e}");
+            return Err(e);
+        }
+        let unmap = || {
+            // SAFETY: the mapping made just above, same address and length.
+            unsafe { libc::munmap(p, len as usize) };
+        };
+        // A kernel older than MAP_FIXED_NOREPLACE treats it as a hint.
+        if p as u64 != hva {
+            unmap();
+            return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+        }
+        // The pages must be there before a slot points at them: UVM inserts
+        // them when it maps a pool, and a range it cannot fault is refused
+        // here rather than met by the guest.
+        //
+        // SAFETY: advice on the range mapped above.
+        if unsafe { libc::madvise(p, len as usize, libc::MADV_POPULATE_WRITE) } != 0 {
+            let e = std::io::Error::last_os_error();
+            unmap();
+            log::error!("UVM pool {hva:#x}+{len:#x}: the pages are not there: {e}");
+            return Err(e);
+        }
+        if let Err(e) = self.mapper.map(base + offset, hva, len) {
+            unmap();
+            return Err(std::io::Error::other(format!("{e:#}")));
+        }
+        pools.insert(offset, (len, hva));
+        log::debug!("aperture: pool {hva:#x}+{len:#x} at offset {offset:#x}");
+        Ok(())
+    }
+
+    /// The slot first, then the mapping, so the guest never has a slot over
+    /// nothing.
+    fn withdraw_pool(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        let base = self
+            .aperture_base
+            .lock()
+            .unwrap()
+            .ok_or_else(|| std::io::Error::other("BAR 4 has no address yet"))?;
+        let mut pools = self.pools.lock().unwrap();
+        let Some(&(l, hva)) = pools.get(&offset) else {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        };
+        if l != len {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        self.mapper
+            .unmap(base + offset, len)
+            .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+        // SAFETY: the pool's own mapping, made by `place_pool`.
+        unsafe { libc::munmap(hva as *mut libc::c_void, len as usize) };
+        pools.remove(&offset);
+        Ok(())
+    }
+
+    /// Every pool, when the backend goes away.
+    fn withdraw_all_pools(&self) {
+        let offsets: Vec<(u64, u64)> = self
+            .pools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&o, &(l, _))| (o, l))
+            .collect();
+        for (offset, len) in offsets {
+            if let Err(e) = self.withdraw_pool(offset, len) {
+                log::warn!("aperture: pool at {offset:#x} not withdrawn: {e}");
+            }
+        }
+    }
+}
+
 impl VhostUserFrontendReqHandler for WindowMapper {
     fn shmem_map(&self, req: &VhostUserMMap, fd: &dyn AsRawFd) -> HandlerResult<u64> {
-        self.place(req, fd.as_raw_fd()).map(|()| 0)
+        match req.shmid {
+            NV_SHM_ID => self.place(req, fd.as_raw_fd()).map(|()| 0),
+            NV_SHM_ID_APERTURE => self.place_pool(req, fd.as_raw_fd()).map(|()| 0),
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
     }
 
     fn shmem_unmap(&self, req: &VhostUserMMap) -> HandlerResult<u64> {
+        match req.shmid {
+            NV_SHM_ID => {}
+            NV_SHM_ID_APERTURE => {
+                let (offset, len) = (req.shm_offset, req.len);
+                return self.withdraw_pool(offset, len).map(|()| 0);
+            }
+            _ => return Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
         // Overwrite rather than unmap: leaving a hole would let a later fault
         // in this range reach no VMA at all, and the slot still describes it.
         let base = self
@@ -257,8 +442,7 @@ impl Inner {
             // it to place mappings in. Without one it must keep every mapping
             // to itself, which is the state this device shipped in.
             if self.window.is_some() {
-                wanted |= VhostUserProtocolFeatures::BACKEND_REQ
-                    | VhostUserProtocolFeatures::SHMEM;
+                wanted |= VhostUserProtocolFeatures::BACKEND_REQ | VhostUserProtocolFeatures::SHMEM;
             }
             let agreed = offered & wanted;
             self.frontend
@@ -417,6 +601,10 @@ impl Inner {
         }
         self.queues = new_queues();
         self.qs = 0;
+        // A reset guest has no vma left over any pool.
+        if let Some(w) = &self.window {
+            w.withdraw_all_pools();
+        }
     }
 
     fn sq(&self) -> &QState {
@@ -485,7 +673,10 @@ fn check_device_config(cfg: &[u8], host_version: &str, vram_limit_mib: Option<u6
         "the backend lists {fds} descriptor-carrying ioctls; the guest driver takes {MAX_FD_TRANSLATIONS}"
     );
     let version = &cfg[..32];
-    let end = version.iter().position(|&b| b == 0).unwrap_or(version.len());
+    let end = version
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(version.len());
     let version = std::str::from_utf8(&version[..end]).unwrap_or("");
     anyhow::ensure!(
         version == host_version,
@@ -646,6 +837,8 @@ impl NvGpuDevice {
         self.inner.lock().unwrap().window = Some(Arc::new(WindowMapper {
             mapper,
             guest_base: Mutex::new(None),
+            aperture_base: Mutex::new(None),
+            pools: Mutex::new(Default::default()),
         }));
     }
 
@@ -654,6 +847,18 @@ impl NvGpuDevice {
         if let Some(w) = &self.inner.lock().unwrap().window {
             *w.guest_base.lock().unwrap() = Some(addr);
         }
+    }
+
+    /// Tell the device where the bus put BAR 4, the UVM aperture.
+    pub fn set_aperture_guest_addr(&self, addr: u64) {
+        if let Some(w) = &self.inner.lock().unwrap().window {
+            *w.aperture_base.lock().unwrap() = Some(addr);
+        }
+    }
+
+    /// Which BAR the aperture is.
+    pub fn aperture_bar() -> usize {
+        APERTURE_BAR
     }
 
     /// The window's size, for the caller that has to reserve it.
@@ -694,6 +899,8 @@ impl NvGpuDevice {
         cfg.add_virtio_cap(4, 0, NV_OFF_DEVICE as u32, CONFIG_LEN as u32);
         cfg.set_bar_mem64(SHM_BAR, SHM_SIZE);
         cfg.add_virtio_shm_cap(NV_SHM_ID, SHM_BAR as u8, 0, SHM_SIZE);
+        cfg.set_bar_mem64(APERTURE_BAR, APERTURE_SIZE);
+        cfg.add_virtio_shm_cap(NV_SHM_ID_APERTURE, APERTURE_BAR as u8, 0, APERTURE_SIZE);
         let msix_cap = cfg.add_msix_cap(
             MSIX_VECTORS - 1,
             NV_OFF_MSIX_TABLE as u32,
@@ -842,7 +1049,7 @@ impl PciDevice for NvGpuDevice {
             // trapping, so an access arriving here is to a page the backend has
             // not placed anything in.
             d.fill(0);
-            bi == SHM_BAR
+            bi == SHM_BAR || bi == APERTURE_BAR
         }
     }
     fn write_bar(&self, bi: usize, o: u64, d: &[u8]) -> bool {
@@ -850,18 +1057,19 @@ impl PciDevice for NvGpuDevice {
             self.bar0_write(o, d);
             true
         } else {
-            bi == SHM_BAR
+            bi == SHM_BAR || bi == APERTURE_BAR
         }
     }
     fn bar_size(&self, bi: usize) -> u64 {
         match bi {
             0 => NV_BAR0_SIZE,
             SHM_BAR => SHM_SIZE,
+            APERTURE_BAR => APERTURE_SIZE,
             _ => 0,
         }
     }
     fn bar_type(&self, bi: usize) -> BarType {
-        if bi == SHM_BAR {
+        if bi == SHM_BAR || bi == APERTURE_BAR {
             BarType::Mem64
         } else {
             BarType::Mem32
@@ -1004,6 +1212,55 @@ mod tests {
 
     /// The driver calls virtio_find_vqs(vdev, 2, ...) and fails probe on that
     /// call's error, so this is the number that has to hold.
+    #[test]
+    fn uvm_pools_are_checked_before_placement() {
+        const MIB: u64 = 1 << 20;
+        let rw = VhostUserMMapFlags::WRITABLE.bits();
+        let hva = 8u64 << 30;
+        let mut pools = std::collections::BTreeMap::new();
+        assert_eq!(check_pool(&pools, hva, 0, 2 * MIB, rw), Ok(()));
+        pools.insert(0, (2 * MIB, hva));
+        for (h, o, l, f) in [
+            (hva + 4 * MIB, 4 * MIB, 2 * MIB, 0),
+            (hva + 4 * MIB, 4 * MIB, 0, rw),
+            (hva + 4 * MIB, 4 * MIB, 4097, rw),
+            (hva + 4 * MIB + 1, 4 * MIB, 4096, rw),
+            (hva + 4 * MIB, 4 * MIB + 4096, 4096, rw),
+            (hva + 4 * MIB, 4 * MIB, POOL_MAX_LEN + 4096, rw),
+            (POOL_HVA_MIN - 4096, 4 * MIB, 4096, rw),
+            (POOL_HVA_MAX - 4096, 4 * MIB, 8192, rw),
+            (hva + 4 * MIB, APERTURE_SIZE - 2 * MIB, 4 * MIB, rw),
+        ] {
+            assert_eq!(
+                check_pool(&pools, h, o, l, f),
+                Err(libc::EINVAL),
+                "{h:#x} {o:#x} {l:#x}"
+            );
+        }
+        assert_eq!(
+            check_pool(&pools, hva + 4 * MIB, 0, MIB, rw),
+            Err(libc::EEXIST)
+        );
+        assert_eq!(
+            check_pool(&pools, hva + MIB, 4 * MIB, MIB, rw),
+            Err(libc::EEXIST)
+        );
+        for i in 1..4u64 {
+            pools.insert(i * 64 * MIB, (64 * MIB, hva + i * 64 * MIB));
+        }
+        assert_eq!(
+            check_pool(&pools, hva + 512 * MIB, 512 * MIB, 64 * MIB, rw),
+            Err(libc::ENOSPC)
+        );
+    }
+
+    #[test]
+    fn the_aperture_is_its_own_bar_with_its_own_id() {
+        assert_ne!(APERTURE_BAR, SHM_BAR);
+        assert_ne!(NV_SHM_ID_APERTURE, NV_SHM_ID);
+        assert!(APERTURE_SIZE.is_power_of_two());
+    }
+
     #[test]
     fn two_queues_are_offered() {
         assert_eq!(NUM_QUEUES, 2);

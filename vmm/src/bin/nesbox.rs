@@ -420,6 +420,10 @@ fn main() -> Result<()> {
             .bar_address(bdf, NvGpuDevice::shm_bar())
             .context("virtio-gpu-nv has no BAR 2")?;
         device.set_shm_guest_addr(shm_addr);
+        let aperture_addr = pci_bus
+            .bar_address(bdf, NvGpuDevice::aperture_bar())
+            .context("virtio-gpu-nv has no BAR 4")?;
+        device.set_aperture_guest_addr(aperture_addr);
         // Reserved and registered once. A failure here is not fatal: the
         // backend is simply never offered a request channel, and every mapping
         // stays where the guest cannot reach it -- which is where this device
