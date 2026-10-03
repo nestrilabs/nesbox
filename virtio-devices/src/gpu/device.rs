@@ -184,12 +184,10 @@ impl Inner {
             "the shared window has no guest address; BAR2 was never reported"
         );
 
-        // Deliberately *not* registering the whole window here. Each blob is
-        // published as its own memory slot when the guest asks for it to be
-        // mapped, backed by virglrenderer's own mapping of that resource; a
-        // slot covering the whole window would overlap those and KVM refuses
-        // overlapping slots. Guest reads of unmapped parts of the window come
-        // back to us as ordinary MMIO and read as zero.
+        // The window itself is registered by the VMM as one memory slot at
+        // boot, and a blob is placed inside it when the guest asks for it to be
+        // mapped. Guest reads of the unmapped parts come back as ordinary MMIO
+        // and read as zero.
         // Hand the control queue to the worker's view of the world.
         *self.queues.ctl.lock().unwrap() = self.pending[CTL_INDEX].clone();
 
