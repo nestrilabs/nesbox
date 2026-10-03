@@ -162,10 +162,11 @@ impl Virtiofsd {
             cmd.args(translate_args(guest, host));
         }
 
-        // The daemon exits by itself when the VMM closes its socket, but only if
-        // the VMM gets to: a SIGKILL or an OOM kill leaves it running, serving a
-        // shared directory to nobody, for good. Asking the kernel to deliver a
-        // kill when the parent goes covers the cases where nothing of ours runs.
+        // The daemon exits by itself when the VMM closes its socket, which the
+        // kernel does for us even after a SIGKILL. This covers a daemon that is
+        // not looking at its socket at that moment: the kernel asks it to stop
+        // when its parent goes. SIGTERM and not SIGKILL, so that it removes its
+        // socket and pid file on the way out as it does for a closed socket.
         //
         // SAFETY: only async-signal-safe calls between fork and exec -- one
         // prctl and one getppid. The parent can already be gone by the time this
@@ -174,7 +175,7 @@ impl Virtiofsd {
         let parent = unsafe { libc::getpid() };
         unsafe {
             cmd.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::getppid() != parent {
