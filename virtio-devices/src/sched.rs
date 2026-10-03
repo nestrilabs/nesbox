@@ -13,9 +13,9 @@
 //! which is most of the time; they only lose when both want it at once.
 //!
 //! **Raising needs `CAP_SYS_NICE`** (or an `RLIMIT_NICE` that allows it). When
-//! the process has neither, the thread stays at normal priority and one warning
-//! says how to change that, in the same spirit as the advice about isolating
-//! CPUs: the box runs either way, and this says what it is leaving on the table.
+//! the process has neither, the thread stays at normal priority. This module
+//! does not say so: whoever starts the VMM knows what it was given and is the
+//! one to tell an operator, once, instead of once per box.
 //!
 //! It is a *nice* boost and not a realtime class on purpose. The GPU worker
 //! spins for a short window after each wake, and a realtime thread that spins
@@ -25,8 +25,6 @@
 //! The priority applies to the calling thread only, which is why each thread
 //! calls it on itself: a nice value is inherited by threads a thread spawns, and
 //! the GPU worker is spawned from a vCPU thread that must not be affected.
-
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How much nicer the non-critical helper threads make themselves.
 pub const HELPER_NICE: i32 = 10;
@@ -71,23 +69,15 @@ pub fn lower_this_thread(role: &str) {
 }
 
 /// Raise the calling thread above ordinary ones, if this process may. Returns
-/// whether it did. A refusal is reported once per process, whichever thread asks.
+/// whether it did. A refusal is not an error and is not reported here.
 pub fn raise_this_thread(role: &str) -> bool {
     match set_nice(CRITICAL_NICE) {
         Ok(()) => {
-            log::info!("{role}: priority raised to nice {CRITICAL_NICE}");
+            log::debug!("{role}: priority raised to nice {CRITICAL_NICE}");
             true
         }
         Err(e) => {
-            static TOLD: AtomicBool = AtomicBool::new(false);
-            if !TOLD.swap(true, Ordering::Relaxed) {
-                log::warn!(
-                    "{role}: running at normal priority ({e}). With CAP_SYS_NICE \
-                     (setcap cap_sys_nice+ep on the binary, or AmbientCapabilities= in \
-                     a service) it would run ahead of the box's other threads, which \
-                     matters when they share a CPU"
-                );
-            }
+            log::debug!("{role}: stays at normal priority ({e})");
             false
         }
     }
