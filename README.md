@@ -34,7 +34,8 @@ That holds for any real game frame (2 ms or more; 60 Hz is 16.7 ms).
   frames.
 - **4 guests on an AMD Vega iGPU**, with total throughput _rising_ as guests are
   added (98.8 → 114.3 fps), because one guest leaves the GPU idle between frames.
-- The card is split evenly, with no scheduling from us.
+
+The card is split evenly, without requiring scheduling from us.
 
 > [!NOTE]
 > These are what we measured, not caps. Like containers, you're limited by:
