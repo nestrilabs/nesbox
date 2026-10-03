@@ -15,7 +15,7 @@ remove that. If you need hard isolation between tenants, use a GPU per tenant.
 
 - **KVM isolation.** Each guest runs its own kernel in its own VM.
 - **A seccomp filter**, set to `enforce`. nesbox can't start programs, load
-  kernel code, inspect other processes, or change mounts. It costs no measurable performance hit.
+  kernel code, inspect other processes, or change mounts. It has no measurable performance cost.
 - **No root needed.** nesbox runs without any capabilities.
 
 ## What you can turn on for extra security
