@@ -20,6 +20,7 @@ pub mod serial;
 /// compiles only with `virgl`; making it source-agnostic is what a
 /// virtio-nvgpu stats surface needs first.
 #[cfg(feature = "virgl")]
+pub mod control;
 pub mod stats;
 pub mod virtiofsd;
 pub mod vm;

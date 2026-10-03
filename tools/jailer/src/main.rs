@@ -47,6 +47,7 @@
 //!   * `network`, if present               /dev/net/tun and /dev/vhost-net
 //!   * `vsock`, if present                 /dev/vhost-vsock
 //!   * `stats-socket`, if present          the directory it is created in
+//!   * `control-socket`, if present        the directory it is created in
 //!   * `shared-directories[].path-on-host` each virtiofs source
 //!
 //! plus `/dev/kvm`, `/proc` and `/sys`, which every box needs, and the config
@@ -288,6 +289,8 @@ struct BoxConfig {
     shared_directories: Vec<SharedDirectory>,
     #[serde(default)]
     stats_socket: Option<PathBuf>,
+    #[serde(default)]
+    control_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,6 +416,18 @@ fn host_paths(config_path: &Path, cfg: &BoxConfig, extra: &[PathBuf]) -> Result<
                 )
             })?;
         out.push(needed(dir, "the directory stats-socket lives in"));
+    }
+    if let Some(socket) = &cfg.control_socket {
+        let dir = socket
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .with_context(|| {
+                format!(
+                    "control-socket {} has no directory to create it in",
+                    socket.display()
+                )
+            })?;
+        out.push(needed(dir, "the directory control-socket lives in"));
     }
     for s in &cfg.shared_directories {
         out.push(needed(

@@ -309,6 +309,8 @@ fn main() -> Result<()> {
     // ones guest RAM already occupies.
     #[cfg(feature = "virgl")]
     let mut stats_gpu = None;
+    #[cfg(feature = "virgl")]
+    let mut control_gpu = None;
     // One allocator for both windowed devices. Two would each start numbering
     // at the first slot past guest RAM and hand out the same numbers.
     let memory_slots = MemorySlots::new(vm.vm_fd.clone(), vm.ram_slot_count);
@@ -337,6 +339,7 @@ fn main() -> Result<()> {
                 window_limit_bytes: gpu_cfg.host_visible_window_mib.map_or(0, |m| m * (1 << 20)),
                 window_max_mappings: gpu_cfg.host_visible_max_mappings.unwrap_or(0),
                 poll_us: gpu_cfg.poll_us,
+                gpu_time_percent: gpu_cfg.gpu_time_percent,
                 // The I/O set, which is the guest's own set unless the caller
                 // named a separate one. Either way it stays in the guest's L3
                 // domain: the worker is the other half of every forwarded
@@ -374,7 +377,8 @@ fn main() -> Result<()> {
             "virtio-gpu at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
             bdf.0, bdf.1, bdf.2
         );
-        stats_gpu = Some(gpu_device);
+        stats_gpu = Some(gpu_device.clone());
+        control_gpu = Some(gpu_device);
         next_slot += 1;
     }
 
@@ -384,6 +388,13 @@ fn main() -> Result<()> {
     #[cfg(feature = "virgl")]
     if let Some(path) = config.stats_socket.clone() {
         nesbox_vmm::stats::serve(path, nesbox_vmm::stats::StatsSource::new(stats_gpu))?;
+    }
+    #[cfg(feature = "virgl")]
+    if let Some(path) = config.control_socket.clone() {
+        nesbox_vmm::control::serve(
+            path,
+            nesbox_vmm::control::ControlTarget { gpu: control_gpu },
+        )?;
     }
 
     // ── Shared directories over virtio-fs ─────────────────────────────────

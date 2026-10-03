@@ -49,6 +49,10 @@ pub struct VmConfig {
     /// which is right for a hand-driven box and wrong for a supervised one.
     #[serde(default, rename = "stats-socket")]
     pub stats_socket: Option<PathBuf>,
+    /// Unix socket a supervising agent changes this guest's limits on while it
+    /// runs. Absent means the limits are what the config said at boot.
+    #[serde(default, rename = "control-socket")]
+    pub control_socket: Option<PathBuf>,
     /// seccomp-bpf confinement: `enforce`, `audit`, or `off`.
     ///
     /// `enforce` kills the process on a syscall outside the policy. `audit`
@@ -162,6 +166,14 @@ pub struct Gpu {
     /// with guests that is the wrong trade -- set it to `0` there.
     #[serde(default = "default_gpu_poll_us")]
     pub poll_us: u64,
+    /// The most of the graphics engine this guest may keep busy, as a percentage
+    /// of the card's. Omitted or 100 means no limit.
+    ///
+    /// Enforced on the host by holding back the guest's next submission while
+    /// it is over, so nothing in the guest can lift it, and it can be changed
+    /// while the guest runs through the control socket.
+    #[serde(default)]
+    pub gpu_time_percent: Option<u32>,
 }
 
 /// Long enough to cover the gap between submissions from a guest running a

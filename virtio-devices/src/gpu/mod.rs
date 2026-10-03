@@ -11,6 +11,7 @@
 mod descriptor_utils;
 mod device;
 pub use self::descriptor_utils::Descriptor;
+pub mod budget;
 pub mod display;
 mod edid;
 mod metrics;

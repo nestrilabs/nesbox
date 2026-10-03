@@ -99,6 +99,9 @@ pub struct GpuCounters {
     // spinning, blocked, or draining. `top` cannot separate the first two --
     // a spin is indistinguishable from work in `%CPU`, which is what made an
     // earlier reading of that column mean the opposite of what it seemed to.
+    /// Time submissions were held back to keep the guest inside its GPU time
+    /// limit. Zero for a guest with no limit.
+    pub budget_wait: Phase,
     /// The poll spin in `Worker::wait`, whether or not it found anything.
     pub spin: Phase,
     /// Blocked in `poll` on the doorbell.
@@ -303,6 +306,10 @@ pub struct GpuSnapshot {
     pub window_refusals: u64,
     pub spin: PhaseSnapshot,
     pub sleep: PhaseSnapshot,
+    pub budget_wait: PhaseSnapshot,
+    /// The GPU time limit in force, as a percentage of the graphics engine; 100
+    /// is no limit.
+    pub gpu_time_percent: u32,
     pub drain: PhaseSnapshot,
     pub drained: u64,
     pub command: PhaseSnapshot,
@@ -335,13 +342,28 @@ pub struct GpuSnapshot {
 pub struct GpuMetrics {
     pub counters: GpuCounters,
     occupancy: OccupancyReader,
+    /// The guest's GPU time limit. Held here because this is what the worker,
+    /// the device and the stats thread all already share.
+    pub budget: super::budget::GpuBudget,
 }
 
 impl GpuMetrics {
+    /// Hold a submission back while the guest is over its GPU time limit.
+    pub fn pace_submit(&self, stop: &std::sync::atomic::AtomicBool) {
+        if self.budget.percent() >= super::budget::UNLIMITED {
+            return;
+        }
+        let waited = self.budget.pace(|| self.occupancy.read(), stop);
+        if !waited.is_zero() {
+            self.counters.budget_wait.add(waited.as_nanos() as u64);
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             counters: GpuCounters::default(),
             occupancy: OccupancyReader::new(),
+            budget: super::budget::GpuBudget::new(None),
         }
     }
 
@@ -364,6 +386,8 @@ impl GpuMetrics {
             window_refusals: load(&c.window_refusals),
             spin: c.spin.read(),
             sleep: c.sleep.read(),
+            budget_wait: c.budget_wait.read(),
+            gpu_time_percent: self.budget.percent(),
             drain: c.drain.read(),
             drained: load(&c.drained),
             command: c.command.read(),
