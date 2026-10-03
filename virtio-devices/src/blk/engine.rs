@@ -155,6 +155,11 @@ impl UringEngine {
         // to have.
         builder.setup_single_issuer();
         builder.setup_coop_taskrun();
+        // With cooperative task-run a completion is only posted when this thread
+        // next enters the kernel, and nothing says there is one waiting. This
+        // flag makes the kernel raise a bit in the SQ ring when there is, which
+        // is what lets the polling path know to look.
+        builder.setup_taskrun_flag();
 
         let ring = match builder.build(depth as u32) {
             Ok(r) => r,
@@ -272,7 +277,10 @@ impl Engine for UringEngine {
                     }
                 };
             }
-        } else if self.unsubmitted > 0 {
+        } else if self.unsubmitted > 0 || self.ring.submission().taskrun() {
+            // Also entered when the kernel is holding completions for this
+            // thread to collect, or a polling worker never sees them and waits
+            // out its whole window before blocking for something already done.
             self.ring.submit()?;
         }
         self.unsubmitted = 0;
