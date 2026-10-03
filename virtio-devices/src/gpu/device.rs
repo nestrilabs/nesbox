@@ -301,7 +301,6 @@ impl GpuDevice {
         );
         let metrics = Arc::new(GpuMetrics::new());
         let displays: Box<[DisplayInfo]> = config.displays.clone().into_boxed_slice();
-        anyhow::ensure!(!displays.is_empty(), "the GPU needs at least one display");
 
         let queues = Arc::new(Queues {
             mem: mem.clone(),

@@ -101,7 +101,6 @@ pub trait GpuQueues: Send + Sync {
     fn ctl_has_work(&self) -> bool;
 }
 
-
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum GpuError {
     /// Failed to create EventFd: {0}
