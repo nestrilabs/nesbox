@@ -65,14 +65,25 @@ impl Inner {
             let mut total = 0u32;
             for &(addr, len, flags) in &descs {
                 if flags & VRING_DESC_F_WRITE == 0 {
-                    let mut buf = vec![0u8; len as usize];
-                    if mem
-                        .read_slice(&mut buf, vm_memory::GuestAddress(addr))
-                        .is_ok()
-                    {
-                        let _ = out.write_all(&buf);
+                    // Copied a chunk at a time: `len` is the guest's, and a
+                    // buffer sized by it is a host allocation the guest picks.
+                    let mut buf = [0u8; 4096];
+                    let mut off = 0u32;
+                    while off < len {
+                        let n = (len - off).min(buf.len() as u32) as usize;
+                        if mem
+                            .read_slice(
+                                &mut buf[..n],
+                                vm_memory::GuestAddress(addr + off as u64),
+                            )
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let _ = out.write_all(&buf[..n]);
                         wrote = true;
-                        total += len;
+                        total += n as u32;
+                        off += n as u32;
                     }
                 }
             }

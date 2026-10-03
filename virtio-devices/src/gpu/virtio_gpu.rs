@@ -203,6 +203,8 @@ pub struct VirtioGpu {
     mapper: Arc<dyn HostMemoryMapper>,
     resources: BTreeMap<u32, VirtioGpuResource>,
     fence_state: Arc<Mutex<FenceState>>,
+    /// To retire descriptors from the thread that is not the fence handler.
+    signal: Arc<dyn GpuQueues>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
     pub num_capsets: u32,
@@ -259,17 +261,17 @@ impl VirtioGpu {
             // and avoid potential deadlocks with the main thread.
             let completed: Vec<FenceDescriptor> = {
                 let mut fs = fence_state.lock().unwrap();
-                let mut i = 0;
-                let mut out = Vec::new();
-                while i < fs.descs.len() {
-                    if fs.descs[i].ring == ring && fs.descs[i].fence_id <= completed_fence.fence_id
-                    {
-                        out.push(fs.descs.remove(i));
-                    } else {
-                        i += 1;
-                    }
-                }
-                fs.completed_fences.insert(ring, completed_fence.fence_id);
+                let out: Vec<_> = fs
+                    .descs
+                    .extract_if(.., |d| {
+                        d.ring == ring && d.fence_id <= completed_fence.fence_id
+                    })
+                    .collect();
+                // Never backwards: callbacks for one ring are not promised to
+                // arrive in order, and a lower id here would make a fence that
+                // has already signalled look pending.
+                let done = fs.completed_fences.entry(ring).or_insert(0);
+                *done = (*done).max(completed_fence.fence_id);
                 out
             };
 
@@ -387,7 +389,7 @@ impl VirtioGpu {
         let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(FenceState::default()));
 
         let rutabaga = Self::create_rutabaga(
-            signal,
+            signal.clone(),
             fence_state.clone(),
             gpu_device_path,
             metrics.clone(),
@@ -410,6 +412,7 @@ impl VirtioGpu {
             mapper,
             resources: Default::default(),
             fence_state,
+            signal,
             scanouts: Default::default(),
             displays,
             num_capsets,
@@ -727,8 +730,32 @@ impl VirtioGpu {
         }
     }
 
+    /// A fence on a context that no longer exists will never signal, so the
+    /// descriptors still waiting on one are retired now, or the guest waits on
+    /// them for good. The context's timelines are forgotten too: ids start over
+    /// if the guest reuses the context id, and a stale high-water mark would
+    /// report the new context's first fences as already done.
+    fn retire_context_fences(&mut self, ctx_id: u32) {
+        let orphaned: Vec<(u16, u32)> = {
+            let mut fs = self.fence_state.lock().unwrap();
+            fs.completed_fences.retain(|ring, _| {
+                !matches!(ring, VirtioGpuRing::ContextSpecific { ctx_id: c, .. } if *c == ctx_id)
+            });
+            fs.descs
+                .extract_if(.., |d| {
+                    matches!(&d.ring, VirtioGpuRing::ContextSpecific { ctx_id: c, .. } if *c == ctx_id)
+                })
+                .map(|d| (d.desc_index, d.len))
+                .collect()
+        };
+        if !orphaned.is_empty() {
+            self.signal.complete_ctl(&orphaned);
+        }
+    }
+
     pub fn destroy_context(&mut self, ctx_id: u32) -> VirtioGpuResult {
         self.rutabaga.destroy_context(ctx_id)?;
+        self.retire_context_fences(ctx_id);
         // Releases charges the guest allocated but never claimed with a blob
         // create; without this they would be held for the life of the VM.
         if let Some(vram) = self.vram.as_mut() {

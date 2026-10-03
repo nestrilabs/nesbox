@@ -297,6 +297,20 @@ pub fn pop_avail(mem: &GuestMemoryMmap, q: &mut QState) -> Option<(u16, Vec<(u64
     Some((h, descs))
 }
 
+/// The used index as the ring holds it now.
+///
+/// A worker that remembers the index across batches is wrong after a reset,
+/// when the ring starts over at zero, and then compares `used_event` against
+/// the wrong interval. Reading it at the start of a batch costs one load.
+pub fn read_used_idx(mem: &GuestMemoryMmap, q: &QState) -> u16 {
+    if q.size == 0 || q.used == 0 {
+        return 0;
+    }
+    mem.read_obj(vm_memory::GuestAddress(q.used + 2))
+        .map(u16::from_le)
+        .unwrap_or(0)
+}
+
 /// Write a used element and advance the used index.
 ///
 /// Returns the used index after the write, which is what the `EVENT_IDX`

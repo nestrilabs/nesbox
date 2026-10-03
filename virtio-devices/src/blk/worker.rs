@@ -272,7 +272,7 @@ impl Worker {
                 continue;
             }
 
-            let batch_start = self.used_idx;
+            let batch_start = crate::common::read_used_idx(&self.mem, &q);
             let mut used = 0usize;
             for done in completions.drain(..) {
                 used += self.complete(&q, done);
