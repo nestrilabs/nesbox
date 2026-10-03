@@ -272,6 +272,7 @@ impl Worker {
                     self.release(done.token as u32);
                 }
                 self.want_drain = false;
+                self.publish_in_flight();
                 continue;
             }
 
@@ -283,6 +284,7 @@ impl Worker {
             if self.want_drain {
                 used += self.drain(&mut q);
             }
+            self.publish_in_flight();
             if used > 0 {
                 // The used index store above must be visible before the
                 // driver's interrupt-suppression word is read, or a driver
@@ -298,6 +300,15 @@ impl Worker {
                 self.interrupts += 1;
             }
         }
+    }
+
+    /// Tell a resetting device how many requests are still with the kernel.
+    /// It may not return to the driver while any are, because each is a write
+    /// into guest memory that has not happened yet.
+    fn publish_in_flight(&self) {
+        self.queue
+            .in_flight
+            .store(self.depth - self.free.len(), Ordering::SeqCst);
     }
 
     /// Wait for something to do: a completion, or a request the guest added.
