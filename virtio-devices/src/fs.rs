@@ -48,6 +48,9 @@ struct Inner {
     frontend: Frontend,
     kick_fds: Vec<Arc<EventFd>>,
     running: bool,
+    /// The backend accepts SET_OWNER once per connection; a re-activation
+    /// after a guest reset must not repeat it.
+    owned: bool,
 }
 
 impl Inner {
@@ -61,7 +64,10 @@ impl Inner {
             return Ok(());
         }
 
-        self.frontend.set_owner().context("VHOST_USER_SET_OWNER")?;
+        if !self.owned {
+            self.frontend.set_owner().context("VHOST_USER_SET_OWNER")?;
+            self.owned = true;
+        }
 
         let backend_features = self
             .frontend
@@ -189,6 +195,9 @@ impl Inner {
         if self.running {
             for idx in 0..NUM_QUEUES {
                 let _ = self.frontend.set_vring_enable(idx, false);
+                // Stops the ring on the backend's side, which is what lets the
+                // next activation program it afresh.
+                let _ = self.frontend.get_vring_base(idx);
             }
             self.running = false;
         }
@@ -254,6 +263,7 @@ impl FsDevice {
                 frontend,
                 kick_fds,
                 running: false,
+                owned: false,
             }),
         })
     }
