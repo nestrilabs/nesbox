@@ -63,11 +63,24 @@ pub struct NetConfig {
     pub mac: Option<[u8; 6]>,
 }
 
-/// A locally-administered unicast MAC, so it cannot collide with real hardware.
-fn default_mac() -> [u8; 6] {
+/// A locally-administered unicast MAC derived from the tap's name.
+///
+/// The name is what tells one guest's link from another's on a host -- the
+/// host created the tap and names are unique -- so hashing it gives every guest
+/// its own address without a coordinator, and the same one each time the same
+/// tap is used. A constant here put every guest that was not given a MAC on the
+/// same address, which two guests on one bridge cannot share.
+fn default_mac(tap_name: &str) -> [u8; 6] {
+    // FNV-1a, 64 bit.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in tap_name.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let h = h.to_be_bytes();
     // Bit 1 of the first octet marks it locally administered, bit 0 clear
     // keeps it unicast.
-    [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
+    [0x02, h[3], h[4], h[5], h[6], h[7]]
 }
 
 struct Inner {
@@ -332,7 +345,7 @@ impl NetDevice {
             .map(|_| EventFd::new(0).map(Arc::new).context("failed to create net kick eventfd"))
             .collect::<Result<Vec<_>>>()?;
 
-        let mac = config.mac.unwrap_or_else(default_mac);
+        let mac = config.mac.unwrap_or_else(|| default_mac(&config.tap_name));
         let (cfg, msix_cap) = Self::build_pci_config();
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -573,8 +586,14 @@ mod tests {
 
     #[test]
     fn the_default_mac_is_locally_administered_and_unicast() {
-        let mac = default_mac();
+        let mac = default_mac("nesbox0");
         assert_eq!(mac[0] & 0x02, 0x02, "must be locally administered");
         assert_eq!(mac[0] & 0x01, 0x00, "must not be a multicast address");
+    }
+
+    #[test]
+    fn two_taps_get_two_macs_and_one_tap_gets_the_same_one() {
+        assert_ne!(default_mac("nesbox0"), default_mac("nesbox1"));
+        assert_eq!(default_mac("nesbox7"), default_mac("nesbox7"));
     }
 }
