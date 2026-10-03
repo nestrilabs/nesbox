@@ -147,15 +147,19 @@ section_seccomp() {
     local a b
     a=$(run_probe_guest '' ', "seccomp": "off"')
     b=$(run_probe_guest '' ', "seccomp": "enforce"')
-    probe_complain "$a"; probe_complain "$b"
-    grep -q '^nesbox: seccomp refused syscall' <<<"$b" &&
+    # Refusals are only reported in audit mode: under enforce a refused syscall
+    # is a silent SIGSYS death, so counting them in the enforce run could only
+    # ever find none.
+    c=$(run_probe_guest '' ', "seccomp": "audit"')
+    probe_complain "$a"; probe_complain "$b"; probe_complain "$c"
+    grep -q '^nesbox: seccomp refused syscall' <<<"$c" &&
         say "    WARNING: the policy refused a syscall -- see docs/SECURITY.md"
     cat <<JSON
 {
   "off":     { "fps": $(jnum "$(probe_scalar "$a" fps)"), "p50_ms": $(jnum "$(probe_field "$a" p50)"), "p99_ms": $(jnum "$(probe_field "$a" p99)") },
   "enforce": { "fps": $(jnum "$(probe_scalar "$b" fps)"), "p50_ms": $(jnum "$(probe_field "$b" p50)"), "p99_ms": $(jnum "$(probe_field "$b" p99)") },
   "completed": $(probe_ok "$a" && probe_ok "$b" && echo true || echo false),
-  "refusals": $(grep -c '^nesbox: seccomp refused syscall' <<<"$b")
+  "refusals": $(grep -c '^nesbox: seccomp refused syscall' <<<"$c")
 }
 JSON
 }
