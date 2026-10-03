@@ -185,6 +185,7 @@ impl ConsoleDevice {
         // Stdin reader thread — reads from host stdin and pushes into guest RX queue
         let inner_clone = inner.clone();
         std::thread::spawn(move || {
+            crate::sched::lower_this_thread("console reader");
             let stdin = std::io::stdin();
             let mut buf = [0u8; 256];
             loop {

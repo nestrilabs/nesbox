@@ -195,6 +195,7 @@ pub fn serve(path: PathBuf, source: StatsSource) -> Result<()> {
     std::thread::Builder::new()
         .name("nesbox-stats".into())
         .spawn(move || {
+            virtio_devices::sched::lower_this_thread("stats");
             for stream in listener.incoming() {
                 match stream {
                     Ok(mut s) => {
