@@ -126,6 +126,9 @@ and nothing it does not.
 > — the numbers above are from it — and it is young: measured on driver
 > **595.99.02**, with ABI profiles for 535.129.03, 580.178.04 and 595.71.05 and
 > anything older refused. Four guests share one card; more has not been tried.
+> CUDA runs too, on one A2000 so far, when the backend serves compute: each
+> CUDA context's semaphore pool gets a memory slot of its own in a second
+> shared-memory BAR, the UVM aperture.
 > Build nesbox with `--no-default-features` for such a host; see below.
 >
 > Contributions and funding both help, and the second is why the first is
