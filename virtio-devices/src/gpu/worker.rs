@@ -683,6 +683,9 @@ impl Worker {
                 }
                 let mut cmd_buf = vec![0u8; cmd_size];
                 if reader.read_exact(&mut cmd_buf).is_ok() {
+                    // The one place a guest's engine use can be slowed without
+                    // its cooperation: the work has not reached the card yet.
+                    self.metrics.pace_submit(&self.stop);
                     virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf, &fence_ids)
                 } else {
                     Err(GpuResponse::ErrInvalidParameter)

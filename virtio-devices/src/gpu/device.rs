@@ -82,6 +82,10 @@ pub struct GpuConfig {
     /// cache. Confining the vCPUs to one L3 domain and leaving the thread that
     /// answers them free to run on the other is half a placement.
     pub cpu_affinity: Vec<usize>,
+    /// How much of the graphics engine the guest may keep busy, as a percentage,
+    /// or `None` for no limit. Can be changed later with
+    /// [`GpuDevice::set_gpu_time_percent`].
+    pub gpu_time_percent: Option<u32>,
 }
 
 /// The queue state and interrupt plumbing the worker and the fence handler
@@ -300,6 +304,7 @@ impl GpuDevice {
             config.render_node
         );
         let metrics = Arc::new(GpuMetrics::new());
+        metrics.budget.set(config.gpu_time_percent);
         let displays: Box<[DisplayInfo]> = config.displays.clone().into_boxed_slice();
 
         let queues = Arc::new(Queues {
@@ -353,6 +358,17 @@ impl GpuDevice {
 
     /// A snapshot of what this device is doing, for a supervisor rather than a
     /// log reader ([0027]).
+    /// Change how much of the graphics engine the guest may keep busy, as a
+    /// percentage. `None` removes the limit. Takes effect at the next
+    /// submission, while the guest runs.
+    pub fn set_gpu_time_percent(&self, percent: Option<u32>) {
+        self.metrics.budget.set(percent);
+    }
+
+    pub fn gpu_time_percent(&self) -> u32 {
+        self.metrics.budget.percent()
+    }
+
     pub fn metrics(&self) -> GpuSnapshot {
         self.metrics.snapshot()
     }
