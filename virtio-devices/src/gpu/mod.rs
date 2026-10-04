@@ -11,6 +11,7 @@
 mod descriptor_utils;
 mod device;
 pub use self::descriptor_utils::Descriptor;
+pub mod budget;
 pub mod display;
 mod edid;
 mod metrics;
@@ -100,7 +101,6 @@ pub trait GpuQueues: Send + Sync {
     /// sleeping. See [`crate::common::has_avail`].
     fn ctl_has_work(&self) -> bool;
 }
-
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum GpuError {

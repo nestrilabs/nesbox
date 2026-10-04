@@ -91,6 +91,13 @@ struct Queue {
     /// behind the queue lock: the whole point is that a notify never waits on a
     /// request already in flight.
     kick: Arc<EventFd>,
+    /// Bumped on every device reset. A request carries the value it was taken
+    /// under, and a completion that arrives under a later one belongs to a
+    /// driver that is gone: writing its status or used entry would land in
+    /// whatever the next driver has put in that memory.
+    generation: std::sync::atomic::AtomicU64,
+    /// Requests the worker holds that have not completed, as of its last pass.
+    in_flight: std::sync::atomic::AtomicUsize,
 }
 
 /// Interrupt state, shared by every worker.
@@ -175,6 +182,8 @@ impl BlkDevice {
                     ..Default::default()
                 }),
                 kick,
+                generation: std::sync::atomic::AtomicU64::new(0),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
             });
             let w = worker::Worker::new(
                 mem.clone(),
@@ -188,7 +197,10 @@ impl BlkDevice {
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("virtio-blk-{index}"))
-                    .spawn(move || w.run())
+                    .spawn(move || {
+                        crate::sched::lower_this_thread("virtio-blk worker");
+                        w.run()
+                    })
                     .context("failed to start a virtio-blk worker")?,
             );
             queues.push(queue);
@@ -308,6 +320,23 @@ impl BlkDevice {
         write_val(d, v);
     }
 
+    /// Block until every worker has no request outstanding, or give up after a
+    /// bound: a disk that never answers must not freeze the vCPU for good.
+    fn wait_for_in_flight(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self
+            .queues
+            .iter()
+            .any(|q| q.in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0)
+        {
+            if std::time::Instant::now() >= deadline {
+                log::warn!("virtio-blk: reset gave up waiting for outstanding requests");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+
     fn com_write(&self, off: u64, d: &[u8]) {
         let (v3, v2, v1) = parse_write(d);
         let mut i = self.inner.lock().unwrap();
@@ -342,12 +371,20 @@ impl BlkDevice {
                     // the next driver inherits this one's ring positions.
                     for queue in &self.queues {
                         let mut q = queue.state.lock().unwrap();
+                        queue
+                            .generation
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         *q = QState {
                             size: QUEUE_SIZE,
                             vec: VIRTQ_MSI_NO_VECTOR,
                             ..Default::default()
                         };
                     }
+                    // The device may not touch guest memory once the reset
+                    // write completes, and a read the kernel already has is a
+                    // write into it still to come. The queues are disabled, so
+                    // nothing new is taken; wait for what is out there.
+                    self.wait_for_in_flight();
                 }
             }
             CFG_QUEUE_SEL => i.qs = v2,

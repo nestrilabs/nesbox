@@ -9,7 +9,7 @@
 use crate::common::*;
 use anyhow::{Context, Result};
 use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
-use pci::{MsiRouter, MsiVector, PciDevice};
+use pci::{Doorbell, MsiRouter, MsiVector, PciDevice};
 use std::sync::{Arc, Mutex};
 use vhost::vhost_kern::vsock::Vsock as VhostVsockBackend;
 use vhost::vsock::VhostVsock;
@@ -49,8 +49,11 @@ struct Inner {
     /// Features the kernel backend reports, as `VHOST_GET_FEATURES` gives them.
     backend_features: u64,
     /// One kick eventfd per queue, signalled when the guest notifies.
-    kick_fds: Vec<EventFd>,
+    kick_fds: Vec<Arc<EventFd>>,
     running: bool,
+    /// The kernel only accepts VHOST_SET_OWNER once for the life of the fd;
+    /// a second activation after a guest reset must not repeat it.
+    owned: bool,
 }
 
 impl Inner {
@@ -80,8 +83,11 @@ impl Inner {
 
         // See the same call in net.rs: the vhost worker is born with this
         // thread's affinity, and this thread is a vCPU.
-        crate::affinity::with_io_affinity("virtio-vsock", || self.backend.set_owner())
-            .context("VHOST_SET_OWNER")?;
+        if !self.owned {
+            crate::affinity::with_io_affinity("virtio-vsock", || self.backend.set_owner())
+                .context("VHOST_SET_OWNER")?;
+            self.owned = true;
+        }
 
         let acked = self.com.df & self.features();
         self.backend
@@ -198,7 +204,11 @@ impl VsockDevice {
             .context("failed to open /dev/vhost-vsock — is the vhost_vsock module loaded?")?;
         let backend_features = backend.get_features().context("VHOST_GET_FEATURES")?;
         let kick_fds = (0..NUM_QUEUES)
-            .map(|_| EventFd::new(0).context("failed to create vsock kick eventfd"))
+            .map(|_| {
+                EventFd::new(0)
+                    .map(Arc::new)
+                    .context("failed to create vsock kick eventfd")
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let (cfg, msix_cap) = Self::build_pci_config();
@@ -219,6 +229,7 @@ impl VsockDevice {
                 backend_features,
                 kick_fds,
                 running: false,
+                owned: false,
             }),
         })
     }
@@ -363,6 +374,21 @@ impl VsockDevice {
 }
 
 impl PciDevice for VsockDevice {
+    /// A guest kick goes straight to the eventfd the backend waits on, with no
+    /// exit to userspace. `bar0_write` still handles the same offsets for a
+    /// host where registration fails.
+    fn doorbells(&self) -> Vec<Doorbell> {
+        let i = self.inner.lock().unwrap();
+        i.kick_fds
+            .iter()
+            .enumerate()
+            .map(|(idx, fd)| Doorbell {
+                bar_idx: 0,
+                offset: OFF_NOTIFY + idx as u64 * NOTIFY_MULT as u64,
+                fd: fd.clone(),
+            })
+            .collect()
+    }
     fn read_config(&self, o: u32, d: &mut [u8]) {
         let i = self.inner.lock().unwrap();
         read_cfg_space(&i.cfg, o, d);

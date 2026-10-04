@@ -111,6 +111,9 @@ impl Drop for Bounce {
 /// One request in flight. The `iovec`s here are what the kernel is reading, so
 /// nothing in a live slot may be moved or rewritten until it completes.
 struct Slot {
+    /// The queue's generation when the request was taken. See
+    /// `Queue::generation`.
+    generation: u64,
     head: u16,
     op: Op,
     status_addr: u64,
@@ -269,16 +272,26 @@ impl Worker {
                     self.release(done.token as u32);
                 }
                 self.want_drain = false;
+                self.publish_in_flight();
                 continue;
             }
 
-            let batch_start = self.used_idx;
+            let batch_start = crate::common::read_used_idx(&self.mem, &q);
             let mut used = 0usize;
             for done in completions.drain(..) {
                 used += self.complete(&q, done);
             }
             if self.want_drain {
                 used += self.drain(&mut q);
+            }
+            self.publish_in_flight();
+            if used > 0 {
+                // The used index store above must be visible before the
+                // driver's interrupt-suppression word is read, or a driver
+                // that re-arms and then re-checks the ring can sleep on a
+                // completion nobody told it about. A release fence is only a
+                // compiler barrier for a store followed by a load on x86.
+                std::sync::atomic::fence(Ordering::SeqCst);
             }
             if used > 0 && used_needs_interrupt(&self.mem, &q, batch_start, self.used_idx) {
                 let mut irq = self.irq.lock().unwrap();
@@ -287,6 +300,15 @@ impl Worker {
                 self.interrupts += 1;
             }
         }
+    }
+
+    /// Tell a resetting device how many requests are still with the kernel.
+    /// It may not return to the driver while any are, because each is a write
+    /// into guest memory that has not happened yet.
+    fn publish_in_flight(&self) {
+        self.queue
+            .in_flight
+            .store(self.depth - self.free.len(), Ordering::SeqCst);
     }
 
     /// Wait for something to do: a completion, or a request the guest added.
@@ -549,6 +571,7 @@ impl Worker {
         } = req;
 
         let mut slot = Slot {
+            generation: self.queue.generation.load(Ordering::SeqCst),
             head,
             op,
             status_addr,
@@ -715,6 +738,14 @@ impl Worker {
             log::error!("virtio-blk: completion for an unknown token {token}");
             return 0;
         };
+
+        if slot.generation != self.queue.generation.load(Ordering::SeqCst) {
+            // Taken under a driver that has since reset the device. Its ring
+            // and buffers are not ours to write any more; only the slot comes
+            // back.
+            self.free.push(token);
+            return 0;
+        }
 
         let finish = |w: &mut Self, slot: Slot, status: u8| -> usize {
             let len = match (status, slot.op) {

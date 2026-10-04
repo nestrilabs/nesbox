@@ -1,6 +1,11 @@
 pub mod acpi;
 pub mod boot;
 pub mod config;
+/// The metrics surface. Currently shaped entirely around `GpuDevice`, so it
+/// compiles only with `virgl`; making it source-agnostic is what a
+/// virtio-nvgpu stats surface needs first.
+#[cfg(feature = "virgl")]
+pub mod control;
 pub mod cpuid;
 pub mod gdt;
 pub mod interrupt;
@@ -16,10 +21,6 @@ pub mod regs;
 pub mod renderer;
 pub mod seccomp;
 pub mod serial;
-/// The metrics surface. Currently shaped entirely around `GpuDevice`, so it
-/// compiles only with `virgl`; making it source-agnostic is what a
-/// virtio-nvgpu stats surface needs first.
-#[cfg(feature = "virgl")]
 pub mod stats;
 pub mod virtiofsd;
 pub mod vm;

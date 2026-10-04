@@ -147,6 +147,16 @@ impl Reader {
         Ok(unsafe { obj.assume_init() })
     }
 
+    /// Read an object without consuming it. A command that cannot be decoded
+    /// still has a header, and the header says whether the driver is waiting
+    /// on a fence for it.
+    pub fn peek_obj<T: ByteValued>(&mut self) -> io::Result<T> {
+        let at = self.buf.position();
+        let obj = self.read_obj::<T>();
+        self.buf.set_position(at);
+        obj
+    }
+
     /// Bytes remaining before the end of the readable descriptor area.
     pub fn available_bytes(&self) -> usize {
         self.buf.get_ref().len() - self.buf.position() as usize

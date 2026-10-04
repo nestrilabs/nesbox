@@ -245,6 +245,9 @@ impl Vm {
                 log::warn!("dedicated: KVM's CPUID leaves are absent, so the guest is not told");
             }
             vcpu_fd.set_cpuid2(&cpuid).context("Failed to set CPUID")?;
+            if vendor == crate::cpuid::Vendor::Intel {
+                enable_fast_strings(&vcpu_fd).context("Failed to enable fast string operations")?;
+            }
 
             // Only the bootstrap processor starts executing the kernel. The
             // application processors must be left in the reset state KVM gave
@@ -747,6 +750,16 @@ pub fn run_vcpu_loop(
                     }
                     break;
                 }
+                exit
+                @ (VcpuExit::InternalError | VcpuExit::Unknown | VcpuExit::SystemEvent(..)) => {
+                    // Re-entering after one of these only produces the same
+                    // exit again: the vCPU would spin at full speed while the
+                    // VM looks hung and the log stays silent.
+                    let what = format!("unrecoverable vCPU exit: {exit:?}");
+                    log::error!("{what}");
+                    shutdown.request(ExitReason::Error(what));
+                    break;
+                }
                 other => {
                     log::debug!("Unhandled vCPU exit: {:?}", other);
                 }
@@ -865,4 +878,33 @@ ShmemPmdMapped:  1048576 kB
         file.read_exact_at(&mut byte, size as u64).unwrap();
         assert_eq!(byte[0], 0xa5, "the second mapping wrote at its own offset");
     }
+}
+
+/// IA32_MISC_ENABLE, and its bit for fast `rep movs`/`rep stos`.
+const MSR_IA32_MISC_ENABLE: u32 = 0x1a0;
+const MISC_ENABLE_FAST_STRING: u64 = 1;
+
+/// Set the fast-string bit in the guest's IA32_MISC_ENABLE.
+///
+/// KVM's reset value leaves it clear, and Linux on an Intel CPU reads a clear
+/// bit as "this part has slow string instructions": it drops `REP_GOOD` and
+/// `ERMS` from the CPU's features and falls back to open-coded copy and clear
+/// loops. Real Intel hardware boots with the bit set, so this makes the guest
+/// see what the silicon says.
+fn enable_fast_strings(vcpu: &VcpuFd) -> Result<()> {
+    use kvm_bindings::{Msrs, kvm_msr_entry};
+    let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+        index: MSR_IA32_MISC_ENABLE,
+        ..Default::default()
+    }])?;
+    anyhow::ensure!(
+        vcpu.get_msrs(&mut msrs)? == 1,
+        "KVM would not report IA32_MISC_ENABLE"
+    );
+    msrs.as_mut_slice()[0].data |= MISC_ENABLE_FAST_STRING;
+    anyhow::ensure!(
+        vcpu.set_msrs(&msrs)? == 1,
+        "KVM would not set IA32_MISC_ENABLE"
+    );
+    Ok(())
 }

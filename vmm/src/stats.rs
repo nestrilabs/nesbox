@@ -115,7 +115,7 @@ fn gpu_json(s: &GpuSnapshot) -> String {
          \"vram_refusals\":{},\"gtt_bytes\":{},\
          \"window_bytes\":{},\"window_peak_bytes\":{},\"window_limit_bytes\":{},\
          \"window_mappings\":{},\"window_refusals\":{},\"drained\":{},\
-         \"spin\":{spin},\"sleep\":{sleep},\"drain\":{drain},\
+         \"spin\":{spin},\"sleep\":{sleep},\"budget_wait\":{budget_wait},\"gpu_time_percent\":{gpu_time_percent},\"drain\":{drain},\
          \"command\":{command},\"submit\":{submit},\"observe\":{observe},\
          \"fence_create\":{fence_create},\"fence_latency\":{fence_latency},\
          \"complete\":{complete},\
@@ -158,6 +158,8 @@ fn gpu_json(s: &GpuSnapshot) -> String {
         command_kind = kinds_json(&s.command_kind),
         spin = phase_json(&s.spin),
         sleep = phase_json(&s.sleep),
+        budget_wait = phase_json(&s.budget_wait),
+        gpu_time_percent = s.gpu_time_percent,
         drain = phase_json(&s.drain),
         command = phase_json(&s.command),
         submit = phase_json(&s.submit),
@@ -193,6 +195,7 @@ pub fn serve(path: PathBuf, source: StatsSource) -> Result<()> {
     std::thread::Builder::new()
         .name("nesbox-stats".into())
         .spawn(move || {
+            virtio_devices::sched::lower_this_thread("stats");
             for stream in listener.incoming() {
                 match stream {
                     Ok(mut s) => {
@@ -268,6 +271,8 @@ mod tests {
             drained: 25,
             spin: PhaseSnapshot { ns: 30, count: 31 },
             sleep: PhaseSnapshot { ns: 32, count: 33 },
+            budget_wait: PhaseSnapshot { ns: 0, count: 0 },
+            gpu_time_percent: 100,
             drain: PhaseSnapshot { ns: 34, count: 35 },
             command: PhaseSnapshot { ns: 36, count: 37 },
             submit: PhaseSnapshot { ns: 38, count: 39 },
@@ -320,6 +325,7 @@ mod tests {
         for phase in [
             "spin",
             "sleep",
+            "budget_wait",
             "drain",
             "command",
             "submit",

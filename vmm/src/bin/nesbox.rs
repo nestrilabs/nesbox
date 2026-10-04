@@ -309,6 +309,8 @@ fn main() -> Result<()> {
     // ones guest RAM already occupies.
     #[cfg(feature = "virgl")]
     let mut stats_gpu = None;
+    #[cfg(feature = "virgl")]
+    let mut control_gpu = None;
     // One allocator for both windowed devices. Two would each start numbering
     // at the first slot past guest RAM and hand out the same numbers.
     let memory_slots = MemorySlots::new(vm.vm_fd.clone(), vm.ram_slot_count);
@@ -332,11 +334,12 @@ fn main() -> Result<()> {
         let gpu_device = Arc::new(GpuDevice::new(
             &GpuConfig {
                 render_node: gpu_cfg.render_node.clone(),
-                displays: vec![DisplayInfo::new(gpu_cfg.width, gpu_cfg.height)],
+                displays: vec![/*DisplayInfo::new(gpu_cfg.width, gpu_cfg.height)*/],
                 vram_limit_bytes: gpu_cfg.vram_limit_mib.map(|m| m * (1 << 20)),
                 window_limit_bytes: gpu_cfg.host_visible_window_mib.map_or(0, |m| m * (1 << 20)),
                 window_max_mappings: gpu_cfg.host_visible_max_mappings.unwrap_or(0),
                 poll_us: gpu_cfg.poll_us,
+                gpu_time_percent: gpu_cfg.gpu_time_percent,
                 // The I/O set, which is the guest's own set unless the caller
                 // named a separate one. Either way it stays in the guest's L3
                 // domain: the worker is the other half of every forwarded
@@ -374,7 +377,8 @@ fn main() -> Result<()> {
             "virtio-gpu at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
             bdf.0, bdf.1, bdf.2
         );
-        stats_gpu = Some(gpu_device);
+        stats_gpu = Some(gpu_device.clone());
+        control_gpu = Some(gpu_device);
         next_slot += 1;
     }
 
@@ -384,6 +388,13 @@ fn main() -> Result<()> {
     #[cfg(feature = "virgl")]
     if let Some(path) = config.stats_socket.clone() {
         nesbox_vmm::stats::serve(path, nesbox_vmm::stats::StatsSource::new(stats_gpu))?;
+    }
+    #[cfg(feature = "virgl")]
+    if let Some(path) = config.control_socket.clone() {
+        nesbox_vmm::control::serve(
+            path,
+            nesbox_vmm::control::ControlTarget { gpu: control_gpu },
+        )?;
     }
 
     // ── Shared directories over virtio-fs ─────────────────────────────────
@@ -472,7 +483,7 @@ fn main() -> Result<()> {
     // ── Lifetime ──────────────────────────────────────────────────────────
     let shutdown = Shutdown::new();
     let power = Arc::new(PowerDevice::new(shutdown.clone()));
-    install_signal_handlers(shutdown.clone())?;
+    install_signal_handlers()?;
 
     // ── Take away the network ─────────────────────────────────────────────
     // Deliberately here: after the tap is opened, after virtiofsd is spawned and
@@ -517,6 +528,8 @@ fn main() -> Result<()> {
         })
         .collect();
 
+    let vcpu_count = vm.vcpus.len();
+    let vcpus_exited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handles: Vec<_> = vm
         .vcpus
         .into_iter()
@@ -527,6 +540,7 @@ fn main() -> Result<()> {
             let serial = serial.clone();
             let power = power.clone();
             let shutdown = shutdown.clone();
+            let exited = vcpus_exited.clone();
             let placement = placements[vcpu_id];
             let cgroup_fd = config.machine_config.vcpu_cgroup_fd;
             std::thread::Builder::new()
@@ -535,6 +549,9 @@ fn main() -> Result<()> {
                 // by us or by an operator with taskset -- cannot be checked.
                 .name(format!("vcpu{vcpu_id}"))
                 .spawn(move || {
+                    // Counted on the way out however the thread ends, so the
+                    // watcher knows when to stop signalling it.
+                    let _exit = CountOnDrop(exited);
                     // Into the partition first: until then its CPUs are not in
                     // this thread's cpuset, and the pin below is refused.
                     if let Some(fd) = cgroup_fd
@@ -587,6 +604,13 @@ fn main() -> Result<()> {
             // late.
             let mut ticks = 0u32;
             while !shutdown.is_requested() {
+                if STOP_SIGNALLED.load(std::sync::atomic::Ordering::SeqCst) {
+                    shutdown.request(ExitReason::HostSignal);
+                    break;
+                }
+                if vcpus_exited.load(std::sync::atomic::Ordering::SeqCst) == vcpu_count {
+                    return;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 ticks = ticks.saturating_add(1);
                 if ticks == 10 || ticks == 100 {
@@ -596,19 +620,27 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            for thread in vcpu_threads {
-                // SAFETY: the vCPU threads are joined below, so these ids stay
-                // valid until after this signal is delivered.
-                unsafe { libc::pthread_kill(thread, VCPU_WAKE_SIGNAL) };
+            // One signal is not enough: a vCPU that has checked the stop flag
+            // but not yet entered KVM_RUN misses it, and an idle guest never
+            // exits on its own. Keep waking them until every thread is gone.
+            while vcpus_exited.load(std::sync::atomic::Ordering::SeqCst) < vcpu_count {
+                for &thread in &vcpu_threads {
+                    // SAFETY: main joins the watcher before any vCPU thread, so
+                    // these ids stay valid for as long as this loop runs.
+                    unsafe { libc::pthread_kill(thread, VCPU_WAKE_SIGNAL) };
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         })
     };
 
+    // The watcher first: it signals the vCPU threads by id, so none may be
+    // joined, and its id freed, while it is still doing that.
+    let _ = watcher.join();
     for handle in handles {
         handle.join().unwrap();
     }
     shutdown.request(ExitReason::Error("all vCPUs stopped".into()));
-    let _ = watcher.join();
 
     // Devices and their backends are torn down here: dropping the virtiofsd
     // supervisors kills them, and the VM's memory goes with the process.
@@ -625,7 +657,18 @@ fn main() -> Result<()> {
     } else {
         log::error!("VM stopped: {reason}");
     }
+    // `exit` runs no destructors, so the terminal would be left raw.
+    drop(_raw);
     std::process::exit(reason.exit_code());
+}
+
+/// Bumps a counter when dropped, which a thread does on every way out.
+struct CountOnDrop(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for CountOnDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Signal used to wake a vCPU out of KVM_RUN. Its handler does nothing; the
@@ -635,17 +678,16 @@ const VCPU_WAKE_SIGNAL: libc::c_int = libc::SIGUSR1;
 extern "C" fn wake_handler(_: libc::c_int) {}
 
 extern "C" fn stop_handler(_: libc::c_int) {
-    // Async-signal-safe: just flips an atomic.
-    if let Some(shutdown) = SHUTDOWN.get() {
-        shutdown.request(ExitReason::HostSignal);
-    }
+    // Async-signal-safe: only flips an atomic. Recording the reason takes a
+    // mutex and logs, and a signal landing on a thread already inside either
+    // would deadlock it; the watcher thread turns the flag into a request.
+    STOP_SIGNALLED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-static SHUTDOWN: std::sync::OnceLock<Arc<Shutdown>> = std::sync::OnceLock::new();
+static STOP_SIGNALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// SIGTERM and SIGINT ask the VM to stop; SIGUSR1 just interrupts KVM_RUN.
-fn install_signal_handlers(shutdown: Arc<Shutdown>) -> Result<()> {
-    let _ = SHUTDOWN.set(shutdown);
+fn install_signal_handlers() -> Result<()> {
     // SAFETY: both handlers are async-signal-safe.
     unsafe {
         for signal in [libc::SIGTERM, libc::SIGINT] {

@@ -28,6 +28,7 @@ use vm_memory::GuestAddress;
 
 use vm_memory::GuestMemoryMmap;
 
+use super::GpuQueues;
 use super::VirtioShmRegion;
 use super::descriptor_utils::{Reader, Writer};
 use super::display::DisplayInfo;
@@ -37,7 +38,6 @@ use super::protocol::{
     virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
 use super::virtio_gpu::{VirtioGpu, VirtioGpuRing};
-use super::GpuQueues;
 use crate::memmap::HostMemoryMapper;
 use std::path::PathBuf;
 
@@ -130,8 +130,11 @@ impl Worker {
 
     fn work(mut self) {
         // Before anything else, and on this thread rather than the one that
-        // spawned it: `sched_setaffinity` with pid 0 acts on the caller.
+        // spawned it: `sched_setaffinity` with pid 0 acts on the caller. The
+        // priority is the same kind of thing, and it is inherited by the threads
+        // the renderer starts from here, its fence thread among them.
         self.confine();
+        crate::sched::raise_this_thread("virtio-gpu worker");
 
         let start = std::time::Instant::now();
         let Some(mut virtio_gpu) = VirtioGpu::new(
@@ -247,6 +250,10 @@ impl Worker {
         if self.poll_us > 0 {
             let began = Instant::now();
             let deadline = began + Duration::from_micros(self.poll_us);
+            // The clock is a call of its own and was a quarter of this loop;
+            // the deadline is microseconds away, so reading it every so many
+            // looks costs nothing in accuracy.
+            let mut looks = 0u32;
             loop {
                 if self.queues.ctl_has_work() || self.stop.load(Ordering::Acquire) {
                     // The doorbell is drained whether or not it was what told
@@ -259,7 +266,8 @@ impl Worker {
                     self.metrics.counters.spin.since(began);
                     return;
                 }
-                if Instant::now() >= deadline {
+                looks = looks.wrapping_add(1);
+                if looks % 32 == 0 && Instant::now() >= deadline {
                     break;
                 }
                 std::hint::spin_loop();
@@ -332,19 +340,25 @@ impl Worker {
             let mut reader = match Reader::new(&mem, &descs) {
                 Ok(r) => r,
                 Err(e) => {
-                    error!("virtio-gpu: failed to create Reader: {e:?}");
+                    // Not completing it would leave the descriptor out of the
+                    // used ring for good, and a driver can post enough of them
+                    // to empty the queue.
+                    debug!("virtio-gpu: failed to create Reader: {e:?}");
+                    completed.push((desc_index, 0));
                     continue;
                 }
             };
             let mut writer = match Writer::new(&mem, &descs) {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("virtio-gpu: failed to create Writer: {e:?}");
+                    debug!("virtio-gpu: failed to create Writer: {e:?}");
+                    completed.push((desc_index, 0));
                     continue;
                 }
             };
 
             // Decode the command.
+            let peeked = reader.peek_obj::<virtio_gpu_ctrl_hdr>().ok();
             let (hdr, cmd, resp) = match GpuCommand::decode(&mut reader) {
                 Ok((hdr, cmd)) => {
                     let at = Instant::now();
@@ -355,7 +369,9 @@ impl Worker {
                 }
                 Err(e) => {
                     debug!("virtio-gpu: decode error: {e:?}");
-                    (None, None, Err(GpuResponse::ErrUnspec))
+                    // The header is kept so a fenced command that cannot be
+                    // decoded still answers its fence.
+                    (peeked, None, Err(GpuResponse::ErrUnspec))
                 }
             };
 
@@ -377,6 +393,7 @@ impl Worker {
             // must be retired only after rutabaga signals completion.
             let mut add_to_queue = true;
             let mut len = 0u32;
+            let mut fence_failed = false;
 
             let (flags, fence_id, ctx_id, ring_idx) = if let Some(hdr) = hdr {
                 if hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
@@ -389,7 +406,8 @@ impl Worker {
                     gpu_response = match virtio_gpu.create_fence(fence) {
                         Ok(_) => gpu_response,
                         Err(fence_resp) => {
-                            log::warn!("virtio-gpu: create_fence -> {fence_resp:?}");
+                            debug!("virtio-gpu: create_fence -> {fence_resp:?}");
+                            fence_failed = true;
                             fence_resp
                         }
                     };
@@ -408,7 +426,9 @@ impl Worker {
             }
 
             // If this descriptor is fenced, hand it off to the fence tracker.
-            if flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+            // A fence that was never created will never signal, so the
+            // descriptor is retired now with the error instead of waiting.
+            if flags & VIRTIO_GPU_FLAG_FENCE != 0 && !fence_failed {
                 let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
                     0 => VirtioGpuRing::Global,
                     _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },
@@ -530,6 +550,13 @@ impl Worker {
                          {fits} fit the descriptor chain",
                         info.nr_entries
                     );
+                    return Err(GpuResponse::ErrUnspec);
+                }
+                // Same bound as attach-backing: the chain says how many entries
+                // can exist, the guest's count says nothing.
+                if info.nr_entries as usize
+                    > reader.available_bytes() / size_of::<virtio_gpu_mem_entry>()
+                {
                     return Err(GpuResponse::ErrUnspec);
                 }
                 let mut vecs = Vec::with_capacity(info.nr_entries as usize);
@@ -659,6 +686,9 @@ impl Worker {
                 }
                 let mut cmd_buf = vec![0u8; cmd_size];
                 if reader.read_exact(&mut cmd_buf).is_ok() {
+                    // The one place a guest's engine use can be slowed without
+                    // its cooperation: the work has not reached the card yet.
+                    self.metrics.pace_submit(&self.stop);
                     virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf, &fence_ids)
                 } else {
                     Err(GpuResponse::ErrInvalidParameter)

@@ -31,7 +31,7 @@ use crate::common::*;
 use crate::memmap::HostMemoryMapper;
 use anyhow::{Context, Result};
 use pci::config::{PCIE_TYPE_RC_INTEGRATED, PciConfig};
-use pci::{BarType, MsiRouter, MsiVector, PciDevice};
+use pci::{BarType, Doorbell, MsiRouter, MsiVector, PciDevice};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -391,7 +391,7 @@ struct Inner {
     /// Present once a mapper is bound. Without it the backend is never given a
     /// request channel and keeps its mappings to itself.
     window: Option<Arc<WindowMapper>>,
-    kick_fds: Vec<EventFd>,
+    kick_fds: Vec<Arc<EventFd>>,
     running: bool,
     /// Device config as the backend reported it at creation.
     ///
@@ -746,7 +746,11 @@ impl NvGpuDevice {
         check_device_config(&device_config, &host_version, vram_limit_mib)?;
 
         let kick_fds = (0..NUM_QUEUES)
-            .map(|_| EventFd::new(0).context("failed to create virtio-gpu-nv kick eventfd"))
+            .map(|_| {
+                EventFd::new(0)
+                    .map(Arc::new)
+                    .context("failed to create virtio-gpu-nv kick eventfd")
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let (cfg, msix_cap) = Self::build_pci_config();
@@ -1030,6 +1034,21 @@ impl NvGpuDevice {
 }
 
 impl PciDevice for NvGpuDevice {
+    /// A guest kick goes straight to the eventfd the backend waits on, with no
+    /// exit to userspace. `bar0_write` still handles the same offsets for a
+    /// host where registration fails.
+    fn doorbells(&self) -> Vec<Doorbell> {
+        let i = self.inner.lock().unwrap();
+        i.kick_fds
+            .iter()
+            .enumerate()
+            .map(|(idx, fd)| Doorbell {
+                bar_idx: 0,
+                offset: NV_OFF_NOTIFY + idx as u64 * NOTIFY_MULT as u64,
+                fd: fd.clone(),
+            })
+            .collect()
+    }
     fn read_config(&self, o: u32, d: &mut [u8]) {
         let i = self.inner.lock().unwrap();
         read_cfg_space(&i.cfg, o, d);

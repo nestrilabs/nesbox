@@ -13,6 +13,7 @@ pub mod gpu;
 pub mod memmap;
 mod net;
 mod nvgpu;
+pub mod sched;
 pub mod tap;
 mod vsock;
 
