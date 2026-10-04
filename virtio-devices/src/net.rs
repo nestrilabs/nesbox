@@ -342,7 +342,11 @@ impl NetDevice {
         let backend_features = backend.get_features().context("VHOST_GET_FEATURES")?;
 
         let kick_fds = (0..NUM_QUEUES)
-            .map(|_| EventFd::new(0).map(Arc::new).context("failed to create net kick eventfd"))
+            .map(|_| {
+                EventFd::new(0)
+                    .map(Arc::new)
+                    .context("failed to create net kick eventfd")
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let mac = config.mac.unwrap_or_else(|| default_mac(&config.tap_name));

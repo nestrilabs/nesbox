@@ -746,7 +746,11 @@ impl NvGpuDevice {
         check_device_config(&device_config, &host_version, vram_limit_mib)?;
 
         let kick_fds = (0..NUM_QUEUES)
-            .map(|_| EventFd::new(0).map(Arc::new).context("failed to create virtio-gpu-nv kick eventfd"))
+            .map(|_| {
+                EventFd::new(0)
+                    .map(Arc::new)
+                    .context("failed to create virtio-gpu-nv kick eventfd")
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let (cfg, msix_cap) = Self::build_pci_config();

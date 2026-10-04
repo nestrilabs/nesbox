@@ -246,8 +246,7 @@ impl Vm {
             }
             vcpu_fd.set_cpuid2(&cpuid).context("Failed to set CPUID")?;
             if vendor == crate::cpuid::Vendor::Intel {
-                enable_fast_strings(&vcpu_fd)
-                    .context("Failed to enable fast string operations")?;
+                enable_fast_strings(&vcpu_fd).context("Failed to enable fast string operations")?;
             }
 
             // Only the bootstrap processor starts executing the kernel. The
@@ -751,7 +750,8 @@ pub fn run_vcpu_loop(
                     }
                     break;
                 }
-                exit @ (VcpuExit::InternalError | VcpuExit::Unknown | VcpuExit::SystemEvent(..)) => {
+                exit
+                @ (VcpuExit::InternalError | VcpuExit::Unknown | VcpuExit::SystemEvent(..)) => {
                     // Re-entering after one of these only produces the same
                     // exit again: the vCPU would spin at full speed while the
                     // VM looks hung and the log stays silent.

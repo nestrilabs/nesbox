@@ -204,7 +204,11 @@ impl VsockDevice {
             .context("failed to open /dev/vhost-vsock — is the vhost_vsock module loaded?")?;
         let backend_features = backend.get_features().context("VHOST_GET_FEATURES")?;
         let kick_fds = (0..NUM_QUEUES)
-            .map(|_| EventFd::new(0).map(Arc::new).context("failed to create vsock kick eventfd"))
+            .map(|_| {
+                EventFd::new(0)
+                    .map(Arc::new)
+                    .context("failed to create vsock kick eventfd")
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let (cfg, msix_cap) = Self::build_pci_config();

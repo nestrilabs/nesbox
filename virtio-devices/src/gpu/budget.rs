@@ -110,7 +110,11 @@ impl GpuBudget {
             let sleep_for = {
                 let mut st = self.pace.lock().unwrap();
                 let now = Instant::now();
-                let due = if st.bank_ns < 0.0 { SAMPLE_HELD } else { SAMPLE_OK };
+                let due = if st.bank_ns < 0.0 {
+                    SAMPLE_HELD
+                } else {
+                    SAMPLE_OK
+                };
                 if st.gfx_ns.is_none() || now.duration_since(st.at) >= due {
                     let Some(sample) = read() else {
                         return waited;
@@ -118,7 +122,8 @@ impl GpuBudget {
                     if let Some(prev) = st.gfx_ns {
                         let wall = now.duration_since(st.at).as_nanos() as f64;
                         let used = sample.gfx_ns.saturating_sub(prev) as f64;
-                        st.bank_ns = (st.bank_ns + rate * wall - used).clamp(-MAX_DEBT_NS, BURST_NS);
+                        st.bank_ns =
+                            (st.bank_ns + rate * wall - used).clamp(-MAX_DEBT_NS, BURST_NS);
                     }
                     st.gfx_ns = Some(sample.gfx_ns);
                     st.at = now;
@@ -180,11 +185,11 @@ mod tests {
         // The engine reports 50 ms spent over the next few milliseconds of wall
         // time, far above 10% of it: the guest has to wait.
         std::thread::sleep(Duration::from_millis(2));
-        let waited = b.pace(
-            || sample(50_000_000),
-            &stop,
+        let waited = b.pace(|| sample(50_000_000), &stop);
+        assert!(
+            waited > Duration::ZERO,
+            "an overdrawn guest was let straight through"
         );
-        assert!(waited > Duration::ZERO, "an overdrawn guest was let straight through");
     }
 
     #[test]

@@ -243,7 +243,11 @@ impl FsDevice {
             )
         })?;
         let kick_fds = (0..NUM_QUEUES)
-            .map(|_| EventFd::new(0).map(Arc::new).context("failed to create virtio-fs kick eventfd"))
+            .map(|_| {
+                EventFd::new(0)
+                    .map(Arc::new)
+                    .context("failed to create virtio-fs kick eventfd")
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let (cfg, msix_cap) = Self::build_pci_config();

@@ -72,10 +72,7 @@ impl Inner {
                     while off < len {
                         let n = (len - off).min(buf.len() as u32) as usize;
                         if mem
-                            .read_slice(
-                                &mut buf[..n],
-                                vm_memory::GuestAddress(addr + off as u64),
-                            )
+                            .read_slice(&mut buf[..n], vm_memory::GuestAddress(addr + off as u64))
                             .is_err()
                         {
                             break;
