@@ -82,6 +82,9 @@ pub struct GpuConfig {
     /// cache. Confining the vCPUs to one L3 domain and leaving the thread that
     /// answers them free to run on the other is half a placement.
     pub cpu_affinity: Vec<usize>,
+    /// Scheduler slice the worker asks for, in microseconds. Zero asks for
+    /// nothing. See `sched::request_slice`.
+    pub worker_slice_us: u64,
     /// How much of the graphics engine the guest may keep busy, as a percentage,
     /// or `None` for no limit. Can be changed later with
     /// [`GpuDevice::set_gpu_time_percent`].
@@ -160,6 +163,7 @@ struct Inner {
     /// How long the worker looks at the ring before sleeping, in microseconds.
     poll_us: u64,
     cpu_affinity: Vec<usize>,
+    worker_slice_us: u64,
     metrics: Arc<GpuMetrics>,
     shm_guest_addr: u64,
     mapper: Option<Arc<dyn HostMemoryMapper>>,
@@ -200,6 +204,7 @@ impl Inner {
             self.stop.clone(),
             self.poll_us,
             self.cpu_affinity.clone(),
+            self.worker_slice_us,
             (*self.queues.mem).clone(),
             self.queues.clone(),
             VirtioShmRegion {
@@ -342,6 +347,7 @@ impl GpuDevice {
                 window_max_mappings: config.window_max_mappings,
                 poll_us: config.poll_us,
                 cpu_affinity: config.cpu_affinity.clone(),
+                worker_slice_us: config.worker_slice_us,
                 metrics: metrics.clone(),
                 // Filled in by `set_shm_guest_addr` once the bus has placed
                 // BAR2; the device cannot be activated before that.

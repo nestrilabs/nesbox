@@ -174,6 +174,19 @@ pub struct Gpu {
     /// while the guest runs through the control socket.
     #[serde(default)]
     pub gpu_time_percent: Option<u32>,
+    /// Host CPUs the GPU worker may run on, replacing what it would be given.
+    /// Omitted means `MachineConfig::worker_cpus`.
+    #[serde(default)]
+    pub worker_cpus: Option<Vec<usize>>,
+    /// Microseconds of scheduler slice the GPU worker asks for. Zero asks for
+    /// nothing; omitted means 100.
+    ///
+    /// A short slice is picked sooner when the worker wakes onto a CPU that a
+    /// host task is using, and costs nothing to anyone else: it is a place in
+    /// the queue, not a bigger share. It needs no privilege, which is the
+    /// point -- the priority raise next to it often cannot be had.
+    #[serde(default)]
+    pub worker_slice_us: Option<u64>,
 }
 
 /// Long enough to cover the gap between submissions from a guest running a
@@ -547,6 +560,34 @@ impl MachineConfig {
         Ok(())
     }
 
+    /// Where the GPU worker goes.
+    ///
+    /// The guest's CPUs that no vCPU is pinned to, with the I/O set. A pinned
+    /// vCPU cannot step aside, so a worker that shares its CPU waits behind it,
+    /// and a worker confined to the I/O set alone shares it with everything
+    /// else that serves the guest and with the host's own tasks. The CPUs left
+    /// when the pins are taken out -- the idle threads of cores a vCPU has to
+    /// itself -- are the ones nothing else is promised, and the worker may move
+    /// between them and the I/O set as the host's tasks come and go.
+    ///
+    /// Falls back to the I/O set when every CPU of the guest's is pinned.
+    pub fn worker_cpus(&self) -> Vec<usize> {
+        let mut cpus: Vec<usize> = self
+            .io_cpus()
+            .iter()
+            .chain(&self.cpu_affinity)
+            .copied()
+            .filter(|cpu| !self.vcpu_pins.contains(cpu))
+            .collect();
+        cpus.sort_unstable();
+        cpus.dedup();
+        if cpus.is_empty() {
+            self.io_cpus().to_vec()
+        } else {
+            cpus
+        }
+    }
+
     /// Where the threads that are not vCPUs go.
     pub fn io_cpus(&self) -> &[usize] {
         if self.io_affinity.is_empty() {
@@ -685,6 +726,33 @@ mod machine_config_tests {
         with(1025, HugePages::Transparent)
             .validate()
             .expect("transparent pages impose nothing");
+    }
+
+    /// Pins are taken out of the worker's set, and what is left is the guest's
+    /// unpinned CPUs together with the I/O set.
+    #[test]
+    fn the_worker_may_use_the_cpus_no_vcpu_is_pinned_to() {
+        let mc = MachineConfig {
+            cpu_affinity: vec![1, 2, 3, 4, 17, 18, 19, 20],
+            vcpu_pins: vec![1, 2, 3, 4],
+            io_affinity: vec![0, 16],
+            ..Default::default()
+        };
+        assert_eq!(mc.worker_cpus(), vec![0, 16, 17, 18, 19, 20]);
+    }
+
+    /// Every CPU of the guest's pinned, and no I/O set: the worker still has
+    /// somewhere to run, which is the set the vCPUs came from, not nothing.
+    #[test]
+    fn a_fully_pinned_guest_leaves_the_worker_its_io_set() {
+        let mc = MachineConfig {
+            cpu_affinity: vec![1, 2],
+            vcpu_pins: vec![1, 2],
+            ..Default::default()
+        };
+        assert_eq!(mc.worker_cpus(), vec![1, 2]);
+        let none = MachineConfig::default();
+        assert!(none.worker_cpus().is_empty(), "no placement stays no placement");
     }
 
     #[test]

@@ -60,6 +60,83 @@ pub fn current_nice() -> Option<i32> {
     }
 }
 
+/// The kernel's `struct sched_attr`, as of the version that carries the
+/// utilisation clamps. The syscall takes the size, so older kernels accept it.
+#[repr(C)]
+#[derive(Default)]
+struct SchedAttr {
+    size: u32,
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+    util_min: u32,
+    util_max: u32,
+}
+
+/// Ask the scheduler for a shorter slice, in microseconds, for the calling
+/// thread. Needs no privilege, and takes no CPU share from anyone.
+///
+/// A fair-class thread's slice sets how soon after waking it is picked: the
+/// deadline it is queued with is its slice past its eligible time, so a short
+/// one is chosen ahead of threads holding the usual one. That is the part of
+/// "run first" a thread can ask for without outranking anything -- the GPU
+/// worker wakes tens of thousands of times a second and wants the CPU the
+/// moment it does, not a share of it. Kernels that do not read the field
+/// ignore it and the call still succeeds, so [`current_slice_us`] is how to
+/// tell whether it took.
+pub fn request_slice(role: &str, slice_us: u64) {
+    // `sched_setattr` replaces the whole attribute set, nice value included,
+    // so start from what the thread has and change only the slice. Read with
+    // `sched_getattr` rather than `getpriority`, which the filter this process
+    // runs under does not allow.
+    let Some(mut attr) = read_attr() else {
+        log::debug!("{role}: could not read its scheduling attributes");
+        return;
+    };
+    attr.runtime = slice_us * 1000;
+    // SAFETY: FFI call; pid 0 is the calling thread, and `attr` is a live
+    // `sched_attr` whose size field the kernel filled in.
+    let ret = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0) };
+    if ret == 0 {
+        log::debug!("{role}: asked for a {slice_us} us slice");
+    } else {
+        log::debug!(
+            "{role}: could not ask for a shorter slice: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+fn read_attr() -> Option<SchedAttr> {
+    let mut attr = SchedAttr::default();
+    // SAFETY: FFI call; pid 0 is the calling thread, and `attr` is writable
+    // for the size passed.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_sched_getattr,
+            0,
+            &mut attr as *mut SchedAttr,
+            std::mem::size_of::<SchedAttr>() as u32,
+            0,
+        )
+    };
+    (ret == 0).then_some(attr)
+}
+
+/// The slice the calling thread runs with, in microseconds: what it asked for,
+/// or the kernel's default if it has not. `None` where the kernel does not
+/// report one.
+pub fn current_slice_us() -> Option<u64> {
+    read_attr()
+        .map(|attr| attr.runtime)
+        .filter(|&runtime| runtime > 0)
+        .map(|runtime| runtime / 1000)
+}
+
 /// Make the calling thread a helper: it yields to the critical thread whenever
 /// they contend. Needs no privilege.
 pub fn lower_this_thread(role: &str) {
@@ -99,6 +176,22 @@ mod tests {
         assert_eq!(seen, Some(HELPER_NICE));
         // The thread that spawned it was not touched.
         assert!(current_nice().is_some_and(|n| n < HELPER_NICE));
+    }
+
+    /// A slice request is accepted without privilege and read back where the
+    /// kernel reports it; where it does not, the call still returns.
+    #[test]
+    fn a_slice_can_be_asked_for_without_privilege() {
+        let seen = std::thread::spawn(|| {
+            request_slice("test", 200);
+            current_slice_us()
+        })
+        .join()
+        .unwrap();
+        if let Some(us) = seen {
+            assert_eq!(us, 200);
+        }
+        assert_ne!(current_slice_us(), Some(200), "the spawning thread was not touched");
     }
 
     /// Without the capability a raise is refused and reported, never fatal.

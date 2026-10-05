@@ -43,7 +43,7 @@ both maintained against running VMMs:
 - **Firecracker's `resources/seccomp/x86_64-*.json`** for the VMM and vCPU halves,
   and for the shape of the installer.
 
-111 syscalls in the baseline. The list is broad because it must hold the union of
+118 syscalls in the baseline. The list is broad because it must hold the union of
 every thread's needs, and the GPU worker drags in most of Mesa. **The point is not
 that the list is short — it is what is absent from it.**
 

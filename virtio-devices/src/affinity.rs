@@ -14,6 +14,9 @@ use std::sync::OnceLock;
 
 static IO_CPUS: OnceLock<Vec<usize>> = OnceLock::new();
 
+/// The affinity the process started with, before anything here changed it.
+static ORIGIN: OnceLock<libc::cpu_set_t> = OnceLock::new();
+
 /// Descriptors on `cgroup.threads` of the vCPU cgroup and of the I/O one,
 /// when the pinned CPUs are a cpuset partition that threads must join. See
 /// `MachineConfig::vcpu_cgroup_fd`.
@@ -34,6 +37,21 @@ pub fn set_cgroup_fds(fds: CgroupFds) {
 /// built; a second call is ignored. Empty means no affinity.
 pub fn set_io_cpus(cpus: &[usize]) {
     let _ = IO_CPUS.set(cpus.to_vec());
+}
+
+/// Record the affinity the process started with. Called once, before the
+/// process moves itself anywhere; a second call is ignored.
+pub fn set_origin(set: libc::cpu_set_t) {
+    let _ = ORIGIN.set(set);
+}
+
+/// The affinity the process started with, if [`set_origin`] recorded it.
+///
+/// What a long-lived worker returns to when it was given no set of its own:
+/// born on a vCPU thread it inherits that vCPU's pin, and "no set" has to mean
+/// the host's choice rather than one CPU of the guest's.
+pub fn origin() -> Option<&'static libc::cpu_set_t> {
+    ORIGIN.get()
 }
 
 /// The set recorded by [`set_io_cpus`], or empty.

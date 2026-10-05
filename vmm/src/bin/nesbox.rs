@@ -150,6 +150,9 @@ fn main() -> Result<()> {
     // were given no placement of their own, so an I/O set alone does not
     // quietly confine the guest to it too.
     let started_on = virtio_devices::affinity::current().ok();
+    if let Some(set) = started_on {
+        virtio_devices::affinity::set_origin(set);
+    }
     let io_cpus = config.machine_config.io_cpus().to_vec();
     virtio_devices::affinity::set_io_cpus(&io_cpus);
     if let (Some(vcpu), Some(io)) = (
@@ -346,7 +349,11 @@ fn main() -> Result<()> {
                 // command, and a handoff crossing dies costs on every one. It
                 // confines itself explicitly because it is spawned on
                 // activation, from a vCPU thread whose pin it would inherit.
-                cpu_affinity: io_cpus.clone(),
+                cpu_affinity: gpu_cfg
+                    .worker_cpus
+                    .clone()
+                    .unwrap_or_else(|| config.machine_config.worker_cpus()),
+                worker_slice_us: gpu_cfg.worker_slice_us.unwrap_or(100),
             },
             vm.mem.clone(),
         )?);

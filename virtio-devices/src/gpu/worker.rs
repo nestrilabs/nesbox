@@ -55,6 +55,8 @@ pub struct Worker {
     poll_us: u64,
     /// Host CPUs this thread may run on. Empty means no affinity.
     cpu_affinity: Vec<usize>,
+    /// Slice to ask the scheduler for, in microseconds. Zero asks for nothing.
+    slice_us: u64,
     mem: GuestMemoryMmap,
     /// The control queue, shared with the fence handler inside VirtioGpu.
     queues: Arc<dyn GpuQueues>,
@@ -77,6 +79,7 @@ impl Worker {
         stop: Arc<AtomicBool>,
         poll_us: u64,
         cpu_affinity: Vec<usize>,
+        slice_us: u64,
         mem: GuestMemoryMmap,
         queues: Arc<dyn GpuQueues>,
         shm_region: VirtioShmRegion,
@@ -94,6 +97,7 @@ impl Worker {
             stop,
             poll_us,
             cpu_affinity,
+            slice_us,
             mem,
             queues,
             shm_region,
@@ -135,6 +139,9 @@ impl Worker {
         // the renderer starts from here, its fence thread among them.
         self.confine();
         crate::sched::raise_this_thread("virtio-gpu worker");
+        if self.slice_us > 0 {
+            crate::sched::request_slice("virtio-gpu worker", self.slice_us);
+        }
 
         let start = std::time::Instant::now();
         let Some(mut virtio_gpu) = VirtioGpu::new(
@@ -183,45 +190,38 @@ impl Worker {
         }
     }
 
-    /// Confine this thread to the CPUs it was given, which is the I/O set.
+    /// Confine this thread to the CPUs it was given.
     ///
     /// A warning rather than a failure, for the same reason the vCPU threads
     /// treat it that way: placement is an optimisation, and a box that runs on
     /// the wrong cores is better than one that does not start. A set naming
     /// CPUs this host does not have is the usual cause and is worth seeing.
+    ///
+    /// Given no set, the thread goes back to where the process started rather
+    /// than keeping what it was born with: it is spawned on activation, from a
+    /// vCPU thread, and a vCPU with its own pin would otherwise hand that pin
+    /// to the thread serving it.
     fn confine(&self) {
-        // First, and whatever the set: this thread is spawned on activation,
-        // from a vCPU thread, so under a cpuset partition it is born inside
-        // it, and the affinity below would be refused.
+        // First, and whatever the set: under a cpuset partition this thread is
+        // born inside it, and the affinity below would be refused.
         crate::affinity::leave_vcpu_cgroup("virtio-gpu");
-        if self.cpu_affinity.is_empty() {
-            return;
-        }
-        // SAFETY: all-zeros is a valid cpu_set_t; CPU_ZERO makes it explicit.
-        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        unsafe { libc::CPU_ZERO(&mut set) };
-        let mut named = 0usize;
-        for &cpu in &self.cpu_affinity {
-            if cpu < libc::CPU_SETSIZE as usize {
-                // SAFETY: FFI call, index bounds checked above.
-                unsafe { libc::CPU_SET(cpu, &mut set) };
-                named += 1;
+        let Some(set) = crate::affinity::cpu_set(&self.cpu_affinity) else {
+            if !self.cpu_affinity.is_empty() {
+                log::warn!("virtio-gpu: no CPU in the affinity set exists here; leaving it unset");
             }
-        }
-        if named == 0 {
-            log::warn!("virtio-gpu: no CPU in the affinity set exists here; leaving it unset");
+            if let Some(origin) = crate::affinity::origin()
+                && let Err(e) = crate::affinity::apply(origin)
+            {
+                log::warn!("virtio-gpu: could not leave the spawning thread's CPU: {e}");
+            }
             return;
-        }
-        // SAFETY: FFI call; pid 0 is the calling thread and the size matches.
-        let ret =
-            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
-        if ret != 0 {
-            log::warn!(
-                "virtio-gpu: could not set the worker's CPU affinity: {}",
-                std::io::Error::last_os_error()
-            );
-        } else {
-            log::info!("virtio-gpu: worker confined to {} CPU(s)", named);
+        };
+        match crate::affinity::apply(&set) {
+            Ok(()) => log::info!(
+                "virtio-gpu: worker confined to {} CPU(s)",
+                self.cpu_affinity.len()
+            ),
+            Err(e) => log::warn!("virtio-gpu: could not set the worker's CPU affinity: {e}"),
         }
     }
 

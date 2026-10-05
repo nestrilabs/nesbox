@@ -453,6 +453,8 @@ fn baseline() -> Vec<libc::c_long> {
         libc::SYS_sched_getaffinity,
         libc::SYS_sched_setaffinity,
         libc::SYS_sched_setscheduler,
+        libc::SYS_sched_setattr,
+        libc::SYS_sched_getattr,
         libc::SYS_setpriority,
         libc::SYS_kcmp,
         // prctl is needed for PR_SET_NAME on our own threads. Unconstrained for
