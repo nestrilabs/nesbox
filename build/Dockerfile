@@ -118,19 +118,24 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     install -Dm755 target/release/nesbox /artifacts/nesbox/usr/bin/nesbox && \
     find /artifacts/nesbox -type f -printf '/%P\n' > /artifacts/nesbox/.manifest
 
-# `--workspace` above also builds `tools/jailer`, and only `nesbox` is
-# installed on purpose. The jailer runs on the *host*, as root, before the
-# chroot exists — it is never inside the jail, so putting a copy of it there
-# would be a privileged binary sitting in a tree whose whole point is to
-# bound what a compromised device model can reach. Get it from the repo's own
-# `cargo build --release` (`make jailer` in this directory does that and
-# copies it to output/), not from this image.
+# `--workspace` above also builds `tools/jailer`, and it is not installed
+# beside nesbox. The jailer runs on the *host*, as root, before the chroot
+# exists — it is never inside the jail, so a copy in the tree would be a
+# privileged binary sitting where a compromised device model can reach it.
 #
-# This is also why nothing here needs Firecracker's static-musl jailer build:
-# its jailer copies one static binary into an otherwise-empty jail, so the
-# jail has no libc to link against. This jail is a full userspace with Mesa in
-# it, and the jailer that enters it links against the *host's* libc, which it
-# gets by being built on the host.
+# It ships in this image anyway, at /.host/jailer (the `jailer-build` stage
+# below), so a host gets the jail and the jailer that enters it as one pair.
+# The host agent moves /.host out of the tree when it unpacks it, before any
+# box is jailed there. Static (musl), because it runs on whatever distribution
+# the host is, outside the jail's userspace.
+
+FROM nesbox-src AS jailer-build
+RUN pacman -S --noconfirm --needed rust-musl && pacman -Scc --noconfirm
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    cargo build --release --target x86_64-unknown-linux-musl -p jailer && \
+    install -Dm755 target/x86_64-unknown-linux-musl/release/jailer /artifacts/jailer/.host/jailer && \
+    strip /artifacts/jailer/.host/jailer
 
 
 # ───────────────────────────────────────────────────────────
@@ -212,3 +217,6 @@ RUN while IFS= read -r f; do \
 RUN rm -rf /var/lib/pacman /var/cache/pacman \
         /usr/share/man /usr/share/doc /usr/share/locale \
         /usr/lib/cmake /usr/lib/pkgconfig /usr/share/pkgconfig /usr/include
+
+# Last, after everything that walks the tree: the host takes /.host back out.
+COPY --from=jailer-build /artifacts/jailer /
