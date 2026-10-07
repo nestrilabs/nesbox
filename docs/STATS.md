@@ -39,7 +39,7 @@ changing the meaning of one bumps it.
 | `gpu.vram_bytes` | Device memory held now, accounted at `GEM_NEW` |
 | `gpu.vram_peak_bytes` | High-water mark, which is what capacity planning wants |
 | `gpu.vram_limit_bytes` | The configured quota; `0` is unbounded |
-| `gpu.vram_refusals` | Allocations refused for exceeding it |
+| `gpu.vram_over_budget` | Allocations that took the guest past it. Not refused: the kernel places them in system memory |
 | `gpu.gtt_bytes` | GTT asked for. Counted, never enforced. Bounding host memory is the supervisor's cgroup to set — nesbox reports at startup whether one is in force, and warns when none is |
 | `gpu.window_bytes` | Bytes mapped into the host-visible window (BAR2) now |
 | `gpu.window_peak_bytes` | High-water mark |

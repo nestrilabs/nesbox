@@ -76,8 +76,9 @@ pub struct GpuCounters {
     pub vram_peak_bytes: AtomicU64,
     /// The configured quota, or 0 for unbounded.
     pub vram_limit_bytes: AtomicU64,
-    /// Allocations refused for exceeding the quota.
-    pub vram_refusals: AtomicU64,
+    /// Allocations that took the guest past its budget. Not refused: the
+    /// kernel places them in system memory.
+    pub vram_over_budget: AtomicU64,
     /// GTT asked for. Counted, never enforced. Whether host memory is bounded
     /// at all is the supervisor's cgroup to set; `vmm/src/isolation.rs` reports
     /// what is actually in force and warns when nothing is.
@@ -297,7 +298,7 @@ pub struct GpuSnapshot {
     pub vram_bytes: u64,
     pub vram_peak_bytes: u64,
     pub vram_limit_bytes: u64,
-    pub vram_refusals: u64,
+    pub vram_over_budget: u64,
     pub gtt_bytes: u64,
     pub window_bytes: u64,
     pub window_peak_bytes: u64,
@@ -377,7 +378,7 @@ impl GpuMetrics {
             vram_bytes: load(&c.vram_bytes),
             vram_peak_bytes: load(&c.vram_peak_bytes),
             vram_limit_bytes: load(&c.vram_limit_bytes),
-            vram_refusals: load(&c.vram_refusals),
+            vram_over_budget: load(&c.vram_over_budget),
             gtt_bytes: load(&c.gtt_bytes),
             window_bytes: load(&c.window_bytes),
             window_peak_bytes: load(&c.window_peak_bytes),

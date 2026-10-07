@@ -752,7 +752,10 @@ mod machine_config_tests {
         };
         assert_eq!(mc.worker_cpus(), vec![1, 2]);
         let none = MachineConfig::default();
-        assert!(none.worker_cpus().is_empty(), "no placement stays no placement");
+        assert!(
+            none.worker_cpus().is_empty(),
+            "no placement stays no placement"
+        );
     }
 
     #[test]

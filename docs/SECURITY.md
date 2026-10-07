@@ -152,13 +152,16 @@ Two bounds in this codebase are applied by something other than nesbox, and both
 used to be assumed rather than checked. A limit that silently does not apply is
 worse than no limit, because it is a limit you have stopped thinking about.
 
-**The VRAM budget is enforced inside virglrenderer**, by
-`patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`, which reads
-`NESTRI_VRAM_LIMIT_MIB`. Which renderer gets loaded is `LD_LIBRARY_PATH`'s
-decision, made outside this program. Point it at a stock virglrenderer and
-`vram-limit-mib` becomes a no-op: the config still names a number, the stats
-socket still reports `vram_limit_bytes`, and `vram_refusals` sits at zero because
-nothing is refusing anything.
+**The VRAM budget is held by the kernel and told to the guest by
+virglrenderer.** The agent runs each nesbox in a cgroup whose `dmem.max` and
+`dmem.min` are the budget; `patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`
+reads `NESTRI_VRAM_LIMIT_MIB` and tells the guest a card of that size. Without
+root the agent cannot make the cgroup, and the budget is only what the guest is
+told. Which renderer gets loaded is `LD_LIBRARY_PATH`'s decision, made outside
+this program. Point it at a stock virglrenderer and the guest is told the whole
+card: the config still names a number and the stats socket still reports
+`vram_limit_bytes`, but the guest sizes itself to the card and runs past its
+cgroup's limit into system memory.
 
 nesbox now finds the `libvirglrenderer` it actually mapped — from
 `/proc/self/maps`, not the link-time name, since a wrong `LD_LIBRARY_PATH` is the

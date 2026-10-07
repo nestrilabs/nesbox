@@ -1,22 +1,23 @@
-//! Does the virglrenderer we actually loaded enforce a per-guest VRAM budget?
+//! Does the virglrenderer we actually loaded tell the guest its VRAM budget?
 //!
-//! `vram-limit-mib` is not enforced by this process. It is enforced inside
-//! virglrenderer, by `patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`,
-//! which reads `NESTRI_VRAM_LIMIT_MIB` from the environment — the VMM sets the
-//! variable and counts allocations, but the refusal happens in the renderer,
-//! because that is the only place with a channel that can tell a guest it was
-//! refused (see `virtio-devices/src/gpu/vram.rs`).
+//! `vram-limit-mib` does two things, and neither happens in this process. The
+//! guest is *told* its budget inside virglrenderer, by
+//! `patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`, which reads
+//! `NESTRI_VRAM_LIMIT_MIB` and reports a card of that size that only this guest
+//! uses. The guest is *held* to it by the kernel, through the dmem cgroup the
+//! agent runs this process in. The VMM sets the variable and counts allocations
+//! (see `virtio-devices/src/gpu/vram.rs`).
 //!
 //! Which renderer gets loaded is decided by `LD_LIBRARY_PATH`, outside this
 //! program. Nothing used to check. Point the loader at a stock virglrenderer and
-//! the limit silently becomes a no-op: the config still names a number, the
-//! stats socket still reports `vram_limit_bytes`, `vram_refusals` sits at zero
-//! because nothing is refusing anything, and the first sign of trouble is one
-//! guest exhausting a card its neighbours were sharing.
+//! the limit silently becomes half of itself: the config still names a number,
+//! the stats socket still reports `vram_limit_bytes`, but the guest is told the
+//! whole card, sizes itself to it, and lands past its cgroup's limit in system
+//! memory -- running slowly for a reason nothing names.
 //!
 //! **A limit that silently does not apply is worse than no limit**, because it
 //! is a limit you have stopped thinking about. So when the config asks for one,
-//! nesbox now refuses to start unless it can see the enforcing renderer.
+//! nesbox now refuses to start unless it can see the patched renderer.
 //!
 //! # What the check actually proves, and what it does not
 //!
@@ -25,7 +26,7 @@
 //! build reads that variable, so only the patched build contains the name of it.
 //!
 //! That is evidence, not proof. It shows the loaded library was built from a
-//! source tree that knows the variable; it cannot show the enforcement path is
+//! source tree that knows the variable; it cannot show the reporting path is
 //! reached or correct. A marker *symbol* exported by the patch and resolved with
 //! `dlsym` would be a better signal and the patch should grow one — this works
 //! against the builds that exist today without rebuilding them.
@@ -131,16 +132,16 @@ fn decide(budget: Budget, vram_limit_mib: Option<u64>) -> anyhow::Result<()> {
     match (&budget, vram_limit_mib) {
         (Budget::Enforced(p), Some(mib)) => {
             log::info!(
-                "gpu: VRAM budget of {mib} MiB will be enforced by {}",
+                "gpu: a VRAM budget of {mib} MiB will be reported to the guest by {}",
                 p.display()
             );
         }
         (Budget::NotEnforced(p), Some(mib)) => {
             anyhow::bail!(
                 "config asks for a {mib} MiB VRAM limit, but the loaded renderer does not \
-                 enforce one.\n  loaded: {}\n\
-                 That limit would silently do nothing: the guest would be told the card's \
-                 full size and could take all of it.\n\
+                 report one.\n  loaded: {}\n\
+                 The guest would be told the card's full size, size itself to it, and run \
+                 past its limit into system memory.\n\
                  Either point LD_LIBRARY_PATH at a virglrenderer built with \
                  patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch, or remove \
                  vram-limit-mib from the config so the absence of a bound is deliberate.",
@@ -150,7 +151,7 @@ fn decide(budget: Budget, vram_limit_mib: Option<u64>) -> anyhow::Result<()> {
         (Budget::Unknown(why), Some(mib)) => {
             log::warn!(
                 "gpu: config asks for a {mib} MiB VRAM limit and whether the renderer \
-                 enforces it could not be determined ({why}). Treat the limit as unproven."
+                 reports it could not be determined ({why}). Treat the limit as unproven."
             );
         }
         (_, None) => {

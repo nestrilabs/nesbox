@@ -6,8 +6,8 @@
 // guest and the card bounds how much it may ask for, so one guest can exhaust a
 // card that other guests are sharing.
 //
-// This module counts those allocations and refuses the ones that would take a
-// guest past its limit.
+// This module counts those allocations, and how many of them took a guest past
+// its budget.
 //
 // # This module measures. It does not enforce.
 //
@@ -32,12 +32,18 @@
 // exists, and the first submit referencing it waits forever on a fence.
 // Measured — the guest hangs instead of failing.
 //
-// The renderer has the one channel that can carry the news: `shmem->async_error`,
-// which Mesa reads through `amdvgpu_cs_query_reset_state2` and reports as a lost
-// context. So enforcement lives in the renderer, in the `GEM_NEW` handler, where
-// a genuine `amdgpu_bo_alloc` failure is already handled — a guest over its
-// budget then fails exactly as a guest on a full card does, and no new failure
-// path is introduced into a driver we do not own. See
+// The renderer refused in `GEM_NEW` for a while, on the theory that
+// `shmem->async_error` would carry the news. It does not: Mesa reads it only
+// when asked for a reset status, so a refused guest kept a buffer the host
+// never made and every later submit touching it failed -- measured, a game past
+// its budget rendering garbage with thousands of failed submits.
+//
+// So nothing on this path refuses. The kernel holds the guest to its budget:
+// the agent runs this process in a cgroup whose `dmem.max` is the budget, and an
+// allocation past it lands in system memory, as it does on a card that is full,
+// with the allocation still succeeding. `dmem.min` keeps neighbours from pushing
+// the guest out of its share. The renderer's part is telling the guest a card
+// of the budget's size; see
 // `patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`.
 //
 // What is left here is worth keeping on its own: the VMM is the only place that
@@ -48,7 +54,7 @@
 // # What counts
 //
 // Only allocations that ask for `AMDGPU_GEM_DOMAIN_VRAM`. GTT buffers live in
-// host system memory, and double-counting them here would refuse guests for
+// host system memory, and counting them here would put guests over a budget for
 // memory they are not taking from the card. GTT totals are tracked for
 // observability and never enforced.
 //
@@ -202,8 +208,9 @@ struct Charge {
 /// log can distinguish the two very different things.
 #[derive(Debug)]
 pub enum Notice {
-    /// The guest asked for more VRAM than its limit leaves. The renderer refuses
-    /// it; this is the VMM's record that it happened, and to which guest.
+    /// The guest asked for more VRAM than its budget leaves. Nothing refuses
+    /// it: in the agent's dmem cgroup the kernel places it in system memory,
+    /// and this is the VMM's record that it happened, and to which guest.
     OverLimit {
         requested: u64,
         charged: u64,
@@ -222,8 +229,7 @@ impl std::fmt::Display for Notice {
                 limit,
             } => write!(
                 f,
-                "over VRAM limit (the renderer refuses it): requested {} MiB \
-                 with {} of {} MiB charged",
+                "past its VRAM budget: requested {} MiB with {} of {} MiB charged",
                 requested / (1 << 20),
                 charged / (1 << 20),
                 limit / (1 << 20)
@@ -257,7 +263,7 @@ pub struct VramAccountant {
     /// limit by asking for GTT instead.
     gtt_charged: u64,
     peak: u64,
-    refusals: u64,
+    over_budget: u64,
     /// Where these numbers go so something other than a log reader can see them.
     metrics: Arc<GpuMetrics>,
     /// Highest watermark already reported, so the log records a guest's rising
@@ -283,7 +289,7 @@ impl VramAccountant {
             drm_contexts: HashMap::new(),
             gtt_charged: 0,
             peak: 0,
-            refusals: 0,
+            over_budget: 0,
             reported_peak: 0,
         }
     }
@@ -338,18 +344,21 @@ impl VramAccountant {
     /// Account for a command stream on its way to the renderer.
     ///
     /// The submit is forwarded either way — see the note at the top of this file
-    /// on why a refusal here cannot reach the guest. An `Err` says what is worth
-    /// logging, not what to do.
+    /// on why nothing on this path refuses. An `Err` says what is worth logging,
+    /// not what to do; an allocation past the budget is still charged, because
+    /// it still exists.
     pub fn observe_submit(&mut self, ctx_id: u32, commands: &[u8]) -> Result<(), Notice> {
         if !self.drm_contexts.contains_key(&ctx_id) {
             return Ok(());
         }
 
-        // Charge only after the whole stream is known to be admissible, so a
-        // refusal leaves no partial accounting behind.
+        // Charge only after the whole stream is known to parse, so a malformed
+        // one leaves no partial accounting behind.
         let mut proposed: Vec<((u32, u64), u64)> = Vec::new();
         let mut proposed_gtt = 0u64;
         let mut tentative = self.charged;
+        let mut over = None;
+        let mut over_count = 0u64;
 
         let mut off = 0usize;
         while commands.len() - off >= CCMD_HDR_LEN {
@@ -376,15 +385,15 @@ impl VramAccountant {
                     .ok_or(Notice::Malformed("GEM_NEW preferred_heap"))?;
 
                 if heap & AMDGPU_GEM_DOMAIN_VRAM != 0 {
+                    let before = tentative;
                     tentative = tentative.saturating_add(size);
                     if tentative > self.limit {
-                        self.refusals += 1;
-                        self.publish();
-                        return Err(Notice::OverLimit {
+                        over.get_or_insert(Notice::OverLimit {
                             requested: size,
-                            charged: self.charged,
+                            charged: before,
                             limit: self.limit,
                         });
+                        over_count += 1;
                     }
                     proposed.push(((ctx_id, blob_id), size));
                 } else if heap & AMDGPU_GEM_DOMAIN_GTT != 0 {
@@ -410,6 +419,7 @@ impl VramAccountant {
             self.charged = self.charged.saturating_add(bytes);
         }
         self.gtt_charged = self.gtt_charged.saturating_add(proposed_gtt);
+        self.over_budget += over_count;
         self.peak = self.peak.max(self.charged);
         self.publish();
 
@@ -421,7 +431,7 @@ impl VramAccountant {
             log::info!("virtio-gpu: {}", self.summary());
         }
 
-        Ok(())
+        over.map_or(Ok(()), Err)
     }
 
     /// A blob create named a `blob_id`, so the charge for it now has a resource
@@ -446,17 +456,17 @@ impl VramAccountant {
         let c = &self.metrics.counters;
         GpuCounters::set(&c.vram_bytes, self.charged);
         GpuCounters::set(&c.vram_peak_bytes, self.peak);
-        GpuCounters::set(&c.vram_refusals, self.refusals);
+        GpuCounters::set(&c.vram_over_budget, self.over_budget);
         GpuCounters::set(&c.gtt_bytes, self.gtt_charged);
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "VRAM {}/{} MiB (peak {} MiB, {} refused), GTT {} MiB seen",
+            "VRAM {}/{} MiB (peak {} MiB, {} allocations past the budget), GTT {} MiB seen",
             self.charged / (1 << 20),
             self.limit / (1 << 20),
             self.peak / (1 << 20),
-            self.refusals,
+            self.over_budget,
             self.gtt_charged / (1 << 20),
         )
     }
@@ -520,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn charges_vram_and_refuses_past_the_limit() {
+    fn charges_vram_and_counts_what_goes_past_the_budget() {
         let mut a = drm_ctx(512);
         assert!(
             a.observe_submit(1, &gem_new(1, 256 * MIB, AMDGPU_GEM_DOMAIN_VRAM))
@@ -537,9 +547,10 @@ mod tests {
         // 456 + 100 > 512
         let err = a.observe_submit(1, &gem_new(3, 100 * MIB, AMDGPU_GEM_DOMAIN_VRAM));
         assert!(matches!(err, Err(Notice::OverLimit { .. })));
-        // A refusal charges nothing.
-        assert_eq!(a.charged, 456 * MIB);
-        assert_eq!(a.refusals, 1);
+        // Past the budget is still an allocation: the kernel placed it in
+        // system memory, and the guest will free it like any other.
+        assert_eq!(a.charged, 556 * MIB);
+        assert_eq!(a.over_budget, 1);
     }
 
     #[test]
@@ -555,15 +566,16 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_stream_charges_none_of_its_allocations() {
+    fn a_stream_past_the_budget_charges_all_of_its_allocations() {
         let mut a = drm_ctx(512);
         // Two allocations in one stream: the first fits, together they do not.
         let mut stream = gem_new(1, 400 * MIB, AMDGPU_GEM_DOMAIN_VRAM);
         stream.extend_from_slice(&gem_new(2, 400 * MIB, AMDGPU_GEM_DOMAIN_VRAM));
         assert!(a.observe_submit(1, &stream).is_err());
-        // Not 400 MiB. The submit is refused whole, so the renderer allocates
-        // neither buffer and we must have charged for neither.
-        assert_eq!(a.charged, 0);
+        // Both exist: nothing refused the second, the kernel placed it in
+        // system memory. Only the one that crossed the budget is counted past it.
+        assert_eq!(a.charged, 800 * MIB);
+        assert_eq!(a.over_budget, 1);
     }
 
     #[test]
@@ -717,16 +729,18 @@ mod tests {
             .unwrap();
         let err = a.observe_submit(1, &gem_new(2, u64::MAX, AMDGPU_GEM_DOMAIN_VRAM));
         assert!(matches!(err, Err(Notice::OverLimit { .. })));
-        assert_eq!(a.charged, 256 * MIB);
+        // Saturated, not wrapped round to something that looks under budget.
+        assert_eq!(a.charged, u64::MAX);
     }
 
     #[test]
-    fn a_zero_limit_refuses_all_vram() {
+    fn a_zero_limit_puts_all_vram_past_the_budget() {
         let mut a = drm_ctx(0);
         assert!(
             a.observe_submit(1, &gem_new(1, 4096, AMDGPU_GEM_DOMAIN_VRAM))
                 .is_err()
         );
+        assert_eq!(a.over_budget, 1);
     }
 
     /// Every record in a stream is counted, under its own opcode.

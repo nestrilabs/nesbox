@@ -47,9 +47,9 @@ if not g:
     print("no GPU device"); raise SystemExit
 o = g.get("occupancy")
 mib = lambda b: b / (1 << 20)
-line = "vram %5.0f/%-5.0f MiB  peak %5.0f  refused %d  submits %-8d fences %-8d" % (
+line = "vram %5.0f/%-5.0f MiB  peak %5.0f  over budget %d  submits %-8d fences %-8d" % (
     mib(g["vram_bytes"]), mib(g["vram_limit_bytes"]), mib(g["vram_peak_bytes"]),
-    g["vram_refusals"], g["submits"], g["fences"])
+    g["vram_over_budget"], g["submits"], g["fences"])
 if o is None:
     line += "  occupancy: none yet (no DRM client)"
 else:

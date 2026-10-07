@@ -112,7 +112,7 @@ fn gpu_json(s: &GpuSnapshot) -> String {
     format!(
         "{{\"submits\":{},\"submits_failed\":{},\"fences\":{},\
          \"vram_bytes\":{},\"vram_peak_bytes\":{},\"vram_limit_bytes\":{},\
-         \"vram_refusals\":{},\"gtt_bytes\":{},\
+         \"vram_over_budget\":{},\"gtt_bytes\":{},\
          \"window_bytes\":{},\"window_peak_bytes\":{},\"window_limit_bytes\":{},\
          \"window_mappings\":{},\"window_refusals\":{},\"drained\":{},\
          \"spin\":{spin},\"sleep\":{sleep},\"budget_wait\":{budget_wait},\"gpu_time_percent\":{gpu_time_percent},\"drain\":{drain},\
@@ -134,7 +134,7 @@ fn gpu_json(s: &GpuSnapshot) -> String {
         s.vram_bytes,
         s.vram_peak_bytes,
         s.vram_limit_bytes,
-        s.vram_refusals,
+        s.vram_over_budget,
         s.gtt_bytes,
         s.window_bytes,
         s.window_peak_bytes,
@@ -261,7 +261,7 @@ mod tests {
             vram_bytes: 4,
             vram_peak_bytes: 5,
             vram_limit_bytes: 6,
-            vram_refusals: 7,
+            vram_over_budget: 7,
             gtt_bytes: 8,
             window_bytes: 20,
             window_peak_bytes: 21,

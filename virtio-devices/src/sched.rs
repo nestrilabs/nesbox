@@ -191,7 +191,11 @@ mod tests {
         if let Some(us) = seen {
             assert_eq!(us, 200);
         }
-        assert_ne!(current_slice_us(), Some(200), "the spawning thread was not touched");
+        assert_ne!(
+            current_slice_us(),
+            Some(200),
+            "the spawning thread was not touched"
+        );
     }
 
     /// Without the capability a raise is refused and reported, never fatal.
