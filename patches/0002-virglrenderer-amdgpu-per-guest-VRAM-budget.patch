@@ -23,9 +23,9 @@ The usage is tallied per process, not per context: one VMM process serves one
 guest, and a guest opens several contexts (its game, compositor and encoder).
 
 **This patch does not enforce the budget.** That is the kernel's job: the VMM
-runs each guest in a cgroup whose dmem.max is its budget, so an allocation past
-it lands in system memory as it does on a card that is full, and whose dmem.min
-keeps neighbours from pushing it out. An earlier version of this patch refused
+runs each guest in a cgroup whose dmem.min is its budget, which keeps neighbours
+from pushing it out; past it the guest borrows VRAM nobody is using, and the
+kernel evicts what it borrowed when a neighbour needs its own share. An earlier version of this patch refused
 GEM_NEW past the budget instead, and that is wrong in a way worth recording: the
 guest kernel's RESOURCE_CREATE_BLOB ioctl carries the GEM_NEW but does not wait
 for it, so Mesa never learns of the refusal, keeps a buffer the host never made,
@@ -33,7 +33,7 @@ and every later submit touching it fails. Measured -- a Unity title past its
 budget rendered garbage, with thousands of failed submits.
 
 diff --git a/src/drm/amdgpu/amdgpu_renderer.c b/src/drm/amdgpu/amdgpu_renderer.c
-index 8f05f1a..4bfcb3b 100644
+index 8f05f1a..0ab2eae 100644
 --- a/src/drm/amdgpu/amdgpu_renderer.c
 +++ b/src/drm/amdgpu/amdgpu_renderer.c
 @@ -136,9 +136,85 @@ struct amdgpu_object {
@@ -54,10 +54,10 @@ index 8f05f1a..4bfcb3b 100644
 + * the usage queries RADV builds VK_EXT_memory_budget from, all describe a card
 + * of the budget's size that only this guest is using.
 + *
-+ * Holding a guest to the budget is the kernel's job, not this file's: the VMM
-+ * puts each guest in a cgroup whose dmem.max is the budget, so an allocation
-+ * past it lands in system memory the way it does on a card that is full, and
-+ * whose dmem.min protects it from its neighbours. Refusing allocations here was
++ * Looking after the budget is the kernel's job, not this file's: the VMM puts
++ * each guest in a cgroup whose dmem.min is the budget, which protects it from
++ * its neighbours; past it the guest borrows VRAM nobody is using, and gives it
++ * back to system memory when a neighbour needs its own. Refusing allocations here was
 + * tried and is wrong: the guest kernel does not wait for GEM_NEW, so a refusal
 + * never reaches Mesa, which uses a buffer the host never made, and every submit
 + * touching it fails.

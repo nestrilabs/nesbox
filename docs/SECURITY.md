@@ -152,9 +152,9 @@ Two bounds in this codebase are applied by something other than nesbox, and both
 used to be assumed rather than checked. A limit that silently does not apply is
 worse than no limit, because it is a limit you have stopped thinking about.
 
-**The VRAM budget is held by the kernel and told to the guest by
-virglrenderer.** The agent runs each nesbox in a cgroup whose `dmem.max` and
-`dmem.min` are the budget; `patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`
+**The VRAM budget is protected by the kernel and told to the guest by
+virglrenderer.** The agent runs each nesbox in a cgroup whose `dmem.min` is the
+budget, and a guest past it borrows only what nobody else is using; `patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`
 reads `NESTRI_VRAM_LIMIT_MIB` and tells the guest a card of that size. Without
 root the agent cannot make the cgroup, and the budget is only what the guest is
 told. Which renderer gets loaded is `LD_LIBRARY_PATH`'s decision, made outside

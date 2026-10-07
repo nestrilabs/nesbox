@@ -38,11 +38,11 @@
 // never made and every later submit touching it failed -- measured, a game past
 // its budget rendering garbage with thousands of failed submits.
 //
-// So nothing on this path refuses. The kernel holds the guest to its budget:
-// the agent runs this process in a cgroup whose `dmem.max` is the budget, and an
-// allocation past it lands in system memory, as it does on a card that is full,
-// with the allocation still succeeding. `dmem.min` keeps neighbours from pushing
-// the guest out of its share. The renderer's part is telling the guest a card
+// So nothing on this path refuses. The kernel looks after the budget: the agent
+// runs this process in a cgroup whose `dmem.min` is the budget, which keeps
+// neighbours from pushing the guest out of it. Past it the guest borrows VRAM
+// nobody is using, and the kernel evicts what it borrowed to system memory when
+// a neighbour needs its own share -- with every allocation still succeeding. The renderer's part is telling the guest a card
 // of the budget's size; see
 // `patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`.
 //
