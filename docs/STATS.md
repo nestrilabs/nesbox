@@ -47,6 +47,9 @@ changing the meaning of one bumps it.
 | `gpu.window_mappings` | Live mappings. **Each is a KVM memory slot**, so this is the number that matters for slot pressure rather than the byte total |
 | `gpu.window_refusals` | Mappings refused, for bytes or for count |
 | `gpu.occupancy.gfx_ns` | Nanoseconds the graphics engine has spent on this client, from the kernel's own per-client accounting |
+| `gpu.occupancy.compute_ns` | The same for the compute engine. The GPU limit charges both |
+| `gpu.shader_clock_mhz` | The card's shader clock now; 0 for a card that reports none |
+| `gpu.reference_clock_mhz` | The clock the GPU limit charges against: the last level of `pp_dpm_sclk`, which amdgpu sets to the clock the firmware guarantees every card of the SKU. Engine time counts as `time x shader_clock / reference_clock` of work |
 | `gpu.occupancy.resident_vram_bytes` | What is actually in VRAM. Below `requested` means amdgpu has migrated buffers to GTT |
 | `gpu.occupancy.evicted_vram_bytes` | **Non-zero means this box's quota is above what the card will really give it**, and it is paying the difference in bus traffic |
 

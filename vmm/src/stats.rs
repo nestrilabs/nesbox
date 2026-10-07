@@ -103,9 +103,13 @@ fn kinds_json(kinds: &CommandKindCounts) -> String {
 fn gpu_json(s: &GpuSnapshot) -> String {
     let occupancy = match s.occupancy {
         Some(o) => format!(
-            "{{\"gfx_ns\":{},\"requested_vram_bytes\":{},\
+            "{{\"gfx_ns\":{},\"compute_ns\":{},\"requested_vram_bytes\":{},\
              \"resident_vram_bytes\":{},\"evicted_vram_bytes\":{}}}",
-            o.gfx_ns, o.requested_vram_bytes, o.resident_vram_bytes, o.evicted_vram_bytes
+            o.gfx_ns,
+            o.compute_ns,
+            o.requested_vram_bytes,
+            o.resident_vram_bytes,
+            o.evicted_vram_bytes
         ),
         None => "null".into(),
     };
@@ -115,7 +119,7 @@ fn gpu_json(s: &GpuSnapshot) -> String {
          \"vram_over_budget\":{},\"gtt_bytes\":{},\
          \"window_bytes\":{},\"window_peak_bytes\":{},\"window_limit_bytes\":{},\
          \"window_mappings\":{},\"window_refusals\":{},\"drained\":{},\
-         \"spin\":{spin},\"sleep\":{sleep},\"budget_wait\":{budget_wait},\"gpu_time_percent\":{gpu_time_percent},\"drain\":{drain},\
+         \"spin\":{spin},\"sleep\":{sleep},\"budget_wait\":{budget_wait},\"gpu_time_percent\":{gpu_time_percent},\"shader_clock_mhz\":{shader_clock_mhz},\"reference_clock_mhz\":{reference_clock_mhz},\"drain\":{drain},\
          \"command\":{command},\"submit\":{submit},\"observe\":{observe},\
          \"fence_create\":{fence_create},\"fence_latency\":{fence_latency},\
          \"complete\":{complete},\
@@ -160,6 +164,8 @@ fn gpu_json(s: &GpuSnapshot) -> String {
         sleep = phase_json(&s.sleep),
         budget_wait = phase_json(&s.budget_wait),
         gpu_time_percent = s.gpu_time_percent,
+        shader_clock_mhz = s.shader_clock_mhz,
+        reference_clock_mhz = s.reference_clock_mhz,
         drain = phase_json(&s.drain),
         command = phase_json(&s.command),
         submit = phase_json(&s.submit),
@@ -273,6 +279,8 @@ mod tests {
             sleep: PhaseSnapshot { ns: 32, count: 33 },
             budget_wait: PhaseSnapshot { ns: 0, count: 0 },
             gpu_time_percent: 100,
+            shader_clock_mhz: 3300,
+            reference_clock_mhz: 2620,
             drain: PhaseSnapshot { ns: 34, count: 35 },
             command: PhaseSnapshot { ns: 36, count: 37 },
             submit: PhaseSnapshot { ns: 38, count: 39 },
@@ -312,6 +320,7 @@ mod tests {
             place_refused: 71,
             occupancy: Some(virtio_devices::Occupancy {
                 gfx_ns: 9,
+                compute_ns: 13,
                 requested_vram_bytes: 10,
                 resident_vram_bytes: 11,
                 evicted_vram_bytes: 12,
@@ -320,6 +329,8 @@ mod tests {
         let body = format!("{{\"schema\":1,\"uptime_ms\":1,\"gpu\":{}}}", gpu_json(&s));
         let v: serde_json::Value = serde_json::from_str(&body).expect("must be valid JSON");
         assert_eq!(v["gpu"]["occupancy"]["gfx_ns"], 9);
+        assert_eq!(v["gpu"]["occupancy"]["compute_ns"], 13);
+        assert_eq!(v["gpu"]["reference_clock_mhz"], 2620);
         // Every phase carries both halves. A phase that lost its count would
         // still be valid JSON and would silently stop being a mean.
         for phase in [

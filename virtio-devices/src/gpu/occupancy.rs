@@ -31,6 +31,9 @@ pub struct Occupancy {
     /// Nanoseconds the graphics engine has spent on this client, monotonic since
     /// the client opened. A rate is two samples and the wall time between them.
     pub gfx_ns: u64,
+    /// The compute engine's counterpart. A guest's async compute -- and the
+    /// capture layer's own conversion passes -- run here, not on `gfx_ns`.
+    pub compute_ns: u64,
     /// What the client has asked the card for.
     pub requested_vram_bytes: u64,
     /// What is actually in VRAM now. Lower than requested means amdgpu has
@@ -96,6 +99,9 @@ impl OccupancyReader {
                     o.gfx_ns = value.split_whitespace().next()?.parse().ok()?;
                     is_drm_client = true;
                 }
+                "drm-engine-compute" => {
+                    o.compute_ns = value.split_whitespace().next()?.parse().ok()?;
+                }
                 "amd-requested-vram" => o.requested_vram_bytes = parse_kib(value)?,
                 "drm-resident-vram" => o.resident_vram_bytes = parse_kib(value)?,
                 "amd-evicted-vram" => o.evicted_vram_bytes = parse_kib(value)?,
@@ -148,6 +154,7 @@ drm-driver:\tamdgpu
 drm-client-id:\t42
 drm-pdev:\t0000:04:00.0
 drm-engine-gfx:\t48123456789 ns
+drm-engine-compute:\t1234567 ns
 drm-memory-vram:\t37584 KiB
 amd-requested-vram:\t37584 KiB
 drm-resident-vram:\t37584 KiB
@@ -159,6 +166,7 @@ amd-evicted-vram:\t0 KiB
         let p = write_tmp("nesbox-fdinfo-real", REAL);
         let o = OccupancyReader::parse(&p).expect("should recognise a DRM client");
         assert_eq!(o.gfx_ns, 48_123_456_789);
+        assert_eq!(o.compute_ns, 1_234_567);
         assert_eq!(o.requested_vram_bytes, 37584 * 1024);
         assert_eq!(o.resident_vram_bytes, 37584 * 1024);
         assert_eq!(o.evicted_vram_bytes, 0);

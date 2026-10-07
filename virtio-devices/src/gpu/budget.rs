@@ -9,15 +9,23 @@
 // above this line -- its driver, its frame limiter, its settings -- can undo
 // it, and nothing about it depends on what the workload is.
 //
-// It limits **engine time**, taken from the kernel's own per-client counter,
-// not submissions or fences. A fence measures how long a job took to come back,
-// which includes time queued behind other clients; engine time is what this
-// guest actually used. See `occupancy.rs`.
+// It limits **work**: engine time, taken from the kernel's own per-client
+// counters for the graphics and compute engines, scaled by the shader clock it
+// ran at against the clock the card promises. Not submissions or fences: a
+// fence measures how long a job took to come back, which includes time queued
+// behind other clients; engine time is what this guest actually used. See
+// `occupancy.rs`.
+//
+// Scaled, because time alone is not a share of the card. A quarter of the
+// engine's time on a card the limit itself has let drop to a low clock is far
+// less than a quarter of the card, and the card drops its clock exactly
+// because limited guests leave it idle. See `clock.rs`.
 //
 // # How
 //
-// A token bucket in nanoseconds of engine time. It fills at `percent` of wall
-// time and drains by what the engine reports the guest used. A submission is
+// A token bucket in nanoseconds of engine time at the reference clock. It fills
+// at `percent` of wall time and drains by what the engine reports the guest
+// used, times the clock it is running at over the reference. A submission is
 // let through while the bucket is not empty; otherwise the worker sleeps for
 // as long as the debt takes to repay at the fill rate, then looks again. The
 // bucket is capped, so a guest that was idle cannot bank a long burst.
@@ -57,8 +65,9 @@ const MIN_SLEEP: Duration = Duration::from_micros(100);
 struct Pace {
     /// When the accounting was last read.
     at: Instant,
-    /// The engine-time counter at that read, once there is one.
-    gfx_ns: Option<u64>,
+    /// The engine-time counters (graphics and compute) at that read, once there
+    /// is one.
+    engine_ns: Option<u64>,
     /// Engine time the guest may still spend. Negative is debt.
     bank_ns: f64,
 }
@@ -74,7 +83,7 @@ impl GpuBudget {
             percent: AtomicU32::new(UNLIMITED),
             pace: Mutex::new(Pace {
                 at: Instant::now(),
-                gfx_ns: None,
+                engine_ns: None,
                 bank_ns: BURST_NS,
             }),
         };
@@ -98,7 +107,15 @@ impl GpuBudget {
     ///
     /// `read` gives the engine's accounting for this guest; `None` means there
     /// is no DRM client yet, and a guest with no client has used nothing.
-    pub fn pace(&self, read: impl Fn() -> Option<Occupancy>, stop: &AtomicBool) -> Duration {
+    /// `work_per_ns` is how much work a nanosecond of engine time is right now,
+    /// as engine time at the reference clock: 1.0 for a card that reports no
+    /// clock, which is then charged plain time.
+    pub fn pace(
+        &self,
+        read: impl Fn() -> Option<Occupancy>,
+        work_per_ns: impl Fn() -> f64,
+        stop: &AtomicBool,
+    ) -> Duration {
         let mut waited = Duration::ZERO;
         loop {
             let percent = self.percent.load(Ordering::Relaxed);
@@ -115,17 +132,18 @@ impl GpuBudget {
                 } else {
                     SAMPLE_OK
                 };
-                if st.gfx_ns.is_none() || now.duration_since(st.at) >= due {
+                if st.engine_ns.is_none() || now.duration_since(st.at) >= due {
                     let Some(sample) = read() else {
                         return waited;
                     };
-                    if let Some(prev) = st.gfx_ns {
+                    let engine_ns = sample.gfx_ns.saturating_add(sample.compute_ns);
+                    if let Some(prev) = st.engine_ns {
                         let wall = now.duration_since(st.at).as_nanos() as f64;
-                        let used = sample.gfx_ns.saturating_sub(prev) as f64;
+                        let used = engine_ns.saturating_sub(prev) as f64 * work_per_ns();
                         st.bank_ns =
                             (st.bank_ns + rate * wall - used).clamp(-MAX_DEBT_NS, BURST_NS);
                     }
-                    st.gfx_ns = Some(sample.gfx_ns);
+                    st.engine_ns = Some(engine_ns);
                     st.at = now;
                 }
                 if st.bank_ns >= 0.0 {
@@ -164,6 +182,7 @@ mod tests {
                 reads.fetch_add(1, Ordering::Relaxed);
                 sample(0)
             },
+            || 1.0,
             &AtomicBool::new(false),
         );
         assert_eq!(waited, Duration::ZERO);
@@ -173,7 +192,10 @@ mod tests {
     #[test]
     fn no_drm_client_yet_is_not_a_reason_to_wait() {
         let b = GpuBudget::new(Some(10));
-        assert_eq!(b.pace(|| None, &AtomicBool::new(false)), Duration::ZERO);
+        assert_eq!(
+            b.pace(|| None, || 1.0, &AtomicBool::new(false)),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -181,15 +203,50 @@ mod tests {
         let b = GpuBudget::new(Some(10));
         let stop = AtomicBool::new(false);
         // First look establishes the baseline and lets the call through.
-        b.pace(|| sample(0), &stop);
+        b.pace(|| sample(0), || 1.0, &stop);
         // The engine reports 50 ms spent over the next few milliseconds of wall
         // time, far above 10% of it: the guest has to wait.
         std::thread::sleep(Duration::from_millis(2));
-        let waited = b.pace(|| sample(50_000_000), &stop);
+        let waited = b.pace(|| sample(50_000_000), || 1.0, &stop);
         assert!(
             waited > Duration::ZERO,
             "an overdrawn guest was let straight through"
         );
+    }
+
+    /// The same engine time on a card at half the reference clock is half the
+    /// work, and does not hold the guest back where full-clock time would.
+    #[test]
+    fn engine_time_on_a_slow_clock_is_charged_as_less_work() {
+        // 10% of ~10 ms of wall time, plus the 4 ms an idle guest may burst:
+        // 7 ms of full-clock engine time is past that, 3.5 ms of work is not.
+        let run = |work_per_ns: f64| {
+            let b = GpuBudget::new(Some(10));
+            let stop = AtomicBool::new(false);
+            b.pace(|| sample(0), || work_per_ns, &stop);
+            std::thread::sleep(Duration::from_millis(10));
+            b.pace(|| sample(7_000_000), || work_per_ns, &stop)
+        };
+        assert!(run(1.0) > Duration::ZERO, "full-clock time past the share");
+        assert_eq!(
+            run(0.5),
+            Duration::ZERO,
+            "the same time at half clock is half the work"
+        );
+    }
+
+    /// Compute-engine time is the guest's as much as graphics time is.
+    #[test]
+    fn compute_engine_time_is_charged_too() {
+        let b = GpuBudget::new(Some(10));
+        let stop = AtomicBool::new(false);
+        b.pace(|| sample(0), || 1.0, &stop);
+        std::thread::sleep(Duration::from_millis(2));
+        let compute_only = Some(Occupancy {
+            compute_ns: 50_000_000,
+            ..Default::default()
+        });
+        assert!(b.pace(|| compute_only, || 1.0, &stop) > Duration::ZERO);
     }
 
     #[test]

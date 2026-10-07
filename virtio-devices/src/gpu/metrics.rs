@@ -311,6 +311,10 @@ pub struct GpuSnapshot {
     /// The GPU time limit in force, as a percentage of the graphics engine; 100
     /// is no limit.
     pub gpu_time_percent: u32,
+    /// The card's shader clock now, and the clock GPU time is charged against;
+    /// both 0 for a card that reports none.
+    pub shader_clock_mhz: u64,
+    pub reference_clock_mhz: u64,
     pub drain: PhaseSnapshot,
     pub drained: u64,
     pub command: PhaseSnapshot,
@@ -346,6 +350,9 @@ pub struct GpuMetrics {
     /// The guest's GPU time limit. Held here because this is what the worker,
     /// the device and the stats thread all already share.
     pub budget: super::budget::GpuBudget,
+    /// The card's shader clock, which turns the limit's engine time into work.
+    /// `None` for a card that reports none: its guests are charged plain time.
+    clock: Option<super::clock::ShaderClock>,
 }
 
 impl GpuMetrics {
@@ -354,7 +361,11 @@ impl GpuMetrics {
         if self.budget.percent() >= super::budget::UNLIMITED {
             return;
         }
-        let waited = self.budget.pace(|| self.occupancy.read(), stop);
+        let waited = self.budget.pace(
+            || self.occupancy.read(),
+            || self.clock.as_ref().map_or(1.0, |c| c.work_per_ns()),
+            stop,
+        );
         if !waited.is_zero() {
             self.counters.budget_wait.add(waited.as_nanos() as u64);
         }
@@ -365,6 +376,28 @@ impl GpuMetrics {
             counters: GpuCounters::default(),
             occupancy: OccupancyReader::new(),
             budget: super::budget::GpuBudget::new(None),
+            clock: None,
+        }
+    }
+
+    /// Metrics for a guest on the card behind `render_node`, whose GPU time is
+    /// charged at that card's clock.
+    pub fn for_render_node(render_node: &std::path::Path) -> Self {
+        let clock = super::clock::ShaderClock::for_render_node(render_node);
+        match &clock {
+            Some(c) => log::info!(
+                "virtio-gpu: GPU time is charged as work against a {} MHz shader clock",
+                c.reference_hz() / 1_000_000
+            ),
+            None => log::warn!(
+                "virtio-gpu: {} reports no shader clock, so GPU time limits are shares of \
+                 engine time at whatever clock the card picks",
+                render_node.display()
+            ),
+        }
+        Self {
+            clock,
+            ..Self::new()
         }
     }
 
@@ -389,6 +422,14 @@ impl GpuMetrics {
             sleep: c.sleep.read(),
             budget_wait: c.budget_wait.read(),
             gpu_time_percent: self.budget.percent(),
+            shader_clock_mhz: self
+                .clock
+                .as_ref()
+                .map_or(0, |c| c.current_hz() / 1_000_000),
+            reference_clock_mhz: self
+                .clock
+                .as_ref()
+                .map_or(0, |c| c.reference_hz() / 1_000_000),
             drain: c.drain.read(),
             drained: load(&c.drained),
             command: c.command.read(),

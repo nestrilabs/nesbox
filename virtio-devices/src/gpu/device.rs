@@ -308,7 +308,7 @@ impl GpuDevice {
             "GPU render node {:?} does not exist",
             config.render_node
         );
-        let metrics = Arc::new(GpuMetrics::new());
+        let metrics = Arc::new(GpuMetrics::for_render_node(&config.render_node));
         metrics.budget.set(config.gpu_time_percent);
         let displays: Box<[DisplayInfo]> = config.displays.clone().into_boxed_slice();
 
