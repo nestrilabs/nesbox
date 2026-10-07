@@ -130,7 +130,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # the host is, outside the jail's userspace.
 
 FROM nesbox-src AS jailer-build
-RUN pacman -S --noconfirm --needed rust-musl && pacman -Scc --noconfirm
+# -Syu: the musl target must be the same release as the compiler, and the
+# cached builder layer can hold an older one.
+RUN pacman -Syu --noconfirm --needed rust-musl && pacman -Scc --noconfirm
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     cargo build --release --target x86_64-unknown-linux-musl -p jailer && \
