@@ -1,13 +1,19 @@
-// A ceiling on how much of the graphics engine one guest may keep busy.
+// A ceiling on how much of the card one guest may use.
 //
-// # What it limits, and where
+// # Not how guests share the card
 //
-// The card time-slices between clients on its own and knows nothing about who
-// is paying for what. This is the missing half: it holds back a guest's *next*
-// submission while the guest is over its share, which is the one place the
-// host can slow a guest without cooperation from it. Nothing the guest does
-// above this line -- its driver, its frame limiter, its settings -- can undo
-// it, and nothing about it depends on what the workload is.
+// Sharing is the kernel's: with the DRM scheduler's FAIR policy
+// (`gpu_sched.sched_policy=2`) every client gets an equal share of the card
+// whenever it is contended, and the idle rest whenever it is not. That is
+// finer than anything here -- it decides per job -- and it uses the whole
+// card. Caps from this file were the sharing once, and left a 160 W card
+// running at 61-109 W: guests held back left it idle, and it clocked down.
+//
+// This is only a ceiling, for a guest that must never have more than a set
+// amount however idle the card is. It holds back the guest's *next*
+// submission while the guest is over it, which is the one place the host can
+// slow a guest without cooperation from it. Nothing the guest does above this
+// line -- its driver, its frame limiter, its settings -- can undo it.
 //
 // It limits **work**: engine time, taken from the kernel's own per-client
 // counters for the graphics and compute engines, scaled by the shader clock it
