@@ -1,5 +1,5 @@
 diff --git a/src/drm/amdgpu/amdgpu_renderer.c b/src/drm/amdgpu/amdgpu_renderer.c
-index cf7f4f1..27285cd 100644
+index 8f05f1a..4f8dab7 100644
 --- a/src/drm/amdgpu/amdgpu_renderer.c
 +++ b/src/drm/amdgpu/amdgpu_renderer.c
 @@ -526,11 +526,28 @@ amdgpu_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)

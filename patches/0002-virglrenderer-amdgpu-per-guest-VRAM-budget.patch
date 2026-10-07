@@ -1,6 +1,6 @@
 virglrenderer/amdgpu: per-guest VRAM budget
 
-Applies on top of 0001, against virglrenderer 7fcfce4.
+Applies on top of 0001, against virglrenderer 123e0bc.
 
 A guest on the DRM native-context path carries no vendor GPU driver: it asks for
 device memory with AMDGPU_CCMD_GEM_NEW and the renderer calls amdgpu_bo_alloc on
@@ -39,9 +39,11 @@ Only the VRAM heap is bounded. GTT lives in host system memory, which is capped
 for the whole VMM process by cgroups; counting it here as well would refuse
 guests for memory they never took from the card.
 
---- a/src/drm/amdgpu/amdgpu_renderer.c	2026-08-24 23:17:01.080945070 +0300
-+++ b/src/drm/amdgpu/amdgpu_renderer.c	2026-08-24 23:17:01.083060960 +0300
-@@ -88,6 +88,27 @@
+diff --git a/src/drm/amdgpu/amdgpu_renderer.c b/src/drm/amdgpu/amdgpu_renderer.c
+index 4f8dab7..2316e12 100644
+--- a/src/drm/amdgpu/amdgpu_renderer.c
++++ b/src/drm/amdgpu/amdgpu_renderer.c
+@@ -88,6 +88,27 @@ struct amdgpu_context {
  
     struct hash_table_u64 *id_to_ctx;
  
@@ -69,7 +71,7 @@ guests for memory they never took from the card.
     uint32_t timeline_count;
     struct drm_timeline timelines[];
  };
-@@ -136,6 +157,8 @@
+@@ -136,6 +157,8 @@ struct amdgpu_object {
     bool has_metadata    :1;
     bool exported        :1;
     bool enable_cache_wc :1;
@@ -78,7 +80,7 @@ guests for memory they never took from the card.
  };
  DEFINE_CAST(drm_object, amdgpu_object)
  
-@@ -277,6 +300,15 @@
+@@ -277,6 +300,15 @@ amdgpu_renderer_free_object(struct drm_context *dctx, struct drm_object *dobj)
  
     print(2, "free obj res_id: %d", dobj->res_id);
  
@@ -94,7 +96,7 @@ guests for memory they never took from the card.
     amdgpu_bo_free(obj->bo);
     free(obj);
  }
-@@ -354,6 +386,38 @@
+@@ -354,6 +386,38 @@ static void * amdgpu_renderer_resource_map(struct virgl_context *vctx,
                 amdgpu_device_get_fd(ctx->dev), args.out.addr_ptr);
  }
  
@@ -133,7 +135,7 @@ guests for memory they never took from the card.
  static void
  update_heap_info_in_shmem(struct amdgpu_context *ctx)
  {
-@@ -366,6 +430,21 @@
+@@ -366,6 +430,21 @@ update_heap_info_in_shmem(struct amdgpu_context *ctx)
     amdgpu_query_heap_info(ctx->dev, AMDGPU_GEM_DOMAIN_GTT,
                            0,
                            &ctx->shmem->gtt);
@@ -155,7 +157,7 @@ guests for memory they never took from the card.
  }
  
  static int
-@@ -501,6 +580,32 @@
+@@ -501,6 +580,32 @@ amdgpu_ccmd_query_info(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
              "ioctl error: fd: %d request.query: 0x%x r: %d|%d %s",
              amdgpu_device_get_fd(ctx->dev), request.query, rsp->hdr.ret, r, strerror(errno));
  
@@ -188,7 +190,7 @@ guests for memory they never took from the card.
     memcpy(rsp->payload, value, req->info.return_size);
     free(value);
  
-@@ -513,6 +618,10 @@
+@@ -513,6 +618,10 @@ amdgpu_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
     const struct amdgpu_ccmd_gem_new_req *req = to_amdgpu_ccmd_gem_new_req(hdr);
     struct amdgpu_context *ctx = to_amdgpu_context(dctx);
     int ret = 0;
@@ -199,7 +201,7 @@ guests for memory they never took from the card.
  
     if (req->r.__pad) {
        print(0, "Invalid value for struct %s_req::r::__pad: "
-@@ -543,6 +652,25 @@
+@@ -543,6 +652,25 @@ amdgpu_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
      */
     uint64_t alloc_flags = req->r.flags & ~AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
  
@@ -225,7 +227,7 @@ guests for memory they never took from the card.
     struct amdgpu_bo_alloc_request r = {
        .alloc_size = req->r.alloc_size,
        .phys_alignment = req->r.phys_alignment,
-@@ -569,6 +697,7 @@
+@@ -569,6 +697,7 @@ amdgpu_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
        goto va_map_failed;
  
     obj->base.handle = gem_handle;
@@ -233,7 +235,7 @@ guests for memory they never took from the card.
     /* Enable Write-Combine except for GTT buffers with WC disabled. */
     obj->enable_cache_wc =
        (req->r.preferred_heap != AMDGPU_GEM_DOMAIN_GTT) ||
-@@ -585,6 +714,10 @@
+@@ -585,6 +714,10 @@ va_map_failed:
     amdgpu_bo_free(bo_handle);
  
  alloc_failed:
@@ -244,7 +246,7 @@ guests for memory they never took from the card.
     print(2, "ERROR blob_id: %" PRIu64 " heap: %08x flags: %" PRIx64,
           req->blob_id, req->r.preferred_heap, req->r.flags);
     if (ctx->shmem)
-@@ -1261,6 +1394,23 @@
+@@ -1261,6 +1394,23 @@ amdgpu_renderer_create(int fd, size_t debug_len, const char *debug_name)
     if (d)
        ctx->debug = atoi(d);
  
