@@ -1,3 +1,21 @@
+virglrenderer/amdgpu: strip VM_ALWAYS_VALID
+
+Applies against virglrenderer 123e0bc. **Only for pre-RDNA GPUs** (seen on a
+Vega iGPU), where a guest exporting a buffer RADV allocated as local failed:
+amdgpu_gem_prime_export() refuses any BO carrying AMDGPU_GEM_CREATE_VM_ALWAYS_VALID.
+
+**Do not apply it anywhere else: it breaks an ordering RADV relies on.** RADV
+leaves its local buffers out of every submission's BO list, because the kernel
+keeps an always-valid BO resident and makes each submission wait for its page
+table updates (vm->last_update). Strip the flag and neither holds: the kernel
+keeps such a BO's page-table fence on the BO itself (bo_va->last_pt_update), and
+a submission only waits on that for BOs in its list. So a job using a buffer the
+guest has just mapped can run before the page tables for it are written, and
+faults. Measured on RDNA4: a 256 MiB DXVK chunk mapped and written in the same
+second, a write fault at its first page, the compute ring reset, and every later
+submission from the context refused. A BO evicted under this patch is not moved
+back either, for the same reason.
+
 diff --git a/src/drm/amdgpu/amdgpu_renderer.c b/src/drm/amdgpu/amdgpu_renderer.c
 index 8f05f1a..4f8dab7 100644
 --- a/src/drm/amdgpu/amdgpu_renderer.c

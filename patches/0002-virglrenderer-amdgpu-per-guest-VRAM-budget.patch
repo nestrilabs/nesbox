@@ -1,6 +1,6 @@
 virglrenderer/amdgpu: per-guest VRAM budget
 
-Applies on top of 0001, against virglrenderer 123e0bc.
+Applies against virglrenderer 123e0bc, with or without 0001.
 
 A guest on the DRM native-context path sizes itself to the card it is told it
 has. Told the whole card, a guest sharing it with others sizes its texture pools
@@ -33,7 +33,7 @@ and every later submit touching it fails. Measured -- a Unity title past its
 budget rendered garbage, with thousands of failed submits.
 
 diff --git a/src/drm/amdgpu/amdgpu_renderer.c b/src/drm/amdgpu/amdgpu_renderer.c
-index 4f8dab7..743573d 100644
+index 8f05f1a..4bfcb3b 100644
 --- a/src/drm/amdgpu/amdgpu_renderer.c
 +++ b/src/drm/amdgpu/amdgpu_renderer.c
 @@ -136,9 +136,85 @@ struct amdgpu_object {
@@ -210,7 +210,7 @@ index 4f8dab7..743573d 100644
     memcpy(rsp->payload, value, req->info.return_size);
     free(value);
  
-@@ -569,6 +712,7 @@ amdgpu_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+@@ -552,6 +695,7 @@ amdgpu_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
        goto va_map_failed;
  
     obj->base.handle = gem_handle;
@@ -218,7 +218,7 @@ index 4f8dab7..743573d 100644
     /* Enable Write-Combine except for GTT buffers with WC disabled. */
     obj->enable_cache_wc =
        (req->r.preferred_heap != AMDGPU_GEM_DOMAIN_GTT) ||
-@@ -1261,6 +1405,21 @@ amdgpu_renderer_create(int fd, size_t debug_len, const char *debug_name)
+@@ -1244,6 +1388,21 @@ amdgpu_renderer_create(int fd, size_t debug_len, const char *debug_name)
     if (d)
        ctx->debug = atoi(d);
  
