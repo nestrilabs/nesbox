@@ -157,9 +157,16 @@ impl Virtiofsd {
             cmd.arg("--readonly");
         }
         if let Some(guest) = guest_owner {
-            // SAFETY: neither call has preconditions or can fail.
-            let host = unsafe { [libc::getuid(), libc::getgid()] };
-            cmd.args(translate_args(guest, host));
+            // The guest's owner is mapped onto whoever owns the directory, not
+            // onto whoever this process runs as. They are the same for a VMM
+            // started by the user whose directory it is; for one started as
+            // root they are not, and mapping onto root showed the guest its own
+            // files as somebody else's -- Steam would not start and Wine refused
+            // its prefix.
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata(shared_dir)
+                .with_context(|| format!("reading the owner of {}", shared_dir.display()))?;
+            cmd.args(translate_args(guest, [owner.uid(), owner.gid()]));
         }
 
         // The daemon exits by itself when the VMM closes its socket, which the
@@ -265,7 +272,7 @@ mod tests {
     /// `<guest base>:<host base>:<count>`, and the reverse order would hand the
     /// host's uid to the guest and store its files as a uid nobody has.
     #[test]
-    fn a_guest_owner_maps_the_guests_ids_onto_this_processs() {
+    fn a_guest_owner_maps_the_guests_ids_onto_the_directorys_owner() {
         assert_eq!(
             translate_args([1001, 1001], [1000, 985]),
             [

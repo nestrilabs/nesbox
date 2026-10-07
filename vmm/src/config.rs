@@ -268,14 +268,16 @@ pub struct SharedDirectory {
     /// "only the downloader writes here" true by construction.
     #[serde(default)]
     pub read_only: bool,
-    /// `[uid, gid]` the guest should see as owning what this process owns.
+    /// `[uid, gid]` the guest should see as owning what the directory's owner owns.
     ///
     /// virtiofsd passes host ids straight through, so without this a guest
     /// user sees a directory the host made for it as somebody else's -- and
     /// Wine, for one, refuses a prefix it does not own. Set, virtiofsd maps
-    /// these guest ids to whatever uid and gid this VMM runs as, both ways:
-    /// the guest sees its own files, the host stores them as the VMM's user,
-    /// and nobody needs the privilege to `chown` anything.
+    /// these guest ids to the uid and gid that own the shared directory, both
+    /// ways: the guest sees its own files, the host stores them as the
+    /// directory's owner, and nobody needs the privilege to `chown` anything.
+    /// The owner rather than this process's uid, so a VMM started as root maps
+    /// onto the user whose directory it is and not onto root.
     #[serde(default)]
     pub guest_owner: Option<[u32; 2]>,
 }
