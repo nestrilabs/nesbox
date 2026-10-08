@@ -121,6 +121,11 @@ const DEFAULT_NESBOX_BIN: &str = "/usr/bin/nesbox";
 const DEFAULT_SCRATCH_DIR: &str = "/run/nesbox-jailer";
 
 const KVM: &str = "/dev/kvm";
+/// Needed by every box for the same reason as `/dev/kvm`, though nothing in a
+/// config names it: a process started with its input on the null device opens
+/// it first, so without it nesbox cannot start virtiofsd at all. The jail image
+/// is a container image, which carries no device nodes.
+const NULL: &str = "/dev/null";
 /// `virtio-devices/src/tap.rs`'s `TUN_PATH`. nesbox opens an existing tap
 /// through it; creating one is the host setup script's job.
 const TUN: &str = "/dev/net/tun";
@@ -369,6 +374,7 @@ fn host_paths(config_path: &Path, cfg: &BoxConfig, extra: &[PathBuf]) -> Result<
         // nesbox re-reads its own config after the exec, from inside the jail.
         needed(config_path, "the config file itself"),
         needed(KVM, "every box needs /dev/kvm"),
+        needed(NULL, "every process may open /dev/null"),
         needed(
             &cfg.boot_source.kernel_image_path,
             "boot-source.kernel_image_path",
@@ -1212,6 +1218,7 @@ mod tests {
             vec![
                 PathBuf::from("/boxes/1/box.json"),
                 PathBuf::from("/dev/kvm"),
+                PathBuf::from("/dev/null"),
                 PathBuf::from("/path/to/vmlinux"),
                 PathBuf::from("/path/to/rootfs.ext4"),
                 PathBuf::from("/dev/dri/renderD128"),
@@ -1235,6 +1242,7 @@ mod tests {
             vec![
                 PathBuf::from("/boxes/1/box.json"),
                 PathBuf::from("/dev/kvm"),
+                PathBuf::from("/dev/null"),
                 PathBuf::from("/k/vmlinux"),
             ],
             "no gpu, network or vsock means no render node, tap or vhost node"
@@ -1266,6 +1274,7 @@ mod tests {
             vec![
                 PathBuf::from("/boxes/1/box.json"),
                 PathBuf::from("/dev/kvm"),
+                PathBuf::from("/dev/null"),
                 PathBuf::from("/k"),
                 PathBuf::from("/run/nesbox/1/nvgpu.sock"),
             ],
