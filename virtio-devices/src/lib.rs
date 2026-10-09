@@ -22,8 +22,8 @@ pub use console::ConsoleDevice;
 pub use fs::FsDevice;
 #[cfg(feature = "virgl")]
 pub use gpu::{
-    CommandKindCounts, GPU_COMMAND_NAMES, GpuConfig, GpuDevice, GpuSnapshot, InfoCounts, Occupancy,
-    PhaseSnapshot,
+    CommandKindCounts, Driver, GPU_COMMAND_NAMES, GpuConfig, GpuDevice, GpuSnapshot, InfoCounts,
+    Occupancy, PhaseSnapshot,
 };
 pub use memmap::HostMemoryMapper;
 pub use net::{NetConfig, NetDevice};

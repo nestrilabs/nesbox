@@ -102,15 +102,33 @@ fn kinds_json(kinds: &CommandKindCounts) -> String {
 
 fn gpu_json(s: &GpuSnapshot) -> String {
     let occupancy = match s.occupancy {
-        Some(o) => format!(
-            "{{\"gfx_ns\":{},\"compute_ns\":{},\"requested_vram_bytes\":{},\
-             \"resident_vram_bytes\":{},\"evicted_vram_bytes\":{}}}",
-            o.gfx_ns,
-            o.compute_ns,
-            o.requested_vram_bytes,
-            o.resident_vram_bytes,
-            o.evicted_vram_bytes
-        ),
+        Some(o) => {
+            // Unknown engine time is null, never 0: zero reads as an idle GPU.
+            let engine = |ns: u64| {
+                if o.engine_time {
+                    ns.to_string()
+                } else {
+                    "null".into()
+                }
+            };
+            format!(
+                "{{\"driver\":\"{}\",\"gfx_ns\":{},\"compute_ns\":{},\
+                 \"requested_vram_bytes\":{},\"resident_vram_bytes\":{},\
+                 \"evicted_vram_bytes\":{},\"device_total_bytes\":{},\
+                 \"device_resident_bytes\":{},\"device_not_resident_bytes\":{},\
+                 \"host_resident_bytes\":{}}}",
+                o.driver.name(),
+                engine(o.gfx_ns),
+                engine(o.compute_ns),
+                o.requested_vram_bytes,
+                o.resident_vram_bytes,
+                o.evicted_vram_bytes,
+                o.device_total_bytes,
+                o.device_resident_bytes,
+                o.device_not_resident_bytes(),
+                o.host_resident_bytes
+            )
+        }
         None => "null".into(),
     };
     format!(
@@ -319,17 +337,25 @@ mod tests {
             placed_withdraw: PhaseSnapshot { ns: 69, count: 70 },
             place_refused: 71,
             occupancy: Some(virtio_devices::Occupancy {
+                driver: virtio_devices::Driver::Amdgpu,
+                engine_time: true,
                 gfx_ns: 9,
                 compute_ns: 13,
                 requested_vram_bytes: 10,
                 resident_vram_bytes: 11,
                 evicted_vram_bytes: 12,
+                device_total_bytes: 20,
+                device_resident_bytes: 15,
+                host_resident_bytes: 7,
             }),
         };
         let body = format!("{{\"schema\":1,\"uptime_ms\":1,\"gpu\":{}}}", gpu_json(&s));
         let v: serde_json::Value = serde_json::from_str(&body).expect("must be valid JSON");
         assert_eq!(v["gpu"]["occupancy"]["gfx_ns"], 9);
         assert_eq!(v["gpu"]["occupancy"]["compute_ns"], 13);
+        assert_eq!(v["gpu"]["occupancy"]["driver"], "amdgpu");
+        assert_eq!(v["gpu"]["occupancy"]["device_not_resident_bytes"], 5);
+        assert_eq!(v["gpu"]["occupancy"]["host_resident_bytes"], 7);
         assert_eq!(v["gpu"]["reference_clock_mhz"], 2620);
         // Every phase carries both halves. A phase that lost its count would
         // still be valid JSON and would silently stop being a mean.

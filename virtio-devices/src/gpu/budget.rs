@@ -175,6 +175,7 @@ mod tests {
     fn sample(ns: u64) -> Option<Occupancy> {
         Some(Occupancy {
             gfx_ns: ns,
+            engine_time: true,
             ..Default::default()
         })
     }
@@ -250,6 +251,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         let compute_only = Some(Occupancy {
             compute_ns: 50_000_000,
+            engine_time: true,
             ..Default::default()
         });
         assert!(b.pace(|| compute_only, || 1.0, &stop) > Duration::ZERO);

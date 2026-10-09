@@ -362,7 +362,9 @@ impl GpuMetrics {
             return;
         }
         let waited = self.budget.pace(
-            || self.occupancy.read(),
+            // A client whose driver reports no engine time has nothing to
+            // meter, which is what the limit makes of no client at all.
+            || self.occupancy.read().filter(|o| o.engine_time),
             || self.clock.as_ref().map_or(1.0, |c| c.work_per_ns()),
             stop,
         );

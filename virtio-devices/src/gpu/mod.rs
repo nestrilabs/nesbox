@@ -26,7 +26,7 @@ mod worker;
 pub use self::descriptor_utils::{Error as DescriptorError, Reader, Writer};
 pub use self::device::{GpuConfig, GpuDevice};
 pub use self::metrics::{CommandKindCounts, GpuSnapshot, InfoCounts, PhaseSnapshot};
-pub use self::occupancy::Occupancy;
+pub use self::occupancy::{Driver, Occupancy};
 pub use self::protocol::GPU_COMMAND_NAMES;
 
 /// Control virtqueue index.

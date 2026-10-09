@@ -46,12 +46,17 @@ changing the meaning of one bumps it.
 | `gpu.window_limit_bytes` | The configured quota; `0` is unbounded |
 | `gpu.window_mappings` | Live mappings. **Each is a KVM memory slot**, so this is the number that matters for slot pressure rather than the byte total |
 | `gpu.window_refusals` | Mappings refused, for bytes or for count |
-| `gpu.occupancy.gfx_ns` | Nanoseconds the graphics engine has spent on this client, from the kernel's own per-client accounting |
-| `gpu.occupancy.compute_ns` | The same for the compute engine. The GPU limit charges both |
+| `gpu.occupancy.driver` | The kernel driver (`amdgpu`, `i915`, `xe`, `other`). Says how to read the memory fields below |
+| `gpu.occupancy.gfx_ns` | Nanoseconds the graphics engine has spent on this client, from the kernel's own per-client accounting (`drm-engine-gfx` on amdgpu, `drm-engine-render` on i915). **`null` for a driver that reports no engine time in nanoseconds** (xe reports cycles): unknown, not idle |
+| `gpu.occupancy.compute_ns` | The same for the compute engine, `null` likewise. The GPU limit charges both |
 | `gpu.shader_clock_mhz` | The card's shader clock now; 0 for a card that reports none |
 | `gpu.reference_clock_mhz` | The clock the GPU limit charges against: the last level of `pp_dpm_sclk`, which amdgpu sets to the clock the firmware guarantees every card of the SKU. Engine time counts as `time x shader_clock / reference_clock` of work |
-| `gpu.occupancy.resident_vram_bytes` | What is actually in VRAM. Below `requested` means amdgpu has migrated buffers to GTT |
-| `gpu.occupancy.evicted_vram_bytes` | **Non-zero means this box's quota is above what the card will really give it**, and it is paying the difference in bus traffic |
+| `gpu.occupancy.resident_vram_bytes` | amdgpu only: what is in its `vram` region now. `device_resident_bytes` is the same across drivers |
+| `gpu.occupancy.evicted_vram_bytes` | amdgpu only. Buffers outside every domain they asked for. RADV asks for VRAM *or* GTT unless `nogttspill`, so most spills do not show here; read `device_not_resident_bytes` |
+| `gpu.occupancy.device_total_bytes` | Device memory the driver counts for this client, summed over its device regions (`vram*`, `local*`; stolen memory left out) |
+| `gpu.occupancy.device_resident_bytes` | The part of it in device memory now |
+| `gpu.occupancy.device_not_resident_bytes` | The difference. **On amdgpu, memory spilled to system memory, exactly**: amdgpu places a buffer at creation and counts it under its preferred domain. On i915 an upper bound: it gives buffers pages on first use, so this also holds memory nothing has touched yet. xe: not yet measured |
+| `gpu.occupancy.host_resident_bytes` | Host memory the GPU reads for this client (`gtt*`, `system*`, `cpu` regions). Includes what was asked for there on purpose -- staging, uploads -- so it is not a spill by itself |
 
 ## What you can compute, and what you cannot
 
