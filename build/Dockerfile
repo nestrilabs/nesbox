@@ -47,14 +47,14 @@ ENV ARTIFACTS=/artifacts
 # ───────────────────────────────────────────────────────────
 #  virglrenderer — patched
 #
-#  Base commit is the one patches/0002's own header names ("Applies on top
-#  of 0001, against virglrenderer 7fcfce4"); the patches are the source of
-#  truth for what changed and why, not this file.
+#  Base commit is the one patches/0002's own header names ("Applies against
+#  virglrenderer 123e0bc"); the patches are the source of truth for what
+#  changed and why, not this file.
 # ───────────────────────────────────────────────────────────
 FROM builder AS virgl-build
 
 ARG VIRGLRENDERER_GIT=https://gitlab.freedesktop.org/virgl/virglrenderer.git
-ARG VIRGLRENDERER_COMMIT=7fcfce4
+ARG VIRGLRENDERER_COMMIT=123e0bc
 
 COPY patches/ /build/patches/
 

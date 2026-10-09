@@ -1,6 +1,6 @@
 virglrenderer/amdgpu: per-guest VRAM budget
 
-Applies against virglrenderer 123e0bc, with or without 0001.
+Applies against virglrenderer 123e0bc.
 
 A guest on the DRM native-context path sizes itself to the card it is told it
 has. Told the whole card, a guest sharing it with others sizes its texture pools

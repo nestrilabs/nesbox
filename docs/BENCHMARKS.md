@@ -65,7 +65,7 @@ a figure from a different host is a different figure, not a confirmation.
 > command each. **That run has happened** — `benchmarks/rdna4-rx-9060-xt.json`, and
 > §16 for what it says.
 | libdrm | 2.4.134 |
-| virglrenderer | fork at `7fcfce4` **+ the patch in §6** |
+| virglrenderer | fork at `7fcfce4` **+ the patch in §6** (since removed; see §6) |
 | Guest kernel | 7.2.0+ |
 | Guest Mesa | 26.3.0-devel (`git-b78fc73dd8`), RADV, built `-Damdgpu-virtio=true` |
 
@@ -243,6 +243,16 @@ than assume residency — measurable with the same instrument.
 Unconditional stripping is the blunt version. The targeted fixes are upstream
 conversations: defer the allocation until blob flags are known, or stop RADV's WSI
 path asking for local buffers on the virtio path.
+
+**Removed (2026-10-09).** The patch broke more than it fixed. A buffer without
+`VM_ALWAYS_VALID` that RADV leaves out of a submission's buffer list -- it assumes
+a local buffer is always resident -- is not revalidated when it is evicted, and its
+page-table update is not waited for: GPU write faults on compute rings, a ring
+reset, and on nestripc-1 under a hard VRAM cap, where a box evicts its own buffers
+all the time, a full-card `MODE1` reset that took every box down. RDNA4 boxes ran
+without it, presenting through Wayland, with no export failures; the `EPERM` above
+was seen on a Vega iGPU. Recorded in nescore's
+`docs/superpowers/specs/2026-10-07-gpu-sharing-and-vram-design.md`.
 
 ---
 

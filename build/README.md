@@ -35,7 +35,8 @@ no fstab, no getty. Just enough userspace for `nesbox` to run: Mesa, patched
 ## What building this end to end actually confirmed
 
 This Dockerfile has been built successfully, start to finish, against a
-real checkout of virglrenderer commit `7fcfce4` and a real
+real checkout of virglrenderer commit `7fcfce4` (since moved to `123e0bc`,
+the base `patches/0002` names) and a real
 `ghcr.io/nestrilabs/nestri/base:latest`. Four things it started out guessing at, or hadn't
 reached yet, are settled now, not just asserted:
 
@@ -46,7 +47,7 @@ reached yet, are settled now, not just asserted:
   this repo's first guess and meson rejected it outright (`Unknown option:
   "drm"`). The real option, from `meson_options.txt` at that commit, is
   `drm-renderers` — an array, not a boolean — with `amdgpu-experimental`
-  and `i915-experimental` among its choices. `patches/0001` and `0002` only
+  and `i915-experimental` among its choices. The patches only
   touch `src/drm/amdgpu/`, which lines up: `amdgpu-experimental` is the one
   the patches actually need; `i915-experimental` is included because
   nesbox's own README lists Intel as a supported host GPU too, even though

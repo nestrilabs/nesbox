@@ -77,7 +77,7 @@ You'll need
 2. A GPU (NVIDIA, Intel or AMD)
    - NVIDIA guests need the [virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu) backend, and NVIDIA's drivers on the host.
    - Intel and AMD need `libvirglrenderer` our [patches](patches/) applied, and Mesa built with `-Dintel-virtio-experimental=true` and `-Damdgpu-virtio=true`.
-     `0002` (the per-guest VRAM budget) is for every AMD host. `0001` is only for pre-RDNA GPUs such as Vega, and costs a race on every other one: see its header.
+     `0002` (the per-guest VRAM budget) is for every AMD host.
 3. `virtiofsd`
 4. The guest kernel needs `VIRTIO_PCI`, `PCI_MMCONFIG`, `DRM_VIRTIO_GPU`, `VIRTIO_FS` and `VSOCKETS`.
 5. On a host sharing one GPU between several guests, boot with `gpu_sched.sched_policy=2`. That is the kernel DRM scheduler's FAIR policy: every guest gets an equal share of the card whenever it is contended, and the idle rest whenever it is not. Under the default (first come, first served) a heavy game crowds out the others; per-guest caps instead leave the card underclocked. See `nescore/docs/superpowers/specs/2026-10-07-gpu-sharing-and-vram-design.md`, which also covers the dmem cgroup setup for VRAM.
