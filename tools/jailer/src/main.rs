@@ -27,7 +27,8 @@
 //!   5. `chroot` into the merged tree. The image itself was built and
 //!      materialized elsewhere; this binary does not build, fetch or
 //!      version it.
-//!   6. drop from root to the uid/gid the caller names.
+//!   6. drop from root to the uid/gid the caller names, keeping only the
+//!      groups that own a device node the box needs ([`device_groups`]).
 //!   7. `execve` nesbox, with the same config file.
 //!
 //! # The config decides what comes in
@@ -94,6 +95,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 // ── Constants not exposed by the pinned libc, or not worth trusting sight
@@ -717,6 +719,74 @@ fn build_jail(image: &Path, scratch: &Path) -> Result<PathBuf> {
     Ok(merged)
 }
 
+// ── which groups survive the drop ───────────────────────────────────────
+
+/// The groups this box keeps after the drop: the ones that own a device node
+/// it needs and are the only way to open it.
+///
+/// `setgroups(0)` alone is right on a host whose `/dev/kvm` is `rw-rw-rw-`,
+/// and a box that cannot start on one whose distro ships it `rw-rw----
+/// root:kvm` -- the
+/// VMM's first open after the drop is `EACCES`, on `/dev/kvm` or the vhost
+/// nodes or the render node. udev puts the mode back whenever the node is
+/// recreated, so a hand `chmod` is not a fix either.
+///
+/// Derived from the nodes this config brings in, like everything else here,
+/// rather than a `--group` flag the caller would have to get right per
+/// distro. Only a group that grants read and write where "other" does not is
+/// kept, and never gid 0: membership of `root` would reach far more than one
+/// device. A node that only its owner can open has no group to keep, and is
+/// returned in the second list so the failure can name it before the VMM
+/// trips over it.
+///
+/// What keeping a group costs: the box can open every node that group owns,
+/// not only the one it was kept for -- `render` reaches every GPU's render
+/// node, not just the box's. That is the trade until the agent opens the
+/// nodes itself and passes the fds in.
+fn device_groups(paths: &[Needed]) -> (Vec<libc::gid_t>, Vec<PathBuf>) {
+    let mut groups = Vec::new();
+    let mut unreachable = Vec::new();
+    for n in paths {
+        let Ok(meta) = std::fs::metadata(&n.path) else {
+            // Missing paths fail at the bind, naming the field; not ours to report.
+            continue;
+        };
+        if !meta.file_type().is_char_device() {
+            continue;
+        }
+        match device_access(meta.mode(), meta.gid()) {
+            DeviceAccess::Anyone => {}
+            DeviceAccess::Group(gid) => {
+                if !groups.contains(&gid) {
+                    groups.push(gid);
+                }
+            }
+            DeviceAccess::OwnerOnly => unreachable.push(n.path.clone()),
+        }
+    }
+    (groups, unreachable)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceAccess {
+    /// "other" can read and write it; no group needed.
+    Anyone,
+    /// Only through this group.
+    Group(libc::gid_t),
+    /// Nothing the drop can keep reaches it.
+    OwnerOnly,
+}
+
+fn device_access(mode: u32, gid: libc::gid_t) -> DeviceAccess {
+    if mode & 0o006 == 0o006 {
+        DeviceAccess::Anyone
+    } else if mode & 0o060 == 0o060 && gid != 0 {
+        DeviceAccess::Group(gid)
+    } else {
+        DeviceAccess::OwnerOnly
+    }
+}
+
 // ── chroot, privilege drop, exec ────────────────────────────────────────
 
 fn enter_jail(jail_root: &Path) -> Result<()> {
@@ -737,13 +807,21 @@ fn enter_jail(jail_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Drop from root to `uid:gid`, and check that it actually took rather than
-/// assuming a zero return means what it says.
-fn drop_privileges(uid: u32, gid: u32) -> Result<()> {
-    // SAFETY: infallible per POSIX when the count is 0.
-    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+/// Drop from root to `uid:gid` with exactly `groups` as supplementary groups,
+/// and check that it actually took rather than assuming a zero return means
+/// what it says. Every group root held is gone; `groups` is what
+/// [`device_groups`] found the box's device nodes need.
+fn drop_privileges(uid: u32, gid: u32, groups: &[libc::gid_t]) -> Result<()> {
+    let ptr = if groups.is_empty() {
+        std::ptr::null()
+    } else {
+        groups.as_ptr()
+    };
+    // SAFETY: `ptr` is null with a count of 0, or a valid slice of
+    // `groups.len()` gids read only for the duration of the call.
+    if unsafe { libc::setgroups(groups.len(), ptr) } != 0 {
         return Err(std::io::Error::last_os_error())
-            .context("setgroups(0, NULL) -- clearing supplementary groups");
+            .with_context(|| format!("setgroups({groups:?}) -- replacing supplementary groups"));
     }
     // gid before uid: dropping uid first would remove the privilege needed
     // to still change gid.
@@ -761,6 +839,18 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<()> {
     ensure!(
         got_uid == uid && got_gid == gid,
         "privilege drop did not take: uid={got_uid} gid={got_gid}, wanted uid={uid} gid={gid}"
+    );
+    let mut got_groups = vec![0 as libc::gid_t; 64];
+    // SAFETY: the buffer holds `got_groups.len()` gids and outlives the call.
+    let n = unsafe { libc::getgroups(got_groups.len() as libc::c_int, got_groups.as_mut_ptr()) };
+    ensure!(n >= 0, "getgroups after the drop failed");
+    got_groups.truncate(n as usize);
+    got_groups.sort_unstable();
+    let mut wanted: Vec<libc::gid_t> = groups.to_vec();
+    wanted.sort_unstable();
+    ensure!(
+        got_groups == wanted,
+        "supplementary groups after the drop are {got_groups:?}, wanted {wanted:?}"
     );
     // Belt and suspenders: a working privilege drop makes regaining root
     // impossible. If it is somehow still possible, something above this line
@@ -914,6 +1004,22 @@ fn run(args: Args) -> Result<()> {
 
     refuse_if_uid_is_live(args.uid)?;
 
+    // Read off the host's nodes before anything is mounted or chrooted: the
+    // bind mounts carry the same inode, so the modes are the ones nesbox meets.
+    let (groups, unreachable) = device_groups(&paths);
+    ensure!(
+        unreachable.is_empty(),
+        "these device nodes can only be opened by their owner, so no group \
+         lets uid {} open them after the drop -- give them a group with read \
+         and write (rw-rw----), or open them to anyone, on this host:\n{}",
+        args.uid,
+        unreachable
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
     unshare_mount_namespace()?;
 
     // The image stays read-only; this is the tree that gets written to. One
@@ -936,17 +1042,18 @@ fn run(args: Args) -> Result<()> {
     }
 
     log::info!(
-        "jailer: {} paths bound, chrooting into {}, dropping to uid={} gid={}, exec'ing {} {}",
+        "jailer: {} paths bound, chrooting into {}, dropping to uid={} gid={} groups={:?}, exec'ing {} {}",
         paths.len(),
         jail.display(),
         args.uid,
         args.gid,
+        groups,
         args.nesbox_bin.display(),
         config_path.display(),
     );
 
     enter_jail(&jail)?;
-    drop_privileges(args.uid, args.gid)?;
+    drop_privileges(args.uid, args.gid, &groups)?;
 
     // nesbox's whole command line: the binary inside the jail, and the config
     // at the same path it had on the host, because that is where it was bound.
@@ -1201,6 +1308,49 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("unknown argument: --"), "{err}");
+    }
+
+    // ── which groups survive the drop ───────────────────────────────────
+
+    #[test]
+    fn a_device_open_to_anyone_keeps_no_group() {
+        // /dev/null and /dev/net/tun, and /dev/kvm where it is open to anyone.
+        assert_eq!(device_access(0o20666, 0), DeviceAccess::Anyone);
+        assert_eq!(device_access(0o20666, 994), DeviceAccess::Anyone);
+    }
+
+    #[test]
+    fn a_group_only_device_keeps_its_group() {
+        // /dev/kvm rw-rw---- root:kvm, as several distros ship it.
+        assert_eq!(device_access(0o20660, 992), DeviceAccess::Group(992));
+    }
+
+    #[test]
+    fn the_root_group_is_never_kept() {
+        // rw-rw---- root:root reaches nothing a uid in a box could use safely, and
+        // membership of gid 0 would reach far more than this node.
+        assert_eq!(device_access(0o20660, 0), DeviceAccess::OwnerOnly);
+    }
+
+    #[test]
+    fn an_owner_only_or_read_only_group_device_is_unreachable() {
+        assert_eq!(device_access(0o20600, 992), DeviceAccess::OwnerOnly);
+        // Read without write is no use to a VMM's ioctls.
+        assert_eq!(device_access(0o20640, 992), DeviceAccess::OwnerOnly);
+    }
+
+    #[test]
+    fn only_device_nodes_are_considered() {
+        // The config file and /dev/null: one is a regular file, the other is
+        // open to anyone. Neither asks for a group.
+        let paths = vec![
+            needed("/etc/hostname", "a regular file"),
+            needed(NULL, "every process may open /dev/null"),
+            needed("/does/not/exist", "missing is the bind's to report"),
+        ];
+        let (groups, unreachable) = device_groups(&paths);
+        assert!(groups.is_empty(), "{groups:?}");
+        assert!(unreachable.is_empty(), "{unreachable:?}");
     }
 
     // ── deriving the mount set from a config ────────────────────────────
@@ -1533,7 +1683,7 @@ mod tests {
 
                 // uid 65534 (nobody) is about as safe a target as any system
                 // is guaranteed to have.
-                drop_privileges(65534, 65534)?;
+                drop_privileges(65534, 65534, &[])?;
                 ensure!(
                     unsafe { libc::getuid() } == 65534,
                     "did not actually drop to nobody"
